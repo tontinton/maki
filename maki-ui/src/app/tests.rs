@@ -5579,6 +5579,7 @@ fn rewind_to_prompt(text: &str) -> RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
         prompt_text: text.into(),
+        images: Vec::new(),
     }
 }
 
@@ -5655,6 +5656,24 @@ fn compaction_feedback_stays_out_of_history_and_updates_context(automatic: bool)
     assert_eq!(app.state.session.messages(), history.as_slice());
 }
 
+/// The draft's own image must not stand in for the rewound prompt's.
+#[test_case(1 ; "brings_the_prompts_image")]
+#[test_case(0 ; "drops_the_drafts_image")]
+fn rewind_replaces_the_attached_images(sent_images: usize) {
+    const PROMPT: &str = "second [Image 1]";
+    let sent = ImageSource::new(ImageMediaType::Png, Arc::from("c2VudA=="));
+    let mut app = build_rewind_app();
+    with_image(&mut app);
+    app.rewind_to(RewindEntry {
+        images: vec![sent.clone(); sent_images],
+        ..rewind_to_prompt(PROMPT)
+    });
+
+    let submission = app.input_box.submit().unwrap();
+    assert_eq!(submission.text, PROMPT);
+    assert_eq!(submission.images, vec![sent; sent_images]);
+}
+
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
@@ -5665,6 +5684,7 @@ fn rewind_to_first_turn_clears_everything() {
         turn_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
+        images: Vec::new(),
     };
     let actions = app.rewind_to(entry);
 
@@ -11401,6 +11421,7 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
         turn_index: 1,
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
+        images: Vec::new(),
     };
     app.rewind_to(entry);
     app.checkpoint();
@@ -11434,10 +11455,14 @@ const ONE_FORK: &str = "a fork must hand the loop exactly one copy to open";
 const RECOVERED_PROMPT: &str = "prompt queued before the agent failed";
 
 fn opened_fork(actions: Vec<Action>) -> AppSession {
-    let Ok([Action::OpenFork(open)]) = <[Action; 1]>::try_from(actions) else {
+    opened_fork_with_images(actions).0
+}
+
+fn opened_fork_with_images(actions: Vec<Action>) -> (AppSession, Vec<ImageSource>) {
+    let Ok([Action::OpenFork { open, draft_images }]) = <[Action; 1]>::try_from(actions) else {
         panic!("{ONE_FORK}");
     };
-    open.session
+    (open.session, draft_images)
 }
 
 #[test]
@@ -11477,6 +11502,7 @@ fn fork_to_first_prompt(app: &mut App) -> Vec<Action> {
         turn_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
+        images: Vec::new(),
     })
 }
 
@@ -11486,6 +11512,29 @@ fn fork_refuses_an_empty_copy(fork: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
     assert!(fork(&mut app).is_empty());
     assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
+}
+
+/// The copy's draft comes back from disk as text, so the images its
+/// markers name travel with the fork and land in the copy's input.
+#[test]
+fn fork_to_prompt_carries_the_prompts_images_into_the_copy() {
+    const PROMPT: &str = "second [Image 1]";
+    let sent = ImageSource::new(ImageMediaType::Png, Arc::from("c2VudA=="));
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    let (fork, draft_images) = opened_fork_with_images(app.fork_to(RewindEntry {
+        images: vec![sent.clone()],
+        ..rewind_to_prompt(PROMPT)
+    }));
+    assert_eq!(draft_images, std::slice::from_ref(&sent));
+
+    let mut copy = test_app();
+    copy.state.session_mut().meta = fork.meta;
+    copy.restore_display();
+    copy.restore_draft_images(draft_images);
+    let submission = copy.input_box.submit().unwrap();
+    assert_eq!(submission.text, PROMPT);
+    assert_eq!(submission.images, [sent]);
 }
 
 #[test]
@@ -11578,6 +11627,7 @@ fn rewind_gesture(app: &mut App) -> Vec<Message> {
         turn_index: 1,
         prompt_preview: LIVE_AGENT_TEXT.into(),
         prompt_text: LIVE_AGENT_TEXT.into(),
+        images: Vec::new(),
     }))
 }
 
@@ -11799,6 +11849,7 @@ fn rewinding_to_the_first_prompt_takes_the_session_off_disk() {
         turn_index: 0,
         prompt_preview: LIVE_AGENT_TEXT.into(),
         prompt_text: LIVE_AGENT_TEXT.into(),
+        images: Vec::new(),
     });
     app.checkpoint();
 
@@ -12315,6 +12366,7 @@ fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool)
         turn_index,
         prompt_preview: String::new(),
         prompt_text: String::new(),
+        images: Vec::new(),
     });
 
     let cancelled = actions.iter().any(|action| {

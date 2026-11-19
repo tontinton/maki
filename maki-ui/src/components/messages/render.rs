@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -39,11 +41,15 @@ impl RenderCursor {
     /// `visible` is false while an overlay covers the transcript. The encoded
     /// protocol is kept either way: releasing it here would re-decode and
     /// re-transmit every image each time a permission prompt opens and closes.
+    ///
+    /// The rows take {style}, so an image inside a message keeps the
+    /// message's background beside it.
     pub fn render_image(
         &mut self,
         image: &mut InlineImage,
         picker: Option<&Picker>,
         visible: bool,
+        style: Option<Style>,
         frame: &mut Frame,
     ) {
         if self.past_bottom() {
@@ -65,7 +71,7 @@ impl RenderCursor {
             self.render(
                 fallback.as_slice(),
                 height,
-                Style::default(),
+                style.unwrap_or_default(),
                 0,
                 None,
                 frame,
@@ -76,6 +82,9 @@ impl RenderCursor {
             .saturating_sub(self.skip)
             .min(self.bottom.saturating_sub(self.y));
         let area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_rows);
+        if let Some(style) = style {
+            frame.buffer_mut().set_style(area, style);
+        }
         if let SlicedProtocol::Sliced(rows) = protocol {
             // Not `SlicedImage::new`: upstream renders `.skip(skip).take(len - drop)`
             // rows into `area`, which is `skip` rows too many when an image is
@@ -145,14 +154,19 @@ impl RenderCursor {
     /// draws anything, so a tall segment used to cost its full height on every
     /// frame. Walking to the first visible row and drawing only what fits
     /// keeps the cost at one screen.
+    ///
+    /// Only the lines in {range} are drawn, the run between two of the
+    /// segment's images.
     pub fn render_segment(
         &mut self,
         seg: &Segment,
+        range: Range<usize>,
         style: Option<Style>,
         highlight: bool,
         frame: &mut Frame,
     ) {
-        let h = seg.text_height(self.viewport.width);
+        let first_run = range.start == 0;
+        let h = seg.rows_of(range.clone(), self.viewport.width);
         if self.skip >= h {
             self.skip -= h;
             return;
@@ -162,7 +176,7 @@ impl RenderCursor {
             base = base.add_modifier(Modifier::REVERSED);
         }
         let cols = seg.gutter_cols(self.viewport.width);
-        let mut walk = seg.rows_from(self.skip, self.viewport.width);
+        let mut walk = seg.rows_in(range, self.skip, self.viewport.width);
         while self.y < self.bottom
             && let Some((lines, rows)) = walk.next_chunk(self.bottom - self.y)
         {
@@ -175,7 +189,7 @@ impl RenderCursor {
             let marker = seg
                 .gutter
                 .as_ref()
-                .filter(|_| rows.start == 0 && self.skip == 0);
+                .filter(|_| first_run && rows.start == 0 && self.skip == 0);
             self.render(lines, rows.end - rows.start, base, cols, marker, frame);
         }
     }
@@ -241,6 +255,7 @@ mod tests {
                     &mut image,
                     Some(&picker),
                     true,
+                    None,
                     frame,
                 );
             })?
@@ -249,7 +264,7 @@ mod tests {
         let mut cursor = RenderCursor::new(TOP_SKIP, VIEWPORT);
         terminal.draw(|frame| {
             let before = frame.buffer_mut().clone();
-            cursor.render_image(&mut image, Some(&picker), true, frame);
+            cursor.render_image(&mut image, Some(&picker), true, None, frame);
             let after = frame.buffer_mut();
             for y in before.area.y..before.area.bottom() {
                 for x in before.area.x..before.area.right() {
@@ -300,7 +315,13 @@ mod tests {
         ))?;
         let buf = &terminal
             .draw(|frame| {
-                RenderCursor::new(skip, GUTTER_VIEWPORT).render_segment(&seg, None, false, frame);
+                RenderCursor::new(skip, GUTTER_VIEWPORT).render_segment(
+                    &seg,
+                    seg.lines_before_image(0),
+                    None,
+                    false,
+                    frame,
+                );
             })?
             .buffer;
         for (y, row) in expected.iter().enumerate() {

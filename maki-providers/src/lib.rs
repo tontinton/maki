@@ -3,6 +3,7 @@ pub(crate) mod error;
 pub mod headers;
 pub mod http;
 pub(crate) mod image;
+pub mod image_marker;
 pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;

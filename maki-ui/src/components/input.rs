@@ -15,7 +15,7 @@ use maki_lua::{InputMarks, InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
-use maki_providers::ImageSource;
+use maki_providers::{ImageSource, image_marker};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -123,6 +123,8 @@ pub struct InputBox {
     follow_cursor: bool,
     placeholder_hint: &'static str,
     pending_images: Vec<ImageSource>,
+    /// The images [`Self::draft`] had attached.
+    draft_images: Vec<ImageSource>,
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
@@ -257,6 +259,7 @@ impl InputBox {
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
             pending_images: Vec::new(),
+            draft_images: Vec::new(),
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
@@ -337,7 +340,7 @@ impl InputBox {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let rows = self.layout(width).total_rows() + u32::from(!self.pending_images.is_empty());
+        let rows = self.layout(width).total_rows();
         let capped = rows.min(self.max_input_lines.into()) as u16;
         capped.saturating_add(BORDER_ROWS)
     }
@@ -367,9 +370,9 @@ impl InputBox {
     /// a `/yol` a plugin wrote would come back as the user's `/yolo`. Such a
     /// text stays out of history.
     pub fn submit(&mut self) -> Option<Submission> {
-        let text = sent_text(self.buffer.value()).to_string();
-        let images = mem::take(&mut self.pending_images);
-        if text.is_empty() && images.is_empty() {
+        let (text, images) =
+            image_marker::resolve(sent_text(self.buffer.value()), &self.pending_images);
+        if text.is_empty() {
             return None;
         }
         if !(text.starts_with(COMMAND_PREFIX) && !self.buffer.writers().is_empty()) {
@@ -383,6 +386,7 @@ impl InputBox {
     /// up in the next prompt.
     pub fn discard(&mut self) {
         self.pending_images.clear();
+        self.draft_images.clear();
         self.history_index = None;
         self.draft = Prompt::default();
         self.buffer.clear();
@@ -390,11 +394,20 @@ impl InputBox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.value().trim().is_empty() && !self.has_images()
+        self.buffer.value().trim().is_empty()
     }
 
+    /// Whether a marker in the text names an attached image, so it would go
+    /// out with the text.
     pub fn has_images(&self) -> bool {
-        !self.pending_images.is_empty()
+        image_marker::markers(self.buffer.value())
+            .any(|marker| (1..=self.pending_images.len()).contains(&marker.number))
+    }
+
+    /// The attached image whose marker the caret is on.
+    pub fn image_at_caret(&self) -> Option<&ImageSource> {
+        let number = image_marker::number_at(self.buffer.value(), self.buffer.cursor_byte())?;
+        self.pending_images.get(number.checked_sub(1)?)
     }
 
     /// The text the user is composing. Under an untouched history recall that
@@ -427,7 +440,13 @@ impl InputBox {
     /// history recall the draft it covers is parked with its own marks.
     pub fn swap_draft(&mut self, draft: Draft) -> Draft {
         let parks_the_draft = self.is_untouched_recall();
-        let images = mem::replace(&mut self.pending_images, draft.images);
+        let shown_images = mem::replace(&mut self.pending_images, draft.images);
+        let covered_images = mem::take(&mut self.draft_images);
+        let images = if parks_the_draft {
+            covered_images
+        } else {
+            shown_images
+        };
         let shown = self.buffer.swap_prompt(Prompt {
             text: draft.text,
             marks: draft.marks,
@@ -480,8 +499,12 @@ impl InputBox {
         self.langs.poll() | syntax.is_some()
     }
 
+    /// The marker goes in where the caret is, so the prompt can point at the
+    /// image. Deleting it detaches the image, and undoing that brings it back,
+    /// so attached images are only let go of with the prompt.
     pub fn attach_image(&mut self, source: ImageSource) {
         self.pending_images.push(source);
+        self.handle_paste_with_spaces(&image_marker::label(self.pending_images.len()));
     }
 
     /// The way a plugin writes to the input. It carries the box's own state
@@ -508,6 +531,7 @@ impl InputBox {
         if self.buffer.version() != before {
             self.history_index = None;
             self.draft = Prompt::default();
+            self.draft_images.clear();
         }
         Ok(caret)
     }
@@ -518,7 +542,20 @@ impl InputBox {
     /// the same, so the marks of the old one go, see
     /// [`TextBuffer::swap_prompt`].
     pub fn set_input(&mut self, s: &str) {
+        self.set_input_with_images(s, Vec::new());
+    }
+
+    /// [`Self::set_input`] for a prompt that was sent: it comes back with the
+    /// images it went with, so its `[Image N]` markers name them again. The
+    /// images of the prompt it replaces go with that prompt.
+    pub fn set_input_with_images(&mut self, s: &str, images: Vec<ImageSource>) {
         self.buffer.set_value(s);
+        self.set_images(images);
+    }
+
+    /// Replaces the attached images, leaving the text that names them alone.
+    pub fn set_images(&mut self, images: Vec<ImageSource>) {
+        self.pending_images = images;
     }
 
     /// [`Self::set_input`] for text made from what the input holds: a
@@ -540,16 +577,19 @@ impl InputBox {
             return false;
         };
         let entry = self.history_entry(new_index);
+        let shown_images = mem::take(&mut self.pending_images);
         let shown = self.buffer.swap_prompt(entry);
         if self.history_index.replace(new_index).is_none() {
             self.draft = shown;
+            self.draft_images = shown_images;
         }
         self.buffer.move_to_end();
         true
     }
 
-    /// History keeps text only, so a recalled entry comes in with no marks,
-    /// and as the user's, who sent it. It holds only what went out, in the
+    /// History keeps text only, so a recalled entry comes in with no marks
+    /// and no images, and as the user's, who sent it. Its `[Image N]` markers
+    /// name nothing then, rather than the images of the draft it covers. It holds only what went out, in the
     /// form Enter read it, so it reads the same way again, see
     /// [`sent_text`].
     fn history_entry(&self, index: usize) -> Prompt {
@@ -566,10 +606,14 @@ impl InputBox {
             return false;
         };
         self.history_index = target;
-        let next = match target {
-            Some(index) => self.history_entry(index),
-            None => mem::take(&mut self.draft),
+        let (next, images) = match target {
+            Some(index) => (self.history_entry(index), Vec::new()),
+            None => (
+                mem::take(&mut self.draft),
+                mem::take(&mut self.draft_images),
+            ),
         };
+        self.pending_images = images;
         self.buffer.swap_prompt(next);
         true
     }
@@ -611,15 +655,14 @@ impl InputBox {
             }
         }
 
-        let total_vl = u16::try_from(text_rows + u32::from(!self.pending_images.is_empty()))
-            .unwrap_or(u16::MAX);
+        let total_vl = u16::try_from(text_rows).unwrap_or(u16::MAX);
         self.last_total_lines = total_vl;
         self.last_content_height = content_height.max(1);
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
         let is_empty = self.buffer.is_empty();
         let mut cursor_cell: Option<Position> = None;
-        let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
+        let styled_lines: Vec<Line> = if is_empty {
             let base = theme::current().input_placeholder;
             let (head, tail): (Cow<str>, _) = match placeholder {
                 Placeholder::Suggestion => (
@@ -679,20 +722,6 @@ impl InputBox {
             }
             lines
         };
-
-        // Only the visible rows were drawn, so the label, which sits right
-        // after the text, fits only when the text ends inside the box.
-        if !self.pending_images.is_empty() && styled_lines.len() < usize::from(content_height) {
-            let n = self.pending_images.len();
-            let label = match n {
-                1 => "1 image".to_string(),
-                _ => format!("{n} images"),
-            };
-            styled_lines.push(Line::from(Span::styled(
-                label,
-                theme::current().input_placeholder,
-            )));
-        }
 
         let text = Text::from(styled_lines);
         let mut block = Block::default()
@@ -1352,42 +1381,62 @@ mod tests {
         ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
     }
 
-    #[test]
-    fn submit_with_images() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
+    const DESCRIBE: &str = "describe";
 
+    #[test]
+    fn attached_image_is_marked_where_the_caret_is() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, DESCRIBE);
         input.attach_image(test_image());
+        type_text(&mut input, " and");
+        input.attach_image(test_image());
+        let label = image_marker::label;
+        assert_eq!(
+            input.buffer.value(),
+            format!("{DESCRIBE} {} and {}", label(1), label(2))
+        );
+
         let sub = input.submit().unwrap();
-        assert!(sub.text.is_empty());
-        assert_eq!(sub.images.len(), 1);
+        assert_eq!(sub.images.len(), 2);
         assert!(input.submit().is_none(), "images cleared after submit");
+    }
 
-        type_text(&mut input, "describe this");
+    #[test]
+    fn one_backspace_detaches_the_image_and_undo_brings_it_back() {
+        let mut input = ruled(RuleSet::with_plugins(&[]));
+        type_text(&mut input, DESCRIBE);
         input.attach_image(test_image());
+        assert!(input.image_at_caret().is_some(), "{PREVIEW_AFTER_PASTE}");
+
+        input.handle_key(KeyEvent::from(KeyCode::Backspace), InputMode::Insert);
+        assert_eq!(input.buffer.value(), format!("{DESCRIBE} "));
+        assert!(!input.has_images());
+
+        assert!(input.undo());
+        assert!(input.has_images());
         let sub = input.submit().unwrap();
-        assert_eq!(sub.text, "describe this");
+        assert_eq!(sub.text, format!("{DESCRIBE} {}", image_marker::label(1)));
         assert_eq!(sub.images.len(), 1);
     }
 
-    const IMAGE_LABEL: &str = "1 image";
-
     #[test]
-    fn image_label_rendered() {
+    fn history_recall_leaves_the_draft_images_with_the_draft() {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.attach_image(test_image());
-        let h = input.height(40);
-        let terminal = render_input(&mut input, 40, h);
-        let found = (0..h).any(|row| rendered_row(&terminal, row).contains(IMAGE_LABEL));
-        assert!(found, "image label not found in rendered output");
+        let sent = input.submit().unwrap();
+        input.attach_image(test_image());
+
+        assert!(input.history_up());
+        assert!(!input.has_images(), "{RECALL_IS_TEXT_ONLY}");
+        assert!(input.history_down());
+        let draft = input.submit().unwrap();
+        assert_eq!(draft.text, sent.text);
+        assert_eq!(draft.images.len(), 1, "{DRAFT_KEEPS_IMAGES}");
     }
 
-    #[test]
-    fn height_accounts_for_pending_images() {
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        let base_height = input.height(TEST_WIDTH);
-        input.attach_image(test_image());
-        assert_eq!(input.height(TEST_WIDTH), base_height + 1);
-    }
+    const RECALL_IS_TEXT_ONLY: &str = "a recalled marker must not name the draft's image";
+    const DRAFT_KEEPS_IMAGES: &str = "walking back past the history gives the draft its images";
+    const PREVIEW_AFTER_PASTE: &str = "the caret right after a paste previews the image";
 
     #[test_case("read", "src/main.rs", " src/main.rs" ; "leading_after_ascii")]
     #[test_case("打开", "src/main.rs", " src/main.rs" ; "leading_after_unicode")]

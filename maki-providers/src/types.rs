@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 
 use crate::TokenUsage;
 use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
+use crate::image_marker;
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
@@ -787,17 +788,57 @@ impl Message {
         }
     }
 
+    /// Each image goes right after the first `[Image N]` in {text} that names
+    /// it, so the model reads it where the user put it and keeps the label to
+    /// refer to it by. Images nothing names follow the text. The text is cut
+    /// into blocks then, so `display_text` keeps it whole for the transcript.
     pub fn user_with_images(text: String, images: Vec<ImageSource>) -> Self {
-        let mut content: Vec<ContentBlock> = images
-            .into_iter()
-            .map(|source| ContentBlock::Image { source })
-            .collect();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
+        let mut placed = vec![false; images.len()];
+        let mut content = Vec::new();
+        let mut copied = 0;
+        for marker in image_marker::markers(&text) {
+            let Some(slot) = marker
+                .number
+                .checked_sub(1)
+                .filter(|&slot| placed.get(slot).is_some_and(|placed| !placed))
+            else {
+                continue;
+            };
+            placed[slot] = true;
+            content.push(ContentBlock::Text {
+                text: text[copied..marker.range.end].to_owned(),
+            });
+            content.push(ContentBlock::Image {
+                source: images[slot].clone(),
+            });
+            copied = marker.range.end;
         }
+        let unplaced = images
+            .into_iter()
+            .zip(placed)
+            .filter(|(_, placed)| !placed)
+            .map(|(source, _)| ContentBlock::Image { source });
+        if content.is_empty() {
+            content.extend(unplaced);
+            if !text.is_empty() {
+                content.push(ContentBlock::Text { text });
+            }
+            return Self {
+                role: Role::User,
+                content,
+                ..Default::default()
+            };
+        }
+        if !text[copied..].trim().is_empty() {
+            content.push(ContentBlock::Text {
+                text: text[copied..].to_owned(),
+            });
+        }
+        content.extend(unplaced);
         Self {
             role: Role::User,
             content,
+            display_text: Some(text),
             ..Default::default()
         }
     }
@@ -1842,6 +1883,32 @@ mod tests {
         let msg = Message::user_with_images(String::new(), vec![source]);
         assert_eq!(msg.content.len(), 1);
         assert!(matches!(&msg.content[0], ContentBlock::Image { .. }));
+    }
+
+    /// What a user message holds, `Text` blocks by their text and images by
+    /// their data.
+    fn user_blocks(msg: &Message) -> Vec<String> {
+        msg.content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::Image { source } => format!("<{}>", source.data),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test_case("a [Image 2] b [Image 1] c", &["a [Image 2]", "<two>", " b [Image 1]", "<one>", " c"] ; "each_image_after_its_marker")]
+    #[test_case("[Image 1] and [Image 1]",    &["[Image 1]", "<one>", " and [Image 1]", "<two>"] ; "repeat_stays_text_and_unnamed_image_goes_last")]
+    #[test_case("x [Image 2]\n",              &["x [Image 2]", "<two>", "<one>"]           ; "blank_tail_dropped")]
+    #[test_case("plain",                      &["<one>", "<two>", "plain"]                 ; "no_marker_keeps_images_first")]
+    fn user_with_images_places_images_at_markers(text: &str, expected: &[&str]) {
+        let images = ["one", "two"]
+            .map(|data| ImageSource::new(ImageMediaType::Png, Arc::from(data)))
+            .to_vec();
+        let msg = Message::user_with_images(text.into(), images);
+        assert_eq!(user_blocks(&msg), expected);
+        assert_eq!(msg.user_text(), Some(text));
     }
 
     #[test]

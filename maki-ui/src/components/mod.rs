@@ -5,6 +5,7 @@ pub mod command;
 pub(crate) mod file_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
+pub(crate) mod image_preview;
 pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;
@@ -307,7 +308,12 @@ pub enum Action {
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),
     /// A copy of this session, to run beside it and take the focus.
-    OpenFork(Box<OpenSession>),
+    OpenFork {
+        open: Box<OpenSession>,
+        /// What the `[Image N]` markers of its draft name. A draft on disk
+        /// keeps text only, so they travel beside it.
+        draft_images: Vec<ImageSource>,
+    },
     ChangeModel(String),
     RefreshProvider {
         slug: String,

@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::app::tasks::count_phrase;
+use crate::chat::user_images;
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_providers::{Message, Role};
+use maki_providers::{ImageSource, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -54,6 +55,8 @@ pub struct RewindEntry {
     pub turn_index: usize,
     pub prompt_preview: String,
     pub prompt_text: String,
+    /// What the prompt's `[Image N]` markers name.
+    pub images: Vec<ImageSource>,
 }
 
 impl PickerItem for RewindEntry {
@@ -117,6 +120,7 @@ impl RewindPicker {
                 turn_index: sent_from,
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
+                images: user_images(msg),
             });
         }
         if entries.is_empty() {
@@ -226,7 +230,7 @@ mod tests {
     use crate::components::buffer_text;
     use crossterm::event::KeyModifiers;
     use maki_agent::USER_CANCEL_MARKER;
-    use maki_providers::ContentBlock;
+    use maki_providers::{ContentBlock, ImageMediaType};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use test_case::test_case;
@@ -305,6 +309,18 @@ mod tests {
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("user typed this"));
         assert_eq!(item.prompt_text, "user typed this");
+    }
+
+    #[test]
+    fn entry_keeps_the_images_its_markers_name() {
+        const PROMPT: &str = "what is [Image 1]";
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("aW1n"));
+        let mut picker = RewindPicker::new();
+        let msg = Message::user_with_images(PROMPT.into(), vec![image.clone()]);
+        picker.open(&[msg], &[]).unwrap();
+        let item = picker.picker.selected_item().unwrap();
+        assert_eq!(item.prompt_text, PROMPT);
+        assert_eq!(item.images, [image]);
     }
 
     #[test]

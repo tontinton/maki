@@ -41,6 +41,13 @@ pub fn instruction_parent(id: &str) -> Option<&str> {
     id.strip_suffix(INST_SUFFIX)
 }
 
+pub(super) struct PlacedImage {
+    pub source: ImageSource,
+    pub fallback: Option<&'static str>,
+    /// How many of the segment's lines go above it, `None` for all of them.
+    pub after_line: Option<usize>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CachedHeight {
     at_width: u16,
@@ -69,6 +76,10 @@ impl HighlightKey {
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub images: Vec<InlineImage>,
+    /// For each image, how many lines are drawn before it, or `None` to draw
+    /// it after all of them. Never decreasing, and a `None` is followed only
+    /// by `None`s.
+    image_lines: Vec<Option<usize>>,
     pub tool_id: Option<String>,
     /// Drawn on the first row only, left of the body. The height cache does
     /// not see it, so set it before `set_lines`.
@@ -146,19 +157,40 @@ impl Segment {
             })
     }
 
-    pub fn set_images(
-        &mut self,
-        sources: impl Iterator<Item = (ImageSource, Option<&'static str>)>,
-    ) {
+    pub fn set_images(&mut self, sources: impl IntoIterator<Item = PlacedImage>) {
         let mut previous = mem::take(&mut self.images).into_iter();
-        self.images = sources
-            .map(|(source, fallback)| {
-                previous
-                    .next()
-                    .filter(|image| Arc::ptr_eq(&image.source().data, &source.data))
-                    .unwrap_or_else(|| InlineImage::new(source, fallback))
-            })
-            .collect();
+        self.image_lines.clear();
+        let mut floor = Some(0);
+        for placed in sources {
+            floor = floor
+                .zip(placed.after_line)
+                .map(|(floor, line)| floor.max(line));
+            self.image_lines.push(floor);
+            let image = previous
+                .next()
+                .filter(|image| Arc::ptr_eq(&image.source().data, &placed.source.data))
+                .unwrap_or_else(|| InlineImage::new(placed.source, placed.fallback));
+            self.images.push(image);
+        }
+    }
+
+    /// The lines drawn right before image {index}, or after the last image
+    /// when {index} is past it. The runs of all indices cover every line once.
+    pub fn lines_before_image(&self, index: usize) -> Range<usize> {
+        let end_of = |i: usize| match self.image_lines.get(i) {
+            Some(Some(line)) => (*line).min(self.lines.len()),
+            _ => self.lines.len(),
+        };
+        let start = index.checked_sub(1).map_or(0, end_of);
+        start..end_of(index)
+    }
+
+    /// Rows the lines in {range} take at `width`.
+    pub fn rows_of(&self, range: Range<usize>, width: u16) -> u16 {
+        if range == (0..self.lines.len()) {
+            return self.text_height(width);
+        }
+        wrap::total_rows(&self.lines[range], self.body_width(width))
     }
 
     pub fn poll_images(&mut self) -> Dirty {
@@ -200,8 +232,14 @@ impl Segment {
 
     /// A cursor parked on the source line that covers display row `start_row`.
     pub fn rows_from(&self, start_row: u16, width: u16) -> RowWalk<'_> {
+        self.rows_in(0..self.lines.len(), start_row, width)
+    }
+
+    /// [`Self::rows_from`] over the lines in {range} alone, with rows counted
+    /// from the first of them.
+    pub fn rows_in(&self, range: Range<usize>, start_row: u16, width: u16) -> RowWalk<'_> {
         let mut walk = RowWalk {
-            lines: &self.lines,
+            lines: &self.lines[range],
             measure: wrap::Measure::new(self.body_width(width)),
             next_line: 0,
             row: 0,

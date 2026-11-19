@@ -31,6 +31,7 @@ use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::Picker;
 
 use crate::repaint::{Cadence, Dirty};
 
@@ -433,6 +434,10 @@ impl Chat {
 
     pub fn tick(&mut self) -> Dirty {
         self.messages_panel.tick()
+    }
+
+    pub fn image_picker(&self) -> Option<&Picker> {
+        self.messages_panel.image_picker()
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -1008,7 +1013,7 @@ fn build_loaded_tool(
 
 /// Images the user attached. A tool result also rides in a user message, and
 /// its images already render under the tool itself, so those stay out.
-fn user_images(msg: &Message) -> Vec<ImageSource> {
+pub(crate) fn user_images(msg: &Message) -> Vec<ImageSource> {
     if msg
         .content
         .iter()

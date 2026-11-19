@@ -9,7 +9,7 @@ pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
 use self::scroll::Layout;
-use self::segment::{Segment, SegmentCache, body_width};
+use self::segment::{PlacedImage, Segment, SegmentCache, body_width};
 
 use super::tool_display::{
     MOVABLE_HINT, RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info,
@@ -27,10 +27,11 @@ use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
 use crate::selection::{DocPos, RowPos, Selection};
 use crate::splash::{ColorTransition, Splash};
-use crate::terminal_image;
+use crate::terminal_image::{self, InlineImage};
 use crate::theme;
 use crate::update;
 use maki_config::{ClockFormat, ThinkingLines, ToolOutputLines, UiConfig};
+use maki_providers::image_marker;
 use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -42,8 +43,8 @@ use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use super::thinking;
 use maki_agent::{
-    BufWatch, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
-    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BufWatch, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
@@ -64,6 +65,17 @@ const CLICKABLE: bool = true;
 const NOTICE_COLLAPSED_MARK: &str = " ▸";
 const NOTICE_EXPANDED_MARK: &str = " ▾";
 const NOTICE_DETAIL_DIM: f32 = 0.7;
+
+/// Draws {image} from the top of {area} the way the transcript draws its
+/// own, clipped to {area}.
+pub(crate) fn render_image(
+    image: &mut InlineImage,
+    picker: &Picker,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    RenderCursor::new(0, area).render_image(image, Some(picker), true, None, frame);
+}
 
 /// What a click in the transcript asks of the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,6 +934,11 @@ impl MessagesPanel {
     /// image decodes. These used to run inside [`Self::view`], which is why a
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
+    /// `None` when the terminal draws no images.
+    pub fn image_picker(&self) -> Option<&Picker> {
+        self.image_picker.as_ref()
+    }
+
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
         if self.show_idle_splash() {
@@ -1073,9 +1090,18 @@ impl MessagesPanel {
             } else {
                 None
             };
-            cursor.render_segment(seg, style, highlight, frame);
-            for image in &mut seg.images {
-                cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
+            for index in 0..=seg.images.len() {
+                let lines = seg.lines_before_image(index);
+                cursor.render_segment(seg, lines, style, highlight, frame);
+                if let Some(image) = seg.images.get_mut(index) {
+                    cursor.render_image(
+                        image,
+                        self.image_picker.as_ref(),
+                        images_visible,
+                        style,
+                        frame,
+                    );
+                }
             }
             last_drawn = i;
         }
@@ -1609,7 +1635,7 @@ impl MessagesPanel {
 
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.update_with_reuse(tl, &self.hl_worker);
-        seg.set_images(message_images(msg));
+        seg.set_images(message_images(msg, &[]));
 
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks);
@@ -1631,7 +1657,7 @@ impl MessagesPanel {
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_tool(id.clone());
                 seg.apply_highlight(tl, &self.hl_worker);
-                seg.set_images(message_images(msg));
+                seg.set_images(message_images(msg, &[]));
                 self.cache.push(seg);
                 self.cache.reserve_instructions(&id);
 
@@ -1645,10 +1671,11 @@ impl MessagesPanel {
             } else {
                 let view = message_view(msg, self.thinking_lines, self.viewport_width);
                 self.cache.push_spacer_if_needed();
+                let images = message_images(msg, &view.lines);
                 let mut seg = Segment::with_lines(view.lines, Some(i));
                 seg.gutter = view.gutter;
                 seg.truncation.output = view.collapsed;
-                seg.set_images(message_images(msg));
+                seg.set_images(images);
                 self.cache.push(seg);
             }
         }
@@ -1746,24 +1773,66 @@ impl MessagesPanel {
             return;
         };
         seg.gutter = view.gutter;
+        seg.set_images(message_images(msg, &view.lines));
         seg.set_lines(view.lines);
         seg.truncation.output = view.collapsed;
     }
 }
 
-/// An image the message carries is all there is to see, so a terminal without
-/// graphics gets an `[image]` line in its place. A tool's image already has a
-/// header naming the file above it, so it needs no stand-in.
-fn message_images(
-    msg: &DisplayMessage,
-) -> impl Iterator<Item = (ImageSource, Option<&'static str>)> + '_ {
+/// A user's image goes right below the line with its `[Image N]` marker. An
+/// image the message carries without one is all there is to see, so it goes
+/// last and a terminal without graphics gets an `[image]` line in its place.
+/// A tool's image already has a header naming the file above it, so it needs
+/// no stand-in.
+fn message_images(msg: &DisplayMessage, lines: &[Line<'static>]) -> Vec<PlacedImage> {
+    let marked = if matches!(msg.role, DisplayRole::User) && !msg.images.is_empty() {
+        marker_lines(lines, msg.images.len())
+    } else {
+        Vec::new()
+    };
     msg.images
         .iter()
-        .map(|source| (source.clone(), Some(IMAGE_PLACEHOLDER)))
+        .enumerate()
+        .map(|(index, source)| {
+            let after_line = marked.get(index).copied().flatten();
+            PlacedImage {
+                source: source.clone(),
+                fallback: after_line.is_none().then_some(IMAGE_PLACEHOLDER),
+                after_line,
+            }
+        })
         .chain(match msg.tool_output.as_deref() {
-            Some(ToolOutput::Image { source, .. }) => Some((source.clone(), None)),
+            Some(ToolOutput::Image { source, .. }) => Some(PlacedImage {
+                source: source.clone(),
+                fallback: None,
+                after_line: None,
+            }),
             _ => None,
         })
+        .collect()
+}
+
+/// For each of {count} images, how many of {lines} go up to and including
+/// the first one with its marker.
+fn marker_lines(lines: &[Line<'static>], count: usize) -> Vec<Option<usize>> {
+    let mut marked = vec![None; count];
+    for (index, line) in lines.iter().enumerate() {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        for marker in image_marker::markers(&text) {
+            if let Some(slot @ None) = marker
+                .number
+                .checked_sub(1)
+                .and_then(|slot| marked.get_mut(slot))
+            {
+                *slot = Some(index + 1);
+            }
+        }
+    }
+    marked
 }
 
 fn message_style(role: &DisplayRole) -> RoleStyle {

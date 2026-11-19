@@ -14,7 +14,7 @@ use maki_agent::{
 };
 use maki_config::DEFAULT_THINKING_LINES;
 use maki_markdown::render::CODE_BAR;
-use maki_providers::ImageMediaType;
+use maki_providers::{ImageMediaType, ImageSource};
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use std::collections::HashSet;
@@ -92,6 +92,25 @@ fn pasted_image_falls_back_to_text() {
         (1, true),
         "{FALLBACK_ROW}"
     );
+}
+
+#[test_case("look\n[Image 1]\nafter", 0..2, 0  ; "marked_image_goes_below_its_line")]
+#[test_case("look\nafter",            0..2, 1  ; "unmarked_image_goes_last_with_a_fallback")]
+fn pasted_image_placement(text: &str, lines_above: Range<usize>, fallback_rows: u16) {
+    let mut panel = panel_with_tools(&[]);
+    panel.image_picker = None;
+    panel.push(DisplayMessage::with_images(
+        DisplayRole::User,
+        text.into(),
+        vec![ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(UNDECODABLE_IMAGE),
+        )],
+    ));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let segment = panel.cache.get(0).unwrap();
+    assert_eq!(segment.lines_before_image(0), lines_above);
+    assert_eq!(image_fallback(segment, &terminal).0, fallback_rows);
 }
 
 /// Rows the image adds on top of the text, and whether the `[image]` line made

@@ -16,7 +16,9 @@ use maki_agent::session::SessionHeader;
 use maki_agent::{CompactRequest, SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
-use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
+use maki_providers::{
+    ImageSource, Message, Model, RequestOptions, TokenUsage, estimate_message_tokens,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredWriters,
@@ -346,7 +348,7 @@ impl App {
         let meta = &self.state.session.meta;
         if let Some(draft) = meta.input_draft.clone() {
             let writers = meta.input_draft_writers;
-            self.restore_input(&draft, writers);
+            self.restore_input(&draft, Vec::new(), writers);
         }
 
         self.chats[MAIN_CHAT].request_restores(restore_items);
@@ -623,14 +625,14 @@ impl App {
     /// copy as a session of its own and focuses it, so this one keeps running
     /// in the background, untouched.
     pub(super) fn fork_session(&mut self) -> Vec<Action> {
-        self.fork_session_with(|_| {})
+        self.fork_session_with(Vec::new(), |_| {})
     }
 
     /// The rewind picker's fork. The copy stops right before the chosen prompt
     /// and keeps that prompt as its draft, so it feels like a rewind that left
-    /// the original alone.
+    /// the original alone. The prompt's images go with it, as on a rewind.
     pub(super) fn fork_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        self.fork_session_with(|forked| {
+        self.fork_session_with(entry.images, |forked| {
             // A receipt the copy drops was never made there, so its id must
             // not come back as a lost notice.
             let mut pending = mem::take(&mut forked.meta.pending_background);
@@ -645,7 +647,11 @@ impl App {
         })
     }
 
-    fn fork_session_with(&mut self, adjust: impl FnOnce(&mut AppSession)) -> Vec<Action> {
+    fn fork_session_with(
+        &mut self,
+        draft_images: Vec<ImageSource>,
+        adjust: impl FnOnce(&mut AppSession),
+    ) -> Vec<Action> {
         // The last frame's snapshot still has `/fork` in the input box, and it
         // can miss what the agent wrote since, so take a fresh one.
         self.checkpoint_now();
@@ -666,7 +672,16 @@ impl App {
         // Without this a young session forks into "fork of New session".
         session.update_title_if_default(None);
         session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
-        vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
+        vec![Action::OpenFork {
+            open: Box::new(OpenSession { session, claim }),
+            draft_images,
+        }]
+    }
+
+    /// Attaches the images a draft restored from disk could not keep, see
+    /// [`Action::OpenFork`].
+    pub(crate) fn restore_draft_images(&mut self, images: Vec<ImageSource>) {
+        self.input_box.set_images(images);
     }
 
     /// Each running task, keyed by the call whose receipt a rewind would drop.
@@ -741,7 +756,8 @@ impl App {
             self.chats[MAIN_CHAT].set_tool_background(&id, badge);
         }
 
-        self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
+        let writers = turn_writers(&entry.prompt_text);
+        self.restore_input(&entry.prompt_text, entry.images, writers);
 
         actions.push(Action::RestartAgent(self.install_local_history()));
         actions
@@ -749,9 +765,15 @@ impl App {
 
     /// Puts back a draft from disk or a rewound turn. Its {writers} come back
     /// as one nameless plugin holding what was kept of their grants, see
-    /// [`turn_writers`] for a turn.
-    fn restore_input(&mut self, text: &str, writers: Option<StoredWriters>) {
-        self.input_box.set_input(text);
+    /// [`turn_writers`] for a turn. A rewound turn brings the {images} its
+    /// markers name. A draft on disk kept no images, so it brings none.
+    fn restore_input(
+        &mut self,
+        text: &str,
+        images: Vec<ImageSource>,
+        writers: Option<StoredWriters>,
+    ) {
+        self.input_box.set_input_with_images(text, images);
         if let Some(writers) = writers {
             self.input_box.buffer.add_writer(&unknown_writer(writers));
         }
