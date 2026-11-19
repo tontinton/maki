@@ -40,6 +40,7 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 - **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.
 - **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
+- **Permission level.** A `Permissions` option next to the model picks how prompts are answered: `ask` shows each prompt in the editor, `yolo` allows every call that no deny rule blocks. It starts on `ask`, or on `yolo` with `--yolo`. A plugin can add levels with [`maki.api.register_permission_mode`](/docs/lua-api/#maki-api-register_permission_mode), and they appear in the same list.
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
 - **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
 - **Images and context.** Prompts can include images and editor-attached files.

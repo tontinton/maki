@@ -57,6 +57,10 @@ use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_cursor, release_mode};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::permission_mode::{
+    PermissionModeInfo, PermissionModeStore, clear_plugin_permission_modes,
+    list as list_permission_modes, select as select_permission_mode,
+};
 use crate::api::plan::{
     PlanRowHandlers, RowHandler, RowOwners, clear_plugin_rows, clear_session_rows,
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
@@ -192,6 +196,10 @@ const PLAN_FORM_COST: LayerCost<'static> = LayerCost::TOTAL;
 /// The whole budget a pick can take here, so the UI derives its own fallback
 /// from it rather than from a number of its own.
 pub const PLAN_ROW_HANDLER_DEADLINE: Duration = Duration::from_secs(30);
+/// Wall clock a permission mode's `on_select` gets. A host waits for it before
+/// it tells the user the level changed.
+const PERMISSION_MODE_DEADLINE: Duration = Duration::from_secs(10);
+const PERMISSION_MODE_TIMEOUT_ERR: &str = "permission mode handler timed out";
 const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
 const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
 const NO_PLUGIN_HOST: &str = "no plugin host is running this code";
@@ -571,6 +579,18 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: SyncSender<PluginOptionSpecs>,
+    },
+    /// The levels plugins registered with `maki.api.register_permission_mode`.
+    PermissionModes {
+        reply: oneshot::Sender<Vec<PermissionModeInfo>>,
+    },
+    /// Runs the owner's `on_select` for {id}. Spawned, so a handler that parks
+    /// holds back only its own answer.
+    SelectPermissionMode {
+        id: String,
+        session: String,
+        selected: bool,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
@@ -3837,6 +3857,7 @@ impl LuaRuntime {
         });
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(ActionStore::default());
+        lua.set_app_data(PermissionModeStore::default());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(WinStore::default());
@@ -3937,6 +3958,7 @@ impl LuaRuntime {
         // handler captured the permissions the user just revoked.
         clear_plugin_rows(&self.lua, name);
         clear_plugin_actions(&self.lua, name);
+        clear_plugin_permission_modes(&self.lua, name);
         release_mode(&self.lua, name);
         release_cursor(&self.lua, name);
         let mut revision_guard = None;
@@ -6179,6 +6201,25 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::PermissionModes { reply } => {
+                            let _ = reply.send(list_permission_modes(&rt.lua));
+                        }
+                        Request::SelectPermissionMode {
+                            id,
+                            session,
+                            selected,
+                            reply,
+                        } => {
+                            let lua = rt.lua.clone();
+                            spawn_local(async move {
+                                let run = select_permission_mode(&lua, &id, &session, selected);
+                                let answer = match timeout(PERMISSION_MODE_DEADLINE, run).await {
+                                    Ok(answer) => answer,
+                                    Err(_) => Err(PERMISSION_MODE_TIMEOUT_ERR.to_owned()),
+                                };
+                                let _ = reply.send(answer);
+                            });
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());

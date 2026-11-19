@@ -32,6 +32,7 @@ declare maki: {
     del_autocmd: @checked (id: number) -> (),
     exec_autocmds: @checked (event: any, opts: any) -> (),
     register_action: @checked (name: string, callback: any, opts: any) -> (string),
+    register_permission_mode: @checked (spec: any) -> (),
     declare_slot: @checked (name: string, default: any, opts: any) -> (any),
     set_slot: @checked (name: string, wrapper: any) -> (),
     get_slots: @checked () -> (any),

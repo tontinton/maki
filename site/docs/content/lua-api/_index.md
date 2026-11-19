@@ -1183,6 +1183,51 @@ end, { capability = { "fs_read", "input", "session_read", "agent", "session_writ
 
 ---
 
+### `maki.api.register_permission_mode()` {#maki-api-register_permission_mode}
+
+```lua
+maki.api.register_permission_mode({spec})
+```
+
+Adds a permission level that hosts with a permission picker list next to
+their own, like the `Permissions` option an ACP client shows. A host that
+has no picker ignores it.
+
+Choosing the mode calls `on_select(session, true)`. Choosing another level
+afterwards, or the session ending, calls `on_select(session, false)`, so
+the handler is where the plugin switches its behavior on and off. What the
+mode does is up to the plugin, typically by layering `permission.prompt`.
+The host only knows the id, so pick one that is unlikely to collide.
+Registering an id again replaces the earlier mode, and the mode goes away
+when your plugin unloads.
+
+Throws when `id` is blank or `on_select` is missing.
+
+Requires the `session_settings` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{spec}` (`table`) `{ id, name?, description?, on_select }`. `id` (string)
+  is what the host stores and hands back. `name` (string) is the label,
+  default the id. `description` (string) is the help text. `on_select`
+  (function) is called with the session id (string) and whether the mode
+  was selected (boolean).
+
+**Example:**
+
+```lua
+maki.api.register_permission_mode({
+  id = "judge",
+  name = "Judge",
+  description = "A model answers permission prompts",
+  on_select = function(session, selected)
+    enabled = selected
+  end,
+})
+```
+
+---
+
 ### `maki.api.declare_slot()` {#maki-api-declare_slot}
 
 ```lua

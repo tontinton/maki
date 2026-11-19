@@ -15,6 +15,7 @@ pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod pack;
+pub(crate) mod permission_mode;
 pub(crate) mod plan;
 pub(crate) mod provider;
 pub(crate) mod session;
@@ -83,6 +84,7 @@ pub(crate) fn create_maki_global(
         permissions.is_allowed(Permission::SessionRead),
     )?;
     action::add_action_methods(&api, lua, Arc::clone(&plugin), reach.clone())?;
+    permission_mode::add_permission_mode_methods(&api, lua, permissions, Arc::clone(&plugin))?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin), permissions.clone())?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
