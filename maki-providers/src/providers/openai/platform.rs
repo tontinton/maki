@@ -549,6 +549,10 @@ impl Provider for OpenAi {
         })
     }
 
+    fn needs_model_discovery(&self) -> bool {
+        self.auth.held_tokens().is_some()
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             if self.auth.uses_oauth().await? {
