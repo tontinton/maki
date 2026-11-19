@@ -150,9 +150,10 @@ impl Resumed {
 /// and `gauge` under one owner, and the store joins them so a driver cannot
 /// hold a transcript it never persists.
 ///
-/// The transcript is only reachable through [`Self::turn`], whose guard writes
-/// it back when it drops, so "built an agent and forgot to persist it" is not a
-/// mistake a driver can make.
+/// The transcript is only reachable through [`Self::turn`] or
+/// [`Self::turn_as_before`], whose guard writes it back when it drops, so
+/// "built an agent and forgot to persist it" is not a mistake a driver can
+/// make.
 ///
 /// Work moved off a turn can keep spending after the last turn ended.
 /// Dropping the track writes that spend, so a driver drops it once the work
@@ -227,17 +228,23 @@ impl SessionTrack {
     /// reported yet. Moved work sends no events a frontend sees, so this
     /// turn's `Done` is where that spend shows up.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
-        let unreported = self.spend.totals().since(&self.reported);
-        let ledger = RunLedger::carrying(&self.spend, unreported);
-        let session = &mut self.store.session;
-        session.set_model(model_spec);
-        session.meta.mode = Some(match input.mode {
+        let meta = &mut self.store.session.meta;
+        meta.mode = Some(match input.mode {
             AgentMode::Build => StoredMode::Build,
             AgentMode::Plan(_) => StoredMode::Plan,
         });
-        session.meta.thinking = Some(input.thinking.into());
-        session.meta.fast = input.fast;
-        session.meta.workflow = input.workflow;
+        meta.thinking = Some(input.thinking.into());
+        meta.fast = input.fast;
+        meta.workflow = input.workflow;
+        self.turn_as_before(model_spec)
+    }
+
+    /// A [`Self::turn`] with no input, like a `/compact`, so the settings
+    /// stay what the last turn ran under.
+    pub fn turn_as_before(&mut self, model_spec: String) -> SessionTurn<'_> {
+        let unreported = self.spend.totals().since(&self.reported);
+        let ledger = RunLedger::carrying(&self.spend, unreported);
+        self.store.session.set_model(model_spec);
         self.store.publish_header(true);
         SessionTurn {
             track: self,
@@ -289,6 +296,12 @@ impl SessionTurn<'_> {
     /// so the agent must be built with this one.
     pub fn ledger(&self) -> Arc<RunLedger> {
         Arc::clone(&self.ledger)
+    }
+
+    /// The tool catalog the last prompt ran with, stored ones included, so a
+    /// turn with no input of its own keeps the frame that prompt had.
+    pub fn workflow(&self) -> bool {
+        self.track.store.session.meta.workflow
     }
 
     pub fn run_params(

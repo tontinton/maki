@@ -21,7 +21,7 @@ use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
+use crate::agent::{self, AgentHooks, CompactReason, HostPrompt, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
@@ -32,9 +32,9 @@ use crate::tools::{
 };
 use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
-    EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
-    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
+    DoneReason, EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger,
+    RunTotals, SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -209,26 +209,23 @@ impl KeepAlive {
 enum Next {
     Prompt(AgentInput),
     Woken(AgentInput),
+    /// A `/compact`, with the user's guidance for the summary.
+    Compact(Option<String>),
 }
 
 impl Next {
     /// Whether the turn still runs, on the model it had, once a switch
-    /// failed. A prompt's caller has its answer in the error. Woken notices
-    /// are already out of the mailbox, so skipping the turn loses them.
+    /// failed. A prompt's or compaction's caller has its answer in the
+    /// error. Woken notices are already out of the mailbox, so skipping the
+    /// turn loses them.
     fn survives_failed_switch(&self) -> bool {
         matches!(self, Self::Woken(_))
-    }
-
-    fn into_input(self) -> AgentInput {
-        match self {
-            Self::Prompt(input) | Self::Woken(input) => input,
-        }
     }
 }
 
 /// Where an interactive session's turns come from.
 struct Inputs {
-    prompts: UnboundedReceiver<AgentInput>,
+    host: UnboundedReceiver<SessionInput>,
     modes: UnboundedReceiver<AgentMode>,
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
@@ -246,8 +243,11 @@ impl Inputs {
     async fn next(&mut self) -> Option<Next> {
         let stop = self.stop.clone();
         let next = async {
-            if let Some(input) = self.prompts.recv().await {
-                return Some(Next::Prompt(input));
+            if let Some(asked) = self.host.recv().await {
+                return Some(match asked {
+                    SessionInput::Prompt(input) => Next::Prompt(input),
+                    SessionInput::Compact(guidance) => Next::Compact(guidance),
+                });
             }
             if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
                 self.keep_alive.switch_mode(mode);
@@ -444,13 +444,32 @@ pub struct InteractiveParams {
     /// the input has ended.
     pub background: BackgroundMode,
     /// Firing it cancels the run in flight and ends the session without
-    /// waiting for background work. Prompts still queued never run.
+    /// waiting for background work. Inputs still queued never run.
     pub stop: CancelToken,
+}
+
+/// What a host asks of its session. One channel carries both, so they run
+/// in the order sent, and what is queued when the input ends still runs
+/// unless the session is stopped.
+pub enum SessionInput {
+    Prompt(AgentInput),
+    /// A `/compact` with the user's guidance for the summary, cancelled by
+    /// [`InteractiveHandle::cancel_tx`]. It ends in `Done` with
+    /// [`DoneReason::Compact`] (an empty transcript too, untouched), `Done`
+    /// with [`DoneReason::Cancelled`], or `Error`.
+    Compact(Option<String>),
+}
+
+impl From<AgentInput> for SessionInput {
+    fn from(input: AgentInput) -> Self {
+        Self::Prompt(input)
+    }
 }
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: UnboundedSender<AgentInput>,
+    /// Dropping it ends the input.
+    pub input_tx: UnboundedSender<SessionInput>,
     pub answer_tx: UnboundedSender<String>,
     pub cancel_tx: watch::Sender<()>,
     pub model_tx: UnboundedSender<Model>,
@@ -504,7 +523,7 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
+    let (input_tx, input_rx) = unbounded_channel::<SessionInput>();
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (cancel_tx, cancel_rx) = watch::channel(());
     let (model_tx, mut model_rx) = unbounded_channel::<Model>();
@@ -559,7 +578,7 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
             .as_ref()
             .map_or_else(FileAccess::fresh, |seed| Arc::clone(&seed.file_access));
         let mut inputs = Inputs {
-            prompts: input_rx,
+            host: input_rx,
             modes: mode_rx,
             keep_alive: KeepAlive::new(mailbox.clone(), params.background),
             stop: params.stop.clone(),
@@ -612,61 +631,98 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                     provider: Arc::clone(&provider),
                 }));
             }
-            let input = next.into_input();
+            let (result, totals) = match next {
+                Next::Compact(guidance) => {
+                    compact_session(
+                        &mut track,
+                        &provider,
+                        &model,
+                        event_tx,
+                        &context,
+                        mcp.as_ref(),
+                        &cancel,
+                        &session_ref_clone,
+                        &params.config,
+                        params.timeouts,
+                        &params.model_policy,
+                        guidance.as_deref(),
+                    )
+                    .await
+                }
+                Next::Prompt(mut input) | Next::Woken(mut input) => {
+                    // An ask holds this lock from before its request goes out
+                    // until its answer lands, so a free lock means nothing
+                    // queued has a taker. A call moved to the background can
+                    // still be parked on it after its run ended: then whatever
+                    // is queued may be its answer, and the new run must not
+                    // wait for it to arrive.
+                    if let Ok(mut answers) = answer_rx.try_lock() {
+                        while answers.try_recv().is_ok() {}
+                    }
 
-            // An ask holds this lock from before its request goes out until
-            // its answer lands, so a free lock means nothing queued has a
-            // taker. A call moved to the background can still be parked on
-            // it after its run ended: then whatever is queued may be its
-            // answer, and the new run must not wait for it to arrive.
-            if let Ok(mut answers) = answer_rx.try_lock() {
-                while answers.try_recv().is_ok() {}
-            }
+                    adopt_chat_settings(seed.as_deref(), &input);
+                    inputs.keep_alive.follow(&input);
 
-            adopt_chat_settings(seed.as_deref(), &input);
-            inputs.keep_alive.follow(&input);
+                    // Outlives `agent` and drops with this arm, so the turn is
+                    // on disk before the next input is read, without the loop
+                    // body remembering to write it.
+                    let mut turn = track.turn(model.spec(), &input);
+                    let mut agent = Agent::new(
+                        AgentParams {
+                            provider: Arc::clone(&provider),
+                            model: model.clone(),
+                            config: params.config.clone(),
+                            tool_output_lines: ToolOutputLines::default(),
+                            permissions: Arc::clone(&task_permissions),
+                            session_id: Some(session_ref_clone.clone()),
+                            background_for: BackgroundFor::None,
+                            task_id: None,
+                            mailbox: Some(mailbox.clone()),
+                            timeouts: params.timeouts,
+                            file_access: Arc::clone(&file_access),
+                            prompt_slots: Arc::clone(&params.prompt_slots),
+                            subagent_cancels: Arc::new(CancelMap::new()),
+                            ledger: turn.ledger(),
+                            audience: ToolAudience::MAIN,
+                            model_policy: Arc::clone(&params.model_policy),
+                        },
+                        turn.run_params(event_tx, Arc::clone(&context)),
+                    )
+                    .with_loaded_instructions(
+                        instructions.loaded.clone(),
+                        instructions.files.clone(),
+                    )
+                    .with_cancel(cancel)
+                    .with_local_tools(Arc::clone(&params.local_tools))
+                    .with_mcp(mcp.clone());
+                    if !params.unattended {
+                        agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
+                    }
 
-            // Outlives `agent`, so this turn is on disk before the next prompt
-            // is read, without the loop body remembering to write it.
-            let mut turn = track.turn(model.spec(), &input);
-            let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::clone(&provider),
-                    model: model.clone(),
-                    config: params.config.clone(),
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::clone(&task_permissions),
-                    session_id: Some(session_ref_clone.clone()),
-                    background_for: BackgroundFor::None,
-                    task_id: None,
-                    mailbox: Some(mailbox.clone()),
-                    timeouts: params.timeouts,
-                    file_access: Arc::clone(&file_access),
-                    prompt_slots: Arc::clone(&params.prompt_slots),
-                    subagent_cancels: Arc::new(CancelMap::new()),
-                    ledger: turn.ledger(),
-                    audience: ToolAudience::MAIN,
-                    model_policy: Arc::clone(&params.model_policy),
-                },
-                turn.run_params(event_tx, Arc::clone(&context)),
-            )
-            .with_loaded_instructions(instructions.loaded.clone(), instructions.files.clone())
-            .with_cancel(cancel)
-            .with_local_tools(Arc::clone(&params.local_tools))
-            .with_mcp(mcp.clone());
-            if !params.unattended {
-                agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
-            }
-
-            let result = agent.run(input).await;
-            drop(agent);
+                    let preamble = match &input.prompt {
+                        Some(prompt) => McpHandle::prompt_preamble(mcp.as_deref(), prompt).await,
+                        None => Ok(Vec::new()),
+                    };
+                    let result = match preamble {
+                        Ok(preamble) => {
+                            input.preamble.extend(preamble);
+                            agent.run(input).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    drop(agent);
+                    if result.is_err() {
+                        inputs.keep_alive.fail();
+                    }
+                    (result, turn.ledger().totals())
+                }
+            };
             cancel_task.abort();
             let _ = cancel_task.await;
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::error(e, turn.ledger().totals()));
-                inputs.keep_alive.fail();
+                let _ = error_tx.send(AgentEvent::error(e, totals));
             }
 
             run_id += 1;
@@ -690,6 +746,66 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
         },
         events,
     )
+}
+
+/// One `/compact` on the session's own model and frame. [`agent::compact`]
+/// sends every `Done` it ends with, a cancel's too, which leaves an `Err` to
+/// the caller.
+#[allow(clippy::too_many_arguments)]
+async fn compact_session(
+    track: &mut SessionTrack,
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    event_tx: EventSender,
+    context: &RunContextBuilder,
+    mcp: Option<&McpSession>,
+    cancel: &CancelToken,
+    session_id: &SessionRef,
+    config: &AgentConfig,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+    guidance: Option<&str>,
+) -> (Result<DoneReason, AgentError>, RunTotals) {
+    // A cancelled lookup falls back to the session model, which `compact`
+    // never asks once it sees the cancel.
+    let (summarizer, summary_model) = cancel
+        .race(agent::resolve_compaction_model(
+            provider,
+            model,
+            timeouts,
+            model_policy,
+        ))
+        .await
+        .unwrap_or_else(|_| (Arc::clone(provider), model.clone()));
+    let mut turn = track.turn_as_before(model.spec());
+    let ledger = turn.ledger();
+    let workflow = turn.workflow();
+    let run = turn.run_params(event_tx, Arc::clone(context));
+    let hooks = AgentHooks {
+        registry: ToolRegistry::global(),
+        session_id: Some(session_id),
+        task_id: None,
+        model,
+        cancel,
+        context_size: run.gauge.size(),
+    };
+    let result = agent::compact(
+        &*summarizer,
+        &summary_model,
+        run.history,
+        run.gauge,
+        context(model, workflow),
+        mcp,
+        &run.event_tx,
+        &hooks,
+        config,
+        guidance,
+        timeouts.retry,
+        CompactReason::Manual,
+        &ledger,
+    )
+    .await;
+    (result, ledger.totals())
 }
 
 /// Fires the turn's token on the host's next cancel. Whatever is in the
@@ -759,7 +875,8 @@ mod tests {
     use maki_providers::model::ModelTier;
     use maki_providers::model_registry;
     use maki_providers::plugin::{
-        self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
+        self, AuthPurpose, DeclAuthority, Hook, PluginAuth, ProviderDecl, ProviderHooks,
+        Registration,
     };
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
@@ -830,6 +947,20 @@ mod tests {
     const SEED_PUBLISHED: &str = "a detached session publishes its seed";
     const DISCOVERY_HEALS: &str =
         "discovery that lands after a failed listing reaches the next turn";
+    const COMPACTING_SLUG: &str = "compacting";
+    const GUIDANCE: &str = "keep the API decisions";
+    const EMPTY_COMPACT_ENDS: &str = "an empty transcript must end its compaction with no request";
+    const PROMPT_AFTER_COMPACT: &str = "the prompt after a compaction must run as its own turn";
+    const COMPACT_HAS_NO_INPUT: &str = "a compaction carries no agent input";
+    const REFUSING_SLUG: &str = "refusing";
+    const AUTH_REFUSED: &str = "no credentials";
+    const STREAM_CLOSES: &str = "a session whose input ended must close its stream";
+    const RUN_IN_SEND_ORDER: &str =
+        "prompts and compactions must end in the order sent, those queued at input end too";
+    const CANCEL_ENDS_COMPACTION: &str =
+        "a cancel during the listing must end the compaction once, as cancelled";
+    const FAILED_COMPACT_KEEPS_WAKE: &str =
+        "a failed compaction must leave the keep-alive waking the result";
 
     type Listed = BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>;
 
@@ -903,7 +1034,30 @@ mod tests {
         }
     }
 
+    struct RefusedAuth;
+
+    impl Hook<AuthPurpose, PluginAuth> for RefusedAuth {
+        fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
+            Box::pin(ready(Err(AgentError::Config {
+                message: AUTH_REFUSED.into(),
+            })))
+        }
+    }
+
     fn register_listed(slug: &str, listing: fn() -> Listed) -> UnboundedReceiver<()> {
+        register_provider(slug, listing, None)
+    }
+
+    /// Every request fails at its auth, before anything leaves the process.
+    fn register_refusing(slug: &str) -> UnboundedReceiver<()> {
+        register_provider(slug, lists_window, Some(Arc::new(RefusedAuth)))
+    }
+
+    fn register_provider(
+        slug: &str,
+        listing: fn() -> Listed,
+        auth: Option<Arc<dyn Hook<AuthPurpose, PluginAuth>>>,
+    ) -> UnboundedReceiver<()> {
         let (called, calls) = unbounded_channel();
         plugin::register(
             Registration {
@@ -923,6 +1077,7 @@ mod tests {
                     ..ProviderDecl::default()
                 },
                 hooks: ProviderHooks {
+                    auth,
                     list_models: Some(Arc::new(CalledListing { called, listing })),
                     ..ProviderHooks::default()
                 },
@@ -938,16 +1093,49 @@ mod tests {
         Model::from_spec(&format!("{slug}/{LISTED_MODEL}")).unwrap()
     }
 
-    async fn next_done(events: &mut SessionEvents) {
+    async fn next_done(events: &mut SessionEvents) -> DoneReason {
         loop {
             let envelope = timeout(RELAY_WAIT, events.next())
                 .await
                 .expect(TURN_ENDS)
                 .expect(TURN_ENDS);
-            if matches!(envelope.event, AgentEvent::Done { .. }) {
-                return;
+            if let AgentEvent::Done { reason, .. } = envelope.event {
+                return reason;
             }
         }
+    }
+
+    /// A run's terminal event: `Some` with its `Done` reason, or `None` for
+    /// an `Error`.
+    fn ending(event: AgentEvent) -> Option<Option<DoneReason>> {
+        match event {
+            AgentEvent::Done { reason, .. } => Some(Some(reason)),
+            AgentEvent::Error { .. } => Some(None),
+            _ => None,
+        }
+    }
+
+    async fn next_ending(events: &mut SessionEvents) -> Option<DoneReason> {
+        loop {
+            let envelope = timeout(RELAY_WAIT, events.next())
+                .await
+                .expect(TURN_ENDS)
+                .expect(TURN_ENDS);
+            if let Some(ended) = ending(envelope.event) {
+                return ended;
+            }
+        }
+    }
+
+    async fn endings_until_closed(events: &mut SessionEvents) -> Vec<Option<DoneReason>> {
+        let mut endings = Vec::new();
+        while let Some(envelope) = timeout(RELAY_WAIT, events.next())
+            .await
+            .expect(STREAM_CLOSES)
+        {
+            endings.extend(ending(envelope.event));
+        }
+        endings
     }
 
     /// A `max_turns` of zero ends every run before it would reach the provider.
@@ -1001,14 +1189,20 @@ mod tests {
                 .await;
 
         for _ in 0..2 {
-            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
             next_done(&mut events).await;
         }
         assert_eq!(answered.len(), 1, "{LISTED_ONCE}");
 
         handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
         for _ in 0..2 {
-            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
             timeout(RELAY_WAIT, hung.recv())
                 .await
                 .expect(LISTING_DUE)
@@ -1039,7 +1233,10 @@ mod tests {
                 .context_window
         };
 
-        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
         next_done(&mut events).await;
         assert_ne!(slot_window(), LISTED_WINDOW);
 
@@ -1050,10 +1247,144 @@ mod tests {
                 ..ModelInfo::id_only(LISTED_MODEL.into())
             }],
         );
-        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
         next_done(&mut events).await;
         assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
         assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
+    }
+
+    /// A summary request would go to the plugin's host and end in an `Error`,
+    /// so a `Done` here means none went out.
+    #[tokio::test]
+    async fn compacting_an_empty_session_ends_at_once_and_the_next_prompt_runs() {
+        plugin::begin_load();
+        let _listed = register_listed(COMPACTING_SLUG, lists_window);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) = spawn_listing_session(
+            &tmp,
+            plugin_model(COMPACTING_SLUG),
+            BackgroundMode::Blocking,
+        )
+        .await;
+
+        handle
+            .input_tx
+            .send(SessionInput::Compact(Some(GUIDANCE.into())))
+            .unwrap();
+        assert_eq!(
+            next_done(&mut events).await,
+            DoneReason::Compact,
+            "{EMPTY_COMPACT_ENDS}"
+        );
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
+        assert_eq!(
+            next_done(&mut events).await,
+            DoneReason::MaxTurns,
+            "{PROMPT_AFTER_COMPACT}"
+        );
+    }
+
+    /// Each prompt leaves its message in the transcript, so each compaction
+    /// asks for a summary, which the refused auth fails with nothing sent.
+    #[tokio::test]
+    async fn prompts_and_compactions_end_in_send_order_after_the_input_ends_too() {
+        plugin::begin_load();
+        let _listed = register_refusing(REFUSING_SLUG);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(REFUSING_SLUG), BackgroundMode::Blocking)
+                .await;
+
+        for _ in 0..2 {
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
+            handle.input_tx.send(SessionInput::Compact(None)).unwrap();
+        }
+        drop(handle.input_tx);
+
+        assert_eq!(
+            endings_until_closed(&mut events).await,
+            [
+                Some(DoneReason::MaxTurns),
+                None,
+                Some(DoneReason::MaxTurns),
+                None
+            ],
+            "{RUN_IN_SEND_ORDER}"
+        );
+    }
+
+    /// Without the cancel the empty transcript would end it as `Compact`.
+    #[tokio::test]
+    async fn a_cancel_during_the_listing_ends_a_compaction_once_as_cancelled() {
+        plugin::begin_load();
+        let mut hung = register_listed(HANGING_SLUG, hangs);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(HANGING_SLUG), BackgroundMode::Blocking).await;
+
+        handle.input_tx.send(SessionInput::Compact(None)).unwrap();
+        timeout(RELAY_WAIT, hung.recv())
+            .await
+            .expect(LISTING_DUE)
+            .unwrap();
+        handle.cancel_tx.send(()).unwrap();
+        drop(handle.input_tx);
+
+        assert_eq!(
+            endings_until_closed(&mut events).await,
+            [Some(DoneReason::Cancelled)],
+            "{CANCEL_ENDS_COMPACTION}"
+        );
+    }
+
+    /// The result settles after both runs, so only a wake can deliver it, and
+    /// a disarmed keep-alive would end the session after the `Error`.
+    #[tokio::test]
+    async fn a_failed_compaction_leaves_the_keep_alive_armed() {
+        plugin::begin_load();
+        let _listed = register_refusing(REFUSING_SLUG);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) = spawn_listing_session(
+            &tmp,
+            plugin_model(REFUSING_SLUG),
+            BackgroundMode::KeepAlive(LONG_WAIT),
+        )
+        .await;
+        let mailbox = SessionMailbox::open(handle.session_id.id()).unwrap();
+        mailbox.track(TASK_ID);
+
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
+        assert_eq!(next_ending(&mut events).await, Some(DoneReason::MaxTurns));
+        handle.input_tx.send(SessionInput::Compact(None)).unwrap();
+        assert_eq!(next_ending(&mut events).await, None);
+        settle_waking(&mailbox);
+        drop(handle.input_tx);
+
+        let woken = endings_until_closed(&mut events).await;
+        assert!(
+            matches!(woken.as_slice(), [Some(_)]),
+            "{FAILED_COMPACT_KEEPS_WAKE}"
+        );
     }
 
     /// A host-written prompt never had maki's facts in it. If the frame
@@ -1277,18 +1608,27 @@ mod tests {
         stop: CancelToken,
     ) -> (
         Inputs,
-        UnboundedSender<AgentInput>,
+        UnboundedSender<SessionInput>,
         UnboundedSender<AgentMode>,
     ) {
-        let (prompt_tx, prompts) = unbounded_channel();
+        let (prompt_tx, host) = unbounded_channel();
         let (mode_tx, modes) = unbounded_channel();
         let inputs = Inputs {
-            prompts,
+            host,
             modes,
             keep_alive: KeepAlive::new(mailbox.clone(), background),
             stop,
         };
         (inputs, prompt_tx, mode_tx)
+    }
+
+    impl Next {
+        fn into_input(self) -> AgentInput {
+            match self {
+                Self::Prompt(input) | Self::Woken(input) => input,
+                Self::Compact(_) => panic!("{COMPACT_HAS_NO_INPUT}"),
+            }
+        }
     }
 
     /// While the host can still prompt, a result rides its next prompt. Once
@@ -1305,7 +1645,7 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
         let prompt = inputs.next().await.expect(PROMPT_ARRIVES);
         assert!(
             !prompt.survives_failed_switch(),
@@ -1341,7 +1681,7 @@ mod tests {
         mailbox.track(TASK_ID);
 
         let woken = async {
-            prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
             let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
             adopt_chat_settings(seed.as_deref(), &prompt);
             inputs.keep_alive.follow(&prompt);
@@ -1379,7 +1719,7 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
         drop(prompt_tx);
         let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
         inputs.keep_alive.follow(&prompt);
@@ -1486,7 +1826,7 @@ mod tests {
         let (mut inputs, prompt_tx, _mode_tx) =
             inputs_for(&mailbox, BackgroundMode::KeepAlive(LONG_WAIT), stop);
         if prompt_queued {
-            prompt_tx.send(prompt_input()).unwrap();
+            prompt_tx.send(prompt_input().into()).unwrap();
         } else {
             drop(prompt_tx);
             inputs.keep_alive.follow(&prompt_input());
