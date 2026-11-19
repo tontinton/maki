@@ -115,6 +115,7 @@ pub async fn run(
             let handle = event_handle.clone();
             Box::pin(async move { handle.end_sessions([id], reason).await })
         })),
+        lua_handle: Some(plugin_host.event_handle()),
         storage,
         background: cli.background_wait().is_some(),
         host_prompt: cli.host_prompt(),

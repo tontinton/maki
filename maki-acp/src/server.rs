@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::v1::{
@@ -28,6 +28,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::settle_session;
@@ -85,6 +86,8 @@ struct SessionState {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
+    /// The snapshot installed for plugins reads the mode through this.
+    plan_mode: Arc<AtomicBool>,
     current_model: String,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
@@ -503,11 +506,32 @@ async fn start_session(
     })
     .await;
     let session_ref = handle.session_id.clone();
+    let plan_mode = Arc::new(AtomicBool::new(false));
+    let snapshot = HeadlessSnapshot::default();
+    if let Some(lua_handle) = &params.lua_handle {
+        let plan_mode = Arc::clone(&plan_mode);
+        snapshot.install(
+            lua_handle,
+            HeadlessMeta {
+                id: session_ref.to_string(),
+                cwd: cwd.display().to_string(),
+                model: params.model.spec(),
+            },
+            move || {
+                if plan_mode.load(Ordering::Relaxed) {
+                    MODE_PLAN
+                } else {
+                    MODE_BUILD
+                }
+            },
+        );
+    }
     start_event_pump(
         events,
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        snapshot,
         cwd,
         maki_storage::paths::home(),
         project_trusted,
@@ -517,6 +541,7 @@ async fn start_session(
         handle,
         mcp,
         current_mode: AgentMode::Build,
+        plan_mode,
         current_model: params.model.spec(),
         pending,
         claim,
@@ -788,6 +813,9 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
 
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     session.handle.switch_mode(new_mode.clone());
+    session
+        .plan_mode
+        .store(matches!(new_mode, AgentMode::Plan(_)), Ordering::Relaxed);
     session.current_mode = new_mode;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -946,6 +974,7 @@ fn start_event_pump(
     session_id: SessionRef,
     out_tx: UnboundedSender<Value>,
     pending: PendingState,
+    snapshot: HeadlessSnapshot,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -960,10 +989,11 @@ fn start_event_pump(
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
-        {
+        while let Some(envelope) = events.next().await {
+            snapshot.observe(&envelope);
+            let Envelope {
+                event, subagent, ..
+            } = envelope;
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1422,6 +1452,7 @@ mod tests {
                 handle,
                 mcp: None,
                 current_mode: AgentMode::Build,
+                plan_mode: Arc::default(),
                 current_model: String::new(),
                 pending: Arc::default(),
                 claim,
@@ -1444,6 +1475,7 @@ mod tests {
             trust_mode: TrustMode::Consult,
             trust_policy: Arc::default(),
             on_session_end: None,
+            lua_handle: None,
             storage,
             background: false,
             host_prompt: HostPrompt::default(),
@@ -1548,6 +1580,7 @@ mod tests {
             session.handle.session_id.clone(),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
+            HeadlessSnapshot::default(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
