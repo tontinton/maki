@@ -35,7 +35,9 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
-use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
+use maki_lua::session_snapshot::{
+    HeadlessMeta, HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, RegisteredSession,
+};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::settle_session;
@@ -110,8 +112,10 @@ struct SessionState {
     /// pump, so no list goes out after a close is answered.
     commands_watch: Option<AbortOnDropHandle<()>>,
     current_mode: AgentMode,
-    /// The snapshot installed for plugins reads the mode through this.
+    /// The snapshot plugins read takes the mode from here.
     plan_mode: Arc<AtomicBool>,
+    /// Keeps `maki.session` answering for this session until it closes.
+    _snapshot: RegisteredSession,
     current_model: String,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
@@ -731,24 +735,14 @@ async fn start_session(
     let sid = client_id(&handle.session_id);
     let plan_mode = Arc::new(AtomicBool::new(false));
     let snapshot = HeadlessSnapshot::default();
-    if let Some(lua_handle) = &srv.stack.lua_handle {
-        let plan_mode = Arc::clone(&plan_mode);
-        snapshot.install(
-            lua_handle,
-            HeadlessMeta {
-                id: handle.session_id.to_string(),
-                cwd: cwd.display().to_string(),
-                model: srv.stack.model.spec(),
-            },
-            move || {
-                if plan_mode.load(Ordering::Relaxed) {
-                    MODE_PLAN
-                } else {
-                    MODE_BUILD
-                }
-            },
-        );
-    }
+    let registered = register_snapshot(
+        &srv.stack.session_snapshots,
+        &snapshot,
+        &handle.session_id,
+        &cwd,
+        srv.stack.model.spec(),
+        &plan_mode,
+    );
     // Before the pump starts, so nothing the new run says lands inside the
     // history the client is still rebuilding.
     for update in replay {
@@ -776,12 +770,37 @@ async fn start_session(
         commands_watch: None,
         current_mode: AgentMode::Build,
         plan_mode,
+        _snapshot: registered,
         current_model: srv.stack.model.spec(),
         pending,
         claim,
     };
     srv.sessions.insert(sid.clone(), state);
     sid
+}
+
+fn register_snapshot(
+    sessions: &HeadlessSessions,
+    snapshot: &HeadlessSnapshot,
+    session_id: &SessionRef,
+    cwd: &Path,
+    model: String,
+    plan_mode: &Arc<AtomicBool>,
+) -> RegisteredSession {
+    let plan_mode = Arc::clone(plan_mode);
+    let meta = HeadlessMeta {
+        id: session_id.to_string(),
+        cwd: cwd.display().to_string(),
+        model,
+    };
+    let mode = move || {
+        if plan_mode.load(Ordering::Relaxed) {
+            MODE_PLAN
+        } else {
+            MODE_BUILD
+        }
+    };
+    sessions.register(session_id.id(), snapshot, meta, mode)
 }
 
 /// The id the client names a run's session with.
@@ -1538,6 +1557,7 @@ mod tests {
     use maki_agent::{McpPromptInfo, McpSnapshot};
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
+    use maki_lua::session_snapshot::NO_CALLING_SESSION_ERR;
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
@@ -1827,6 +1847,7 @@ mod tests {
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
+        let snapshot = fixture_snapshot(&HeadlessSessions::default(), &handle.session_id);
         FixtureSession {
             state: SessionState {
                 handle,
@@ -1837,6 +1858,7 @@ mod tests {
                 commands_watch: None,
                 current_mode: AgentMode::Build,
                 plan_mode: Arc::default(),
+                _snapshot: snapshot,
                 current_model: String::new(),
                 pending: Arc::default(),
                 claim,
@@ -1847,6 +1869,17 @@ mod tests {
             model_rx,
             mode_rx,
         }
+    }
+
+    fn fixture_snapshot(sessions: &HeadlessSessions, id: &SessionRef) -> RegisteredSession {
+        register_snapshot(
+            sessions,
+            &HeadlessSnapshot::default(),
+            id,
+            Path::new(PUMP_CWD),
+            SELECTED_SPEC.to_owned(),
+            &Arc::default(),
+        )
     }
 
     fn test_stack() -> ProjectStack {
@@ -1861,7 +1894,7 @@ mod tests {
             trust_policy: Arc::default(),
             yolo: false,
             on_session_end: None,
-            lua_handle: None,
+            session_snapshots: HeadlessSessions::default(),
         }
     }
 
@@ -2972,6 +3005,40 @@ mod tests {
             [&kept_sid],
             "{OTHER_SESSIONS_UNTOUCHED}"
         );
+    }
+
+    /// Two chats on one plugin host: each answers only for itself, and the one
+    /// opened last never becomes everyone's default, closed or not.
+    #[tokio::test]
+    async fn plugins_read_each_session_by_id_and_never_a_closed_one() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.session_snapshots.provider();
+        let mut first = fixture_session();
+        let mut last = fixture_session();
+        for fixture in [&mut first, &mut last] {
+            fixture.state._snapshot = fixture_snapshot(
+                &srv.stack.session_snapshots,
+                &fixture.state.handle.session_id,
+            );
+        }
+        let (first_id, last_id) = (
+            first.state.handle.session_id.to_string(),
+            last.state.handle.session_id.to_string(),
+        );
+        install(&mut srv, first.state);
+        let last_sid = install(&mut srv, last.state);
+
+        for id in [&first_id, &last_id] {
+            assert_eq!(read(Some(id)).unwrap()["id"], **id);
+        }
+        assert_eq!(read(None).unwrap_err(), NO_CALLING_SESSION_ERR);
+
+        close_session(&mut srv, &last_sid, SessionEndReason::Delete).await;
+        assert!(read(Some(&last_id)).is_err());
+        assert_eq!(read(Some(&first_id)).unwrap()["id"], *first_id);
+
+        close_all_sessions(&mut srv, SessionEndReason::Shutdown).await;
+        assert!(read(Some(&first_id)).is_err());
     }
 
     /// The hook can take seconds, so a prompt left for it to answer would

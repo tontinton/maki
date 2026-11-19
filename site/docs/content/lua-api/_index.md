@@ -5321,9 +5321,10 @@ at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
 `current`, `read`, `export`, `messages`, `windows`, `subagents`,
-`notify` and `new` without `prompt` or `focus` still work. ACP has no
-focused session, so there `current` fails and the read functions need
-`session`. Hook and event payloads carry it as `session_id`.
+`notify` and `new` without `prompt` or `focus` still work. The readers
+default to the session whose tool call is running, else the focused one.
+ACP has no focused session, so outside a tool call they need `session`
+there. Hook and event payloads carry it as `session_id`.
 
 ---
 
@@ -5372,8 +5373,10 @@ local live, err = maki.session.live()
 maki.session.current()
 ```
 
-Returns the id of the focused session. Under `maki -p` and the sdk,
-that is the one session they run.
+Returns the id of the session whose tool call is running, so a tool in a
+background tab gets its own tab. Else the focused session, and under
+`maki -p` and the sdk the one session they run. ACP has no focused
+session, so outside a tool call it fails there.
 
 **Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
 
@@ -5392,8 +5395,9 @@ maki.session.read({opts?})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
-status. Reads the focused session, or the one you name in `session`: a
-background tab, or a stored session nothing has open.
+status. Reads the session of the running tool call, else the focused one,
+or the one you name in `session`: a background tab, or a stored session
+nothing has open.
 
 Metadata only, so it needs no permission. Not to be confused with the
 `session_read` permission, which guards transcript content
@@ -5425,7 +5429,7 @@ session's own, since a subagent runs its own window. There is no
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
@@ -5467,7 +5471,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) The document, or nil and an error.
 
@@ -5531,7 +5535,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
   - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
     Defaults to the current window.
   - `last` (`integer?`) only the newest `last` messages.
@@ -5575,7 +5579,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Array of windows, or nil and an error.
 
@@ -5618,7 +5622,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
   - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
     Defaults to the current window.
 
