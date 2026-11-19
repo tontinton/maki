@@ -1349,6 +1349,10 @@ impl Provider for PluginProvider {
         })
     }
 
+    fn needs_model_discovery(&self) -> bool {
+        self.inner.needs_model_discovery()
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let result = self.models().await;
