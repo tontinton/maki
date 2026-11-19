@@ -19,6 +19,7 @@ use tracing::warn;
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
+const OLD_MCP_PREFIX: &str = "mcp:";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
 
@@ -932,20 +933,21 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         let table = toml::Table::deserialize(deserializer)?;
         let default = table
             .get("default")
-            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
-            .or_else(|| {
-                table
-                    .get("allow_all")?
-                    .as_bool()?
-                    .then_some(DefaultEffect::Allow)
-            });
+            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok());
 
         let mut tools = HashMap::new();
         let mut mcp_rules = Vec::new();
         let mut mcp_defaults = HashMap::new();
 
         for (k, v) in table.iter() {
-            if k.is_empty() || k == "allow_all" || k == "default" {
+            if k.is_empty() || k == "default" {
+                continue;
+            }
+            if k.starts_with(OLD_MCP_PREFIX) {
+                tracing::warn!(
+                    key = k.as_str(),
+                    "[\"{k}\"] is the old MCP format and is ignored: move it to [mcp.<server>]"
+                );
                 continue;
             }
             if k == "mcp" {
@@ -3871,37 +3873,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_allow_all_migrated() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(
-            dir.path(),
-            "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
-        );
-
-        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
-        assert_eq!(perms.default, DefaultEffect::Allow);
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(!content.contains("allow_all"));
-        assert!(content.contains("default = \"allow\""));
-    }
-
-    #[test]
-    fn permissions_allow_all_false_migrated_removed() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "allow_all = false\n");
-
-        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
-        assert_eq!(perms.default, DefaultEffect::Prompt);
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(!content.contains("allow_all"));
-        assert!(!content.contains("default"));
-    }
-
-    #[test]
     fn project_default_deny_allowed() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -4437,34 +4408,6 @@ mod tests {
         let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
         assert!(perms.rules.is_empty());
         assert!(perms.tool_defaults.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn migration_applies_in_memory_when_write_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        fs::write(
-            global.join("permissions.toml"),
-            "[\"mcp:github__delete\"]\ndeny = true\n",
-        )
-        .unwrap();
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
-        if fs::write(global.join("probe"), b"x").is_ok() {
-            return; // running as root, cannot simulate a read-only dir
-        }
-
-        let perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(perms.rules.len(), 1);
-        assert_eq!(perms.rules[0].effect, Effect::Deny);
-        assert_eq!(
-            perms.rules[0].tool,
-            ToolKey::parse("github.delete").unwrap()
-        );
     }
 
     // Setting an environment variable is only sound while no other thread

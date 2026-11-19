@@ -7604,12 +7604,12 @@ fn a_config_init_lua_and_the_modules_it_requires_are_linted() {
     std::fs::create_dir_all(maki_dir.join("lua")).unwrap();
     std::fs::write(
         maki_dir.join("lua").join("keys.lua"),
-        "return function(ev) return ev.key == \"esc\" end\n",
+        "return function(ev) return ev.key == \"<Escc>\" end\n",
     )
     .unwrap();
     std::fs::write(
         maki_dir.join("init.lua"),
-        "local on_key = require(\"keys\")\nlocal submit = \"enter\"\n",
+        "local on_key = require(\"keys\")\nlocal submit = \"<Tabb>\"\n",
     )
     .unwrap();
 
