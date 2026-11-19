@@ -12,10 +12,10 @@ use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry}
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
-    PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
+    RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
 };
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model};
+use maki_providers::{AgentError, ContextGauge, Model};
 use maki_storage::blocking;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
@@ -24,7 +24,7 @@ use tracing::error;
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
-fn base_tools(
+async fn base_tools(
     vars: &Vars,
     model: &Model,
     config: &AgentConfig,
@@ -40,6 +40,7 @@ fn base_tools(
         workflow,
         has_mcp,
     )
+    .await
 }
 
 /// The loop's side of everything it shares with its `AgentHandles`.
@@ -163,7 +164,8 @@ impl AgentLoop {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
         match run {
             QueueRun::Compact(compaction) => {
-                self.do_compact(&event_tx, &compaction, cancel).await?;
+                self.do_compact(&event_tx, &compaction, cancel, ledger)
+                    .await?;
             }
             QueueRun::Messages(messages) => {
                 let inputs = messages
@@ -222,15 +224,21 @@ impl AgentLoop {
                 .collect_prompt_slots(Some(self.seed.session_id.as_str()))
                 .await,
         );
-        let vars = self.vars.clone();
-        let instructions = self.instructions.text.clone();
-        let slots = Arc::clone(&prompt_slots);
-        let config = self.seed.config.clone();
         let has_mcp = self.seed.mcp.is_some();
-        let host_prompt = Arc::clone(&self.host_prompt);
+        let spec = Arc::new((
+            self.vars.clone(),
+            self.instructions.text.clone(),
+            Arc::clone(&prompt_slots),
+            self.seed.config.clone(),
+            Arc::clone(&self.host_prompt),
+        ));
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
-            let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            host_prompt.context(&vars, &instructions, &slots, model, tools)
+            let (spec, model) = (Arc::clone(&spec), model.clone());
+            Box::pin(async move {
+                let (vars, instructions, slots, config, host_prompt) = &*spec;
+                let tools = base_tools(vars, &model, config, has_mcp, workflow).await;
+                host_prompt.context(vars, instructions, slots, &model, tools)
+            })
         });
         (context, prompt_slots)
     }
@@ -240,6 +248,7 @@ impl AgentLoop {
         event_tx: &EventSender,
         compaction: &Compaction,
         cancel: &CancelToken,
+        ledger: &RunLedger,
     ) -> Result<DoneReason, AgentError> {
         let (context, _) = self.context_builder().await;
         let slot = self.seed.model_slot.load();
@@ -252,7 +261,7 @@ impl AgentLoop {
         .await;
         // The summary goes out under a fresh frame for the session's own model,
         // so the gauge and `/btw` read the prompt the next run sends.
-        let next = context(&slot.model, compaction.workflow);
+        let next = context(&slot.model, compaction.workflow).await;
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.seed.session_id),
@@ -274,6 +283,7 @@ impl AgentLoop {
             compaction.instructions.as_deref(),
             self.seed.timeouts.retry,
             compaction.reason,
+            ledger,
         )
         .await
     }
@@ -288,31 +298,10 @@ impl AgentLoop {
         let (context, prompt_slots) = self.context_builder().await;
 
         if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.seed.mcp else {
-                return Err(AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: "MCP not available".into(),
-                });
-            };
-            let messages = mcp
-                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
-                .await
-                .map_err(|e| AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: e.to_string(),
-                })?;
-            for pm in messages {
-                let text = pm.text;
-                let msg = match pm.role {
-                    PromptRole::Assistant => Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text { text }],
-                        ..Default::default()
-                    },
-                    PromptRole::User => Message::user(text),
-                };
-                input.preamble.push(msg);
-            }
+            let mcp = self.seed.mcp.as_deref();
+            input
+                .preamble
+                .extend(McpHandle::prompt_preamble(mcp, prompt_ref).await?);
         }
 
         // Read after the awaits above, not before: a switch can land while the

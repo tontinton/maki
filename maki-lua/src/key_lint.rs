@@ -4,16 +4,10 @@
 //! But in `ev.key == "<Esc>"` the comparison happens inside Lua and the host
 //! never sees the string, so a typo there just compares false forever. So we
 //! read the source. Only string literals count, found through the Lua grammar,
-//! so a key named in a comment is left alone. Two rules, each tuned to fire
-//! only on a string that is clearly a key and clearly wrong:
-//!
-//! - **Misspelling**: a bracketed string that does not parse, but would one
-//!   edit away. `"<Escc>"` is a finding. `"<path>"` is not, because nothing
-//!   one edit from it is a key, and that is what keeps placeholders quiet.
-//! - **Legacy spelling**: what `win:recv` used to deliver, like `"esc"` for
-//!   `"<Esc>"`. No shim can help here, because no value equals both. This
-//!   rule is temporary: delete [`legacy`], its call in [`check`], the tests
-//!   naming [`LEGACY_HINT`] and the migration paragraph under `maki.keymap`.
+//! so a key named in a comment is left alone. A finding is a bracketed string
+//! that does not parse, but would one edit away. `"<Escc>"` is a finding.
+//! `"<path>"` is not, because nothing one edit from it is a key, and that is
+//! what keeps placeholders quiet.
 //!
 //! Findings are warnings and never refuse a load, since a false positive
 //! should cost a line of output, not a plugin that will not start. User Lua is
@@ -39,7 +33,6 @@ pub const KEY_WARNING: &str = "key spelling";
 pub(crate) const MODE_WARNING: &str = "keymap mode";
 const NORMAL_ONLY_HINT: &str = "in \"n\" only, so it does not fire while you type";
 pub(crate) const UPGRADE_DOCS: &str = "https://maki.sh/docs/keybindings/#upgrading-old-keymaps";
-pub(crate) const LEGACY_HINT: &str = "is the old spelling of";
 pub(crate) const MISSPELLED_HINT: &str = "is not a key; did you mean";
 pub(crate) const MORE_IN_LOG: &str = "more in the log";
 
@@ -152,77 +145,9 @@ fn check(text: &str) -> Option<String> {
     if Key::parse(text).is_ok() {
         return None;
     }
-    if let Some(canonical) = legacy::notation(text) {
-        return Some(format!("{text:?} {LEGACY_HINT} {canonical:?}"));
-    }
     let bracketed = text.starts_with('<') && text.ends_with('>') && text.len() > 2;
     let suggestion = bracketed.then(|| nearest(text)).flatten()?;
     Some(format!("{text:?} {MISSPELLED_HINT} {suggestion:?}?"))
-}
-
-/// The spellings `win:recv` delivered before keys were unified. Temporary,
-/// see the module docs for how to remove it.
-mod legacy {
-    use crate::key::Key;
-
-    const MODIFIERS: &[(&str, &str)] = &[("ctrl+", "C-"), ("alt+", "M-"), ("shift+", "S-")];
-
-    /// Checked after a `ctrl+`/`alt+`/`shift+` prefix, which already proves
-    /// the string is a key.
-    const NAMES: &[(&str, &str)] = &[
-        ("esc", "Esc"),
-        ("enter", "CR"),
-        ("tab", "Tab"),
-        ("backspace", "BS"),
-        ("delete", "Del"),
-        ("space", "Space"),
-        ("up", "Up"),
-        ("down", "Down"),
-        ("left", "Left"),
-        ("right", "Right"),
-        ("home", "Home"),
-        ("end", "End"),
-        ("pageup", "PageUp"),
-        ("pagedown", "PageDown"),
-        ("insert", "Insert"),
-    ];
-
-    /// The names worth flagging with no modifier in front. The rest of
-    /// [`NAMES`] are everyday words, like `split = "left"`, and a lint that
-    /// cries on those is one people learn to ignore.
-    const BARE_NAMES: &[&str] = &["esc", "enter", "backspace", "pageup", "pagedown"];
-
-    /// The notation {text} is the old spelling of. The answer goes through
-    /// [`Key::parse`], so we only ever suggest a string the host accepts.
-    ///
-    /// Case-sensitive on purpose. The old spellings were always lowercase,
-    /// while `"Ctrl+N"` and `"Enter"` are footer labels for humans, and every
-    /// bundled plugin has a row of those.
-    pub(super) fn notation(text: &str) -> Option<String> {
-        let mut rest = text;
-        let mut prefix = String::new();
-        'strip: loop {
-            for (legacy, canonical) in MODIFIERS {
-                if let Some(tail) = rest.strip_prefix(legacy) {
-                    prefix.push_str(canonical);
-                    rest = tail;
-                    continue 'strip;
-                }
-            }
-            break;
-        }
-        if prefix.is_empty() && !BARE_NAMES.contains(&rest) {
-            return None;
-        }
-        let name = NAMES
-            .iter()
-            .find(|(legacy, _)| *legacy == rest)
-            .map(|(_, canonical)| (*canonical).to_owned())
-            .or_else(|| (rest.chars().count() == 1).then(|| rest.to_owned()))?;
-        Key::parse(&format!("<{prefix}{name}>"))
-            .ok()
-            .map(|key| key.notation())
-    }
 }
 
 /// The key {text} was probably meant to be, if exactly one is close enough.
@@ -266,7 +191,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEY_WARNING, KeyLint, LEGACY_HINT, MISSPELLED_HINT, MORE_IN_LOG, check, lint};
+    use super::{KEY_WARNING, KeyLint, MISSPELLED_HINT, MORE_IN_LOG, check, lint};
     use test_case::test_case;
 
     const CHUNK: &str = "init.lua";
@@ -292,35 +217,31 @@ mod tests {
         assert_eq!(check(text), None);
     }
 
-    // The legacy cases go with `super::legacy`.
-    #[test_case("ctrl+n", LEGACY_HINT, "<C-n>" ; "legacy_ctrl_letter")]
-    #[test_case("alt+x", LEGACY_HINT, "<M-x>" ; "legacy_alt_letter")]
-    #[test_case("shift+tab", LEGACY_HINT, "<S-Tab>" ; "legacy_shift_tab")]
-    #[test_case("esc", LEGACY_HINT, "<Esc>" ; "legacy_bare_esc")]
-    #[test_case("enter", LEGACY_HINT, "<CR>" ; "legacy_bare_enter")]
-    #[test_case("pagedown", LEGACY_HINT, "<PageDown>" ; "legacy_bare_pagedown")]
-    #[test_case("<Escc>", MISSPELLED_HINT, "<Esc>" ; "extra_letter")]
-    #[test_case("<C-nn>", MISSPELLED_HINT, "<C-n>" ; "doubled_modifier_target")]
-    #[test_case("<Tabb>", MISSPELLED_HINT, "<Tab>" ; "trailing_letter")]
-    #[test_case("<S-Aa>", MISSPELLED_HINT, "A" ; "suggests_notation_not_the_matched_spelling")]
-    fn a_finding_suggests_the_canonical_key(text: &str, hint: &str, suggestion: &str) {
+    #[test_case("<Escc>", "<Esc>" ; "extra_letter")]
+    #[test_case("<C-nn>", "<C-n>" ; "doubled_modifier_target")]
+    #[test_case("<Tabb>", "<Tab>" ; "trailing_letter")]
+    #[test_case("<S-Aa>", "A" ; "suggests_notation_not_the_matched_spelling")]
+    fn a_finding_suggests_the_canonical_key(text: &str, suggestion: &str) {
         let finding = check(text).expect("a finding");
         assert!(
-            finding.contains(hint) && finding.contains(&format!("{suggestion:?}")),
+            finding.contains(MISSPELLED_HINT) && finding.contains(&format!("{suggestion:?}")),
             "{finding}"
         );
     }
 
     #[test]
     fn a_key_named_in_a_comment_is_not_a_finding() {
-        let source = "-- press esc to close, or ctrl+n\nlocal x = 1\n";
+        let source = "-- press <Escc> to close, or <C-nn>\nlocal x = 1\n";
 
         assert!(lint(CHUNK, source).is_empty());
     }
 
     #[test]
     fn findings_name_the_chunk_and_line_in_source_order() {
-        let source = format!("local a = \"esc\"\n{}local b = \"enter\"\n", "\n".repeat(8));
+        let source = format!(
+            "local a = \"<Escc>\"\n{}local b = \"<Tabb>\"\n",
+            "\n".repeat(8)
+        );
 
         let findings = lint(CHUNK, &source);
 
@@ -330,11 +251,14 @@ mod tests {
     }
 
     /// The screen gets one line however many there are, and the rest are in
-    /// the log, so a file full of old spellings cannot hold the bar hostage.
+    /// the log, so a file full of typos cannot hold the bar hostage.
     #[test]
     fn many_findings_are_one_summary_line() {
         let key_lint = KeyLint::default();
-        key_lint.check(CHUNK, "local a, b, c = \"esc\", \"enter\", \"ctrl+n\"\n");
+        key_lint.check(
+            CHUNK,
+            "local a, b, c = \"<Escc>\", \"<Tabb>\", \"<C-nn>\"\n",
+        );
 
         let summary = key_lint.take_summary().expect("findings summarized");
 
@@ -347,7 +271,7 @@ mod tests {
     #[test]
     fn a_chunk_is_read_once() {
         let key_lint = KeyLint::default();
-        let source = "local a = \"esc\"\n";
+        let source = "local a = \"<Escc>\"\n";
         key_lint.check(CHUNK, source);
         key_lint.check(CHUNK, source);
 

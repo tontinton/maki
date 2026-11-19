@@ -838,11 +838,11 @@ fn user_message_shows_as_typed(text: &str) {
         .iter()
         .map(|row| row.to_string())
         .collect();
-    assert_eq!(rows.join("\n"), text);
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().label));
 }
 
 #[test]
-fn search_text_includes_role_marker() {
+fn search_text_includes_role_label() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -850,9 +850,9 @@ fn search_text_includes_role_marker() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "❯ hello");
-    assert_eq!(texts[2], format!("● {md}"));
-    assert_eq!(texts[4], "● thinking> hmm");
+    assert_eq!(texts[0], "you> hello");
+    assert_eq!(texts[2], format!("maki> {md}"));
+    assert_eq!(texts[4], "thinking> hmm");
 }
 
 #[test]
@@ -1106,7 +1106,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
 fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let world_start = GUTTER_COLS + "Hello ".len() as u16;
+    let world_start = (assistant_style().label.len() + "Hello ".len()) as u16;
     let sel = make_sel(&panel, area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
@@ -1149,7 +1149,8 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let panel = panel_with_msgs(&["full segment", "partial here"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = seg_start_row(&panel, 2);
-    let sel = make_sel(&panel, area, (0, 0), (seg1_start, GUTTER_COLS + 6));
+    let partial_end = (assistant_style().label.len() + "partial".len() - 1) as u16;
+    let sel = make_sel(&panel, area, (0, 0), (seg1_start, partial_end));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -1165,8 +1166,8 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
     render(&mut panel, 80, 24);
     let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(&panel, area, (0, GUTTER_COLS), (total - 1, 79));
-    let up = make_sel(&panel, area, (total - 1, 79), (0, GUTTER_COLS));
+    let down = make_sel(&panel, area, (0, 0), (total - 1, 79));
+    let up = make_sel(&panel, area, (total - 1, 79), (0, 0));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));
@@ -1202,7 +1203,7 @@ fn extract_partial_last_line_truncated() {
     render(&mut panel, 80, 24);
     let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let sel = make_sel(&panel, area, (0, 0), (total - 1, GUTTER_COLS + 3));
+    let sel = make_sel(&panel, area, (0, 0), (total - 1, 3));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text.lines().last().unwrap(), "ABCD");
 }
@@ -3378,8 +3379,10 @@ fn a_task_notice_opens_with_its_ending_dot(
     panel.messages[0].task_end = task_end;
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
 
-    let gutter = panel.cache.get(0).unwrap().gutter.clone().unwrap();
-    let dot = (gutter.content == TOOL_INDICATOR).then_some(gutter.style);
+    let gutter = panel.cache.get(0).unwrap().gutter.clone();
+    let dot = gutter
+        .filter(|gutter| gutter.content == TOOL_INDICATOR)
+        .map(|gutter| gutter.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
 }
 
@@ -3439,10 +3442,8 @@ fn scrollbar_sits_on_the_theme_window_background() {
         );
     }
 }
-
 const GUTTER_TEST_WIDTH: u16 = 40;
 const GUTTER_TEST_HEIGHT: u16 = 12;
-const USER_MARKER_TEXT: &str = "❯ ";
 const GUTTER_INDENT: &str = "  ";
 const LONG_PROSE: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
 
@@ -3455,18 +3456,19 @@ fn screen_rows(panel: &mut MessagesPanel) -> Vec<String> {
         .collect()
 }
 
-#[test_case(DisplayRole::User, USER_MARKER_TEXT ; "user")]
-#[test_case(DisplayRole::Assistant, TOOL_INDICATOR ; "assistant")]
-#[test_case(DisplayRole::Error, GUTTER_INDENT ; "error")]
-fn wrapped_prose_hangs_behind_the_marker(role: DisplayRole, marker: &str) {
+#[test_case(DisplayRole::User ; "user")]
+#[test_case(DisplayRole::Assistant ; "assistant")]
+#[test_case(DisplayRole::Thinking ; "thinking")]
+#[test_case(DisplayRole::Error ; "error")]
+fn wrapped_prose_starts_flush_left(role: DisplayRole) {
+    let label = message_style(&role).label;
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(role, LONG_PROSE.into()));
     let rows = screen_rows(&mut panel);
     assert!(rows.len() > 1, "prose must wrap: {rows:?}");
-    assert!(rows[0].starts_with(&format!("{marker}alpha")), "{rows:?}");
+    assert!(rows[0].starts_with(&format!("{label}alpha")), "{rows:?}");
     for row in &rows[1..] {
-        let body = row.strip_prefix(GUTTER_INDENT).expect("blank gutter");
-        assert!(!body.starts_with(' '), "{rows:?}");
+        assert!(!row.starts_with(' '), "{rows:?}");
     }
 }
 
@@ -3489,14 +3491,8 @@ fn thinking_starting_with_heading_keeps_markdown() {
     let terminal = render(&mut panel, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
     let rows: Vec<String> = buffer_text(&terminal).lines().map(str::to_owned).collect();
     let label = thinking_style().label;
-    assert!(
-        rows[0].starts_with(&format!("{TOOL_INDICATOR}{label}Plan")),
-        "{rows:?}"
-    );
-    assert!(
-        rows[1].starts_with(&format!("{GUTTER_INDENT}• a")),
-        "{rows:?}"
-    );
+    assert!(rows[0].starts_with(&format!("{label}Plan")), "{rows:?}");
+    assert!(rows[1].starts_with("• a"), "{rows:?}");
     let x = rows[0].find("Plan").unwrap() as u16;
     let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
     assert_eq!(cell.fg, theme::current().heading.fg.unwrap());

@@ -1,9 +1,9 @@
 use agent_client_protocol_schema::ProtocolVersion;
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, Implementation, InitializeResponse, LoadSessionResponse, McpCapabilities,
-    NewSessionResponse, PromptCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionListCapabilities, SessionMode,
-    SessionModeId, SessionModeState,
+    NewSessionResponse, PromptCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -21,7 +21,9 @@ pub fn initialize_response() -> InitializeResponse {
                 .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
                 .mcp_capabilities(McpCapabilities::new().http(true))
                 .session_capabilities(
-                    SessionCapabilities::new().list(SessionListCapabilities::new()),
+                    SessionCapabilities::new()
+                        .list(SessionListCapabilities::new())
+                        .close(SessionCloseCapabilities::new()),
                 ),
         )
         .auth_methods(vec![])

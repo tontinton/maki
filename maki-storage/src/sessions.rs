@@ -160,10 +160,19 @@ struct ClaimInner {
     /// dir). Refusing to run there would break setups that work today, so the
     /// claim still gates every write but protects nothing.
     lock: Option<Lock>,
+    origin: ClaimOrigin,
     /// Where [`SessionClaim::persist`] appends next. It lives on the claim
     /// because a cursor is only safe while nobody else can write the file. Kept
     /// past its claim, it could append to a file another process replaced.
     cursor: Mutex<Option<SessionLog>>,
+}
+
+/// Every write goes to [`jsonl_path`], so only an id an older maki wrote can
+/// have a legacy-named transcript. A minted id never has one, and its last
+/// claim can skip scanning the sessions dir for it.
+enum ClaimOrigin {
+    Fresh,
+    Existing,
 }
 
 impl fmt::Debug for SessionClaim {
@@ -176,11 +185,12 @@ impl fmt::Debug for SessionClaim {
 }
 
 impl SessionClaim {
-    fn new(id: MakiId, dir: PathBuf, lock: Option<Lock>) -> Self {
+    fn new(id: MakiId, dir: PathBuf, lock: Option<Lock>, origin: ClaimOrigin) -> Self {
         Self(Arc::new(ClaimInner {
             id,
             dir,
             lock,
+            origin,
             cursor: Mutex::default(),
         }))
     }
@@ -195,8 +205,33 @@ impl SessionClaim {
     /// exec still holds a copy of the fd we just closed. A real holder outlasts
     /// the retry, see [`Lock::acquire_retrying`].
     pub fn acquire_in(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
-        match Lock::acquire_retrying(&lock_path(dir, id)) {
-            Ok(lock) => Ok(Self::new(id, dir.to_path_buf(), Some(lock))),
+        Self::from_lock(
+            id,
+            dir,
+            Lock::acquire_retrying(&lock_path(dir, id)),
+            ClaimOrigin::Existing,
+        )
+    }
+
+    /// [`Self::acquire`] with the retry on the tokio timer instead of a
+    /// sleeping thread.
+    pub async fn acquire_async(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        tokio::fs::create_dir_all(&sessions_dir)
+            .await
+            .map_err(StorageError::from)?;
+        let lock = Lock::acquire_retrying_async(lock_path(&sessions_dir, id)).await;
+        Self::from_lock(id, &sessions_dir, lock, ClaimOrigin::Existing)
+    }
+
+    fn from_lock(
+        id: MakiId,
+        dir: &Path,
+        lock: Result<Lock, LockError>,
+        origin: ClaimOrigin,
+    ) -> Result<Self, SessionError> {
+        match lock {
+            Ok(lock) => Ok(Self::new(id, dir.to_path_buf(), Some(lock), origin)),
             Err(LockError::Held { .. }) => Err(SessionError::Busy { id }),
             Err(LockError::Io { path, source }) => {
                 warn!(
@@ -205,7 +240,7 @@ impl SessionClaim {
                     session_id = %id,
                     "cannot lock session; concurrent writes to it are unprotected"
                 );
-                Ok(Self::new(id, dir.to_path_buf(), None))
+                Ok(Self::new(id, dir.to_path_buf(), None, origin))
             }
         }
     }
@@ -215,9 +250,10 @@ impl SessionClaim {
     pub fn fresh(dir: &StateDir) -> Self {
         let id = MakiId::generate();
         let sessions_dir = dir.path().join(SESSIONS_DIR);
-        Self::acquire_in(id, &sessions_dir).unwrap_or_else(|e| {
+        let lock = Lock::acquire(&lock_path(&sessions_dir, id));
+        Self::from_lock(id, &sessions_dir, lock, ClaimOrigin::Fresh).unwrap_or_else(|e| {
             warn!(error = %e, session_id = %id, "fresh session left unprotected");
-            Self::new(id, sessions_dir, None)
+            Self::new(id, sessions_dir, None, ClaimOrigin::Fresh)
         })
     }
 
@@ -286,8 +322,17 @@ impl Drop for ClaimInner {
     /// then locks a file nobody else can find. That is harmless, because only
     /// ids without a transcript get here and there is nothing to clobber.
     fn drop(&mut self) {
-        if self.lock.is_some() && locate_session_file(&self.dir, self.id).is_none() {
+        if self.lock.is_some() && !self.has_transcript() {
             let _ = fs::remove_file(lock_path(&self.dir, self.id));
+        }
+    }
+}
+
+impl ClaimInner {
+    fn has_transcript(&self) -> bool {
+        match self.origin {
+            ClaimOrigin::Fresh => jsonl_path(&self.dir, self.id).exists(),
+            ClaimOrigin::Existing => locate_session_file(&self.dir, self.id).is_some(),
         }
     }
 }
@@ -2612,9 +2657,11 @@ mod tests {
     const TAMPERED_TITLE: &str = "tampered cached title";
     const LOCK_WHILE_HELD: &str = "a held claim is a lock file another process can see";
     const NO_ORPHAN_LOCK: &str = "an id with no transcript must not leave a lock behind";
+    const LEGACY_LOCK_KEPT: &str = "a transcript under a legacy name still needs its lock file";
     const UNCLAIMED: &str = "a session nothing else is writing";
     const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
     const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
+    const BUSY_ONLY_WHILE_HELD: &str = "a session is busy exactly while another claim holds it";
     const PENDING_DRAFT: &str = "half typed thought";
     const QUEUED_PROMPT: &str = "and then the tests";
     const FORK_PLAN: &str = "1. split the parser";
@@ -2675,6 +2722,10 @@ mod tests {
 
     fn claim_in(dir: &StateDir, session: &TestSession) -> SessionClaim {
         SessionClaim::acquire(session.id, dir).expect(UNCLAIMED)
+    }
+
+    fn claim_new_id(dir: &StateDir) -> SessionClaim {
+        SessionClaim::acquire(MakiId::generate(), dir).expect(UNCLAIMED)
     }
 
     fn write_legacy_jsonl(path: &Path, session: &TestSession) {
@@ -4094,6 +4145,22 @@ mod tests {
         SessionClaim::acquire_in(id, tmp.path()).expect(SHARED_CLAIM_HELD);
     }
 
+    #[test_case(true ; "busy_while_held")]
+    #[test_case(false ; "claims_a_free_one")]
+    #[tokio::test]
+    async fn acquire_async_claims_only_a_free_session(held: bool) {
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let id = MakiId::generate();
+        let _holder = held.then(|| SessionClaim::acquire(id, &state).expect(UNCLAIMED));
+
+        match (held, SessionClaim::acquire_async(id, &state).await) {
+            (true, Err(SessionError::Busy { id: busy })) => assert_eq!(busy, id),
+            (false, Ok(_claim)) => assert!(SessionClaim::is_held(id, &state), "{LOCK_WHILE_HELD}"),
+            (held, claimed) => panic!("{BUSY_ONLY_WHILE_HELD}: held {held}, got {claimed:?}"),
+        }
+    }
+
     #[test]
     fn a_claim_does_not_cover_another_session() {
         let tmp = TempDir::new().unwrap();
@@ -4130,21 +4197,42 @@ mod tests {
     /// its id, so the claim must take its lock file along. A written session
     /// keeps its lock file, or a process already waiting on it could end up
     /// holding a lock nobody else can see.
-    #[test_case(false ; "an id nothing was written under")]
-    #[test_case(true ; "a written session")]
-    fn the_last_claim_keeps_its_lock_file_only_for_a_written_session(written: bool) {
+    #[test_case(claim_new_id, false ; "an id nothing was written under")]
+    #[test_case(claim_new_id, true ; "a written session")]
+    #[test_case(SessionClaim::fresh, false ; "a fresh id nothing was written under")]
+    #[test_case(SessionClaim::fresh, true ; "a fresh id with a transcript")]
+    fn the_last_claim_keeps_its_lock_file_only_for_a_written_session(
+        take_claim: fn(&StateDir) -> SessionClaim,
+        written: bool,
+    ) {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let dir = tmp.path().join(SESSIONS_DIR);
+        let claim = take_claim(&storage);
         let mut session: TestSession = Session::new("m", "/project");
-        let claim = claim_for(dir, &session);
-        assert!(lock_path(dir, session.id).exists(), "{LOCK_WHILE_HELD}");
+        session.id = claim.id();
+        assert!(lock_path(&dir, session.id).exists(), "{LOCK_WHILE_HELD}");
         if written {
-            session.save_to(&claim, dir).unwrap();
+            session.save_to(&claim, &dir).unwrap();
         }
 
         drop(claim);
 
-        assert_eq!(lock_path(dir, session.id).exists(), written);
+        assert_eq!(lock_path(&dir, session.id).exists(), written);
+    }
+
+    #[test]
+    fn a_claim_on_a_legacy_named_session_keeps_its_lock_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.id = id;
+        write_legacy_jsonl(&dir.join(format!("{LEGACY_HEX_ID}.jsonl")), &session);
+
+        drop(claim_id(dir, id));
+
+        assert!(lock_path(dir, id).exists(), "{LEGACY_LOCK_KEPT}");
     }
 
     #[test]

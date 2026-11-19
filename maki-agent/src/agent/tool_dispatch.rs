@@ -3180,7 +3180,8 @@ mod tests {
     /// form elicitation drops `question`), comes back through a script.
     #[test_case(&[PROBE_WIRE], &[]           ; "config_disabled")]
     #[test_case(&[],           &[PROBE_WIRE] ; "host_excluded")]
-    fn callable_drops_what_the_requests_filter_dropped(disabled: &[&str], excluded: &[&str]) {
+    #[tokio::test]
+    async fn callable_drops_what_the_requests_filter_dropped(disabled: &[&str], excluded: &[&str]) {
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
         ctx.config.disabled_tools = disabled.iter().map(|n| (*n).to_owned()).collect();
@@ -3192,7 +3193,8 @@ mod tests {
             excluded,
             false,
             false,
-        );
+        )
+        .await;
         ctx.tool_filter = Arc::clone(tools.filter());
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);

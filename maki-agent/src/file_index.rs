@@ -27,6 +27,7 @@ use ignore::overrides::OverrideBuilder;
 use ignore::{WalkBuilder, WalkState};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str, Utf32String, chars};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -72,7 +73,7 @@ const NON_UTF8_SKIPPED: &str = "file index skipped paths that are not valid UTF-
 const NOT_DETACHED: &str = "a corpus may only be published by hand on a detached file index";
 
 static INDEXES: Mutex<Vec<FileIndex>> = Mutex::new(Vec::new());
-static WALKS: AtomicUsize = AtomicUsize::new(0);
+static WALKS: Semaphore = Semaphore::const_new(MAX_WALKS);
 static WALK_OBSERVER: Mutex<Option<Arc<WalkObserver>>> = Mutex::new(None);
 
 /// The scoring config every file ranking in maki uses. Exported so a caller
@@ -395,24 +396,7 @@ struct Shared {
 }
 
 /// One of the `MAX_WALKS` slots, held for as long as a walk runs.
-struct WalkPermit;
-
-impl WalkPermit {
-    fn take() -> Option<Self> {
-        WALKS
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
-                (walking < MAX_WALKS).then_some(walking + 1)
-            })
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for WalkPermit {
-    fn drop(&mut self) {
-        WALKS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+type WalkPermit = SemaphorePermit<'static>;
 
 /// A handle on the index for one root. Cloning shares the walk and its
 /// results.
@@ -800,7 +784,7 @@ impl FileIndex {
             if walk.ended.as_ref().is_some_and(|ended| !ended.stale()) {
                 return;
             }
-            let Some(permit) = WalkPermit::take() else {
+            let Ok(permit) = WALKS.try_acquire() else {
                 debug!(root = %self.shared.root.display(), max = MAX_WALKS, "{WALKS_BUSY}");
                 return;
             };
@@ -1939,7 +1923,7 @@ mod tests {
     fn a_root_that_asks_while_the_walk_budget_is_spent_waits_for_a_later_ask() {
         let dir = tree(&["a.rs"]);
         let mut spent = Vec::new();
-        while let Some(permit) = WalkPermit::take() {
+        while let Ok(permit) = WALKS.try_acquire() {
             spent.push(permit);
         }
         assert_eq!(spent.len(), MAX_WALKS, "{NO_PERMIT}");
