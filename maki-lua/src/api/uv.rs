@@ -26,6 +26,24 @@ fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
     Ok(maki_storage::paths::home().and_then(|p| p.to_str().map(String::from)))
 }
 
+/// Return a monotonic high-resolution timestamp in nanoseconds. Like
+/// `vim.uv.hrtime`.
+///
+/// The epoch is arbitrary, so a reading only means something next to another
+/// one. It never goes backwards, which is what a live rate needs.
+///
+/// @return (integer) Nanoseconds from an arbitrary fixed point.
+/// @example
+/// local start = maki.uv.hrtime()
+/// -- ...
+/// local elapsed_ms = (maki.uv.hrtime() - start) / 1e6
+#[lua_fn]
+fn hrtime(_lua: &Lua) -> LuaResult<u64> {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    Ok(START.elapsed().as_nanos() as u64)
+}
+
 /// Look up the environment variable {name}. Like `vim.uv.os_getenv`.
 /// Returns nil when the variable is not set.
 ///
@@ -52,6 +70,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), os_getenv(perms), hrtime(),
     ]
 }

@@ -896,9 +896,10 @@ maki.api.create_autocmd({event}, {opts})
 Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
-Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
-`"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+Built-in events fired by the host: `"TurnStart"`, `"TextDelta"`,
+`"ThinkingDelta"`, `"TurnEnd"`, `"TurnError"`, `"TurnComplete"`,
+`"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`, `"CompactionDone"`,
+`"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
@@ -916,6 +917,11 @@ name the session now running or focused. What each event adds:
   and `data.input`, the input after every `tool.*.input` layer. A call
   that never ran, like a cancelled one, has neither.
 - `"TurnStart"`: `data.text`, the message that started the turn.
+- `"TextDelta"`, `"ThinkingDelta"`: `data.text`, the piece of the answer
+  or of the reasoning the model just streamed, and `data.bytes`, its size
+  in bytes. They fire many times per second, so a handler that redraws
+  should throttle itself. Subagent deltas stay quiet, like every other
+  subagent event.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
   `agent.user_message` layer refused the message), `data.usage` (four
@@ -1006,7 +1012,9 @@ name the session now running or focused. What each event adds:
 
 Conversation content needs the `session_read` permission. Without it a
 host event still arrives, carrying only its metadata fields:
-`"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+`"TurnStart"` without `data.text`, `"TextDelta"` and `"ThinkingDelta"`
+without `data.text` (their `data.bytes` still arrives), `"ToolDone"`
+without `data.input`,
 `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
 `data.text`. Maki warns once per plugin and event, naming what was left
 out. Events a plugin fires under its own names arrive as fired.
@@ -9073,6 +9081,30 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.hrtime()` {#maki-uv-hrtime}
+
+```lua
+maki.uv.hrtime()
+```
+
+Return a monotonic high-resolution timestamp in nanoseconds. Like
+`vim.uv.hrtime`.
+
+The epoch is arbitrary, so a reading only means something next to another
+one. It never goes backwards, which is what a live rate needs.
+
+**Returns:** (`integer`) Nanoseconds from an arbitrary fixed point.
+
+**Example:**
+
+```lua
+local start = maki.uv.hrtime()
+-- ...
+local elapsed_ms = (maki.uv.hrtime() - start) / 1e6
 ```
 
 
