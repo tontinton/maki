@@ -288,27 +288,22 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
 ///   wants.
-/// - `"TurnComplete"`: `data.message`, the model's message, with
-///   `data.context_window` and `data.context_size` when the host knows it.
-///   Fires after each response, before that response's tool calls run.
-///   `data.message` needs `session_read` and is the same table a
-///   `maki.session.messages()` entry is, so a null arrives as `maki.NIL` and
-///   an image block carries an image handle instead of base64. The keys and
-///   blocks are [listed here](#maki-session-messages). Each block is tagged
-///   by `type`, and each type carries its own fields. A
-///   subagent's response carries its own message and sizes with `data.id`,
-///   the task id `maki.session.notify` takes as `task`. Skip events with an
-///   `id` to watch only the main context. No payload carries a cost, and
-///   `"TurnEnd"` holds the bill.
+/// - `"TurnComplete"`: `data.message` and `data.context_window`, plus
+///   `data.context_size` when the host knows it. Fires after each model
+///   response, before its tool calls run. `data.message` is that response,
+///   shaped like a [`maki.session.messages`](#maki-session-messages) entry.
+///   A subagent's response fires it too, with the subagent's own message
+///   and sizes and `data.id`, its task id. Pass that id as `task` to
+///   `maki.session.notify` or `maki.session.request_compact`. Skip events
+///   with an `id` to watch only the main context. A compaction's summary
+///   request fires it as well, with the summary as `data.message`. Nothing
+///   marks it as a summary, and it fires even when the summary comes back
+///   empty and no `"CompactionDone"` follows. For cost, read `"TurnEnd"`.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
 ///   `data.context_size_after`, `data.context_window`, and `data.summary`,
-///   the text that replaced the history. A compaction asks the model for
-///   that summary first, so its `"TurnComplete"` arrives before this event,
-///   carrying the summary as `data.message`. The payload does not say it is
-///   a summary there, and a compaction whose summary fails fires that
-///   `"TurnComplete"` without ever reaching this event.
+///   the text that replaced the history.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
 ///   agent just wrote. Fires once per draft. Plan state is per session, so
 ///   pass `data.session_id` to `maki.plan.read`.
@@ -371,13 +366,14 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Conversation content needs the `session_read` permission. Without it a
 /// host event still arrives, carrying only its metadata fields:
 /// `"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
-/// `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
-/// `data.text`. Maki warns once per plugin and event, naming what was left
-/// out. Events a plugin fires under its own names arrive as fired.
+/// `"TurnComplete"` without `data.message`, `"CompactionDone"` without
+/// `data.summary`, and `"InputChanged"` without `data.text`. Maki warns once
+/// per plugin and event, naming what was left out. Events a plugin fires
+/// under its own names arrive as fired.
 ///
 /// A subagent's run fires only `"TurnComplete"`, never tool or other turn
-/// events. `"TurnEnd"` fires once per turn of the main session. A manual `/compact` fires no `"TurnEnd"`, only the
-/// `"TurnComplete"` of its summary request.
+/// events. `"TurnEnd"` fires once per turn of the main session. A manual
+/// `/compact` fires no `"TurnEnd"`.
 ///
 /// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 /// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
@@ -387,10 +383,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"SessionEnd"` is the teardown signal: it fires first so handlers can
 /// still inspect or stop the session's jobs, then session-owned jobs are
 /// reaped. `data.reason` names the path it came from: `"reset"` (TUI
-/// `/new`), `"load"`, `"delete"` (tab closed, or ACP `session/close`),
-/// `"shutdown"`, `"reload"` (`/reload` is rebuilding the plugin host, and the
-/// session carries on in the new one), `"replaced"` (an ACP client loaded the
-/// open session again), or
+/// `/new`), `"load"` (the tab opened another session), `"delete"` (tab
+/// closed, or ACP `session/close`), `"shutdown"`, `"reload"` (`/reload` is
+/// rebuilding the plugin host, and the session carries on in the new one),
+/// `"replaced"` (an ACP client loaded the open session again), or
 /// `"completed"` (a headless run finished).
 ///
 /// On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is

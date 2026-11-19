@@ -131,7 +131,7 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
 `maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
 
-With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. A model the list has not picked up yet still works when named with `--model`, since every request on this login goes to the Codex backend.
+With ChatGPT OAuth the model list comes from the Codex backend's `/models` endpoint. A model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend reports. When that request fails, the picker falls back to the table above. A model missing from the list still works if you type its id into `/model` or pass it to `--model`.
 
 ### Google
 
@@ -497,6 +497,8 @@ Without `thinking_fields`, maki sends `"thinking": {"type": "disabled"}` when th
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
+In `/model`, a custom provider without a key shows `no key`. A provider whose model list request fails shows `offline`, or `fallback` when Maki still has models to list for it. Press Enter on a `no key` or `offline` row to open `/login` for that provider. For an entry in this file, login first shows its `base_url` so you can fix a moved endpoint, then asks for the key. Leave the key blank to keep the one from the env var, `api_key`, or an earlier login.
+
 ### Aperture overrides
 
 Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
@@ -538,10 +540,6 @@ Current plans:
 | Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
-
-### Setting up a declared provider
-
-A custom entry that sets `protocol` shows `no key` in `/model` until it has a key. A provider whose model list fails shows `offline`, or `fallback` when it still has models to offer. Enter on a `no key` or `offline` row opens `/login` at that provider. A custom entry declared here starts on its prefilled `base_url`, so a moved endpoint is fixed before the key step. A blank key is accepted when the env var, inline key, or stored credential already provides one.
 
 ## Plugin Providers
 

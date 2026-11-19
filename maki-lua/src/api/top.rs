@@ -283,9 +283,9 @@ const NIL__doc: FnDoc = FnDoc {
 `maki.json.decode` returns it for every null unless `luanil` says otherwise. \
 Every conversion to JSON turns it back into null. So a decode, change, \
 encode pass loses no key. It is truthy and not equal to nil, so test \
-`x == maki.NIL` for null. Tool handler arguments use nil for null instead, \
-and so does an event payload, except for the message of `TurnComplete`, \
-which is a session table.",
+`x == maki.NIL` for null. Tool handler arguments and event payloads use \
+nil instead. The one exception is `data.message` of `TurnComplete`, which \
+has the shape `maki.session.messages` returns.",
     params: &[],
     returns: "",
     guard: None,

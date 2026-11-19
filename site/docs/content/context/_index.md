@@ -216,7 +216,7 @@ maki -r <session-id>
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 
-Plugins can also let the model trigger compaction itself: [`maki.session.request_compact`](/docs/lua-api/#maki-session-request_compact) queues the same work `/compact` does, with the same guidance input, and a plugin's `compact` tool typically wraps it. A model-triggered compaction that lands mid-run arrives right after the model's own tool call, and the turn continues on the summary.
+A plugin can let the model compact on its own. [`maki.session.request_compact`](/docs/lua-api/#maki-session-request_compact) queues the same compaction as `/compact`, with optional guidance text, so a plugin can wrap it in a `compact` tool. When the model calls that tool, Maki compacts before the next request and the run continues from the summary.
 
 ## Background tasks
 
