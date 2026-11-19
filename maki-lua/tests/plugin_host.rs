@@ -9529,3 +9529,89 @@ maki.api.register_tool({
         "lite 5-hour 42"
     );
 }
+
+const FILE_TOOL_NOTE_HEAD: &str = "Use dedicated tools for files, not bash: ";
+const FILE_TOOL_NOTE_OPTION: &str = "file_tool_note";
+
+fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig)) -> String {
+    let mut bash = maki_config::PluginFileConfig::default();
+    bash.opts
+        .insert(FILE_TOOL_NOTE_OPTION.into(), Value::Bool(true));
+    let (reg, _host) = builtins_host_with(&PluginsConfig::from_plugins(HashMap::from([(
+        "bash".to_owned(),
+        bash,
+    )])));
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    config(&mut ctx.config);
+    ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+    ctx.registry = Arc::clone(&reg);
+    exec_with_ctx(&reg, "bash", json!({ "command": command }), &ctx).unwrap_or_else(|error| error)
+}
+
+fn file_tool_note(reply: &str) -> Option<&str> {
+    reply
+        .strip_prefix(FILE_TOOL_NOTE_HEAD)
+        .and_then(|rest| rest.split_once(".\n"))
+        .map(|(items, _)| items)
+}
+
+#[test_case::test_case("cat /dev/null", Some("read instead of cat") ; "cat_file")]
+#[test_case::test_case("head -n 1 /dev/null && ls /dev", Some("read instead of head, list instead of ls") ; "chained_commands")]
+#[test_case::test_case("head -20 /dev/null", Some("read instead of head") ; "line_count_as_a_flag")]
+#[test_case::test_case("sed -n 1p /dev/null; sed -n 2p /dev/null", Some("read instead of sed") ; "same_command_named_once")]
+#[test_case::test_case("sed -n '2,4p' /dev/null", Some("read instead of sed") ; "sed_line_range")]
+#[test_case::test_case("sed -n '/a/,/b/p' /dev/null", None ; "sed_pattern_range")]
+#[test_case::test_case("cat /dev/null | wc -l", None ; "pipe_source")]
+#[test_case::test_case("grep -rn a /dev/null 2>&1", Some("grep instead of grep") ; "stderr_merged_into_stdout")]
+#[test_case::test_case("cat /dev/null/missing 2>/dev/null", Some("read instead of cat") ; "stderr_discarded")]
+#[test_case::test_case("find /dev/null -type f -name x", Some("glob instead of find") ; "find_files_by_name")]
+#[test_case::test_case("find /dev/null -name x -delete", None ; "find_with_an_action")]
+#[test_case::test_case("find /dev/null -type d", None ; "find_directories")]
+#[test_case::test_case("grep -c a /dev/null", None ; "counting_grep")]
+#[test_case::test_case("grep -rvn a /dev/null", None ; "inverted_grep_among_short_flags")]
+#[test_case::test_case("ls -l /dev/null", None ; "long_listing")]
+#[test_case::test_case("tail -n 1 /dev/null", Some("read instead of tail") ; "lines_from_the_end")]
+#[test_case::test_case("tail -f /dev/null/missing", None ; "following_a_file")]
+#[test_case::test_case("sed s/a/b/ /dev/null", None ; "sed_substitution")]
+#[test_case::test_case("sed -i.bak s/a/b/ /dev/null/missing", None ; "sed_in_place")]
+#[test_case::test_case("cat /dev/null >> /dev/stdout", None ; "output_written_to_a_file")]
+#[test_case::test_case("printf 'a\\nb\\n' | tail -n 1", None ; "filtering_piped_output")]
+#[test_case::test_case("cat <<EOF\nhi\nEOF", None ; "here_document")]
+#[test_case::test_case("grep -c a <<< a", None ; "here_string")]
+#[test_case::test_case("echo \"$(cat /dev/null)\"", None ; "command_substitution")]
+#[test_case::test_case("for f in /dev/null; do cat \"$f\"; done", None ; "loop_body")]
+#[test_case::test_case("git grep -c zzz-no-match -- /dev/null", None ; "subcommand_named_grep")]
+fn bash_names_the_file_tool_a_command_stands_in_for(command: &str, expected: Option<&str>) {
+    let reply = bash_reply(command, |_| {});
+    assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
+}
+
+#[test]
+fn bash_adds_no_file_tool_note_unless_the_option_is_on() {
+    let (reg, _host) = builtins_host();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+    ctx.registry = Arc::clone(&reg);
+    let reply = exec_with_ctx(&reg, "bash", json!({ "command": "cat /dev/null" }), &ctx)
+        .unwrap_or_else(|error| error);
+    assert_eq!(file_tool_note(&reply), None, "got: {reply}");
+}
+
+#[test_case::test_case(&["read"], &[], Some("grep instead of grep") ; "one_disabled")]
+#[test_case::test_case(&["read", "grep"], &[], None ; "both_disabled")]
+#[test_case::test_case(&[], &["bash", "read"], Some("read instead of cat") ; "one_allowed")]
+#[test_case::test_case(&[], &["bash"], None ; "none_allowed")]
+fn bash_note_names_only_tools_the_model_can_call(
+    disabled: &[&str],
+    allowed: &[&str],
+    expected: Option<&str>,
+) {
+    let owned = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+    let reply = bash_reply("cat /dev/null; grep -n a /dev/null", |config| {
+        config.disabled_tools = owned(disabled);
+        config.allowed_tools = owned(allowed);
+    });
+    assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
+}

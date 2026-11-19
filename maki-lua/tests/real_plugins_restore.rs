@@ -19,6 +19,7 @@ use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
+const FILE_TOOL_NOTE: &str = "Use dedicated tools for files, not bash: read instead of cat.";
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 /// The bash restore cases all run `echo`, and their output `hi` does not contain it.
 const COMMAND_WORD: &str = "echo";
@@ -239,6 +240,22 @@ fn bash_restore_titles_a_call_and_shows_its_command(
     );
     assert_eq!(r.header, header);
     assert!(r.body.contains(COMMAND_WORD), "{}", r.body);
+}
+
+#[test_case("hi", "hi" ; "with_output")]
+#[test_case("Exit code: 0", "No output" ; "without_output")]
+fn bash_restore_leaves_out_the_file_tool_note(reply: &str, shown: &str) {
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "cat hi.txt" }),
+        &format!("{FILE_TOOL_NOTE}\n{reply}"),
+        None,
+        Vec::new(),
+    );
+    assert!(!r.body.contains(FILE_TOOL_NOTE), "{}", r.body);
+    assert!(r.body.contains(shown), "{}", r.body);
 }
 
 /// The session's own directory tells the reader nothing.
