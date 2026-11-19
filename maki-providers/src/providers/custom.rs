@@ -200,11 +200,6 @@ fn model_from_def(
         // Spelling out how a model thinks is as good as saying that it does.
         .or_else(|| row.thinking_fields.as_ref().map(|_| true))
         .or(Some(base.supports_thinking));
-    // `Model::supports_vision` only looks discovery up under the base spec's
-    // slug, so a custom slug's modalities have to be copied in here.
-    row.supports_vision = row
-        .supports_vision
-        .or_else(|| discovered.and_then(|d| d.supports_vision));
     // Only the openai chat path merges the fragments into the body: the
     // responses path has no thinking wiring yet, and anthropic and google spell
     // thinking their own way. Anywhere else they would vanish without a trace.
