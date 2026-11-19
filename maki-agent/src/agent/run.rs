@@ -346,7 +346,7 @@ impl<'h> Agent<'h> {
             // so it must not rebuild the frame either. The next run sees the
             // same change.
             if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
-                self.refresh_frame()?;
+                self.refresh_frame().await?;
             }
             let kept = kept.map(|text| {
                 self.history.offer_title_source(&message, &text);
@@ -538,7 +538,7 @@ impl<'h> Agent<'h> {
             // Ahead of `try_auto_compact`: a switch landing after the check
             // would compact against the old window and then overflow the new
             // one.
-            self.sync_model();
+            self.sync_model().await;
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
@@ -555,8 +555,8 @@ impl<'h> Agent<'h> {
     /// reload, a model with other capabilities, the workflow toggle) or new
     /// host prompt text can't be told in a message, so they start a new frame,
     /// and the user hears that the cache is gone.
-    fn refresh_frame(&mut self) -> Result<(), AgentError> {
-        let candidate = (self.context)(&self.model, self.workflow);
+    async fn refresh_frame(&mut self) -> Result<(), AgentError> {
+        let candidate = (self.context)(&self.model, self.workflow).await;
         self.prompt_facts.clone_from(&candidate.facts);
         if fit_frame(self.history, candidate, self.mcp.as_ref(), &self.model) == FrameFit::Rebuilt {
             info!(session = ?self.session_id, model = %self.model.id, "frame fingerprint changed, rebuilt the frame");
@@ -595,7 +595,7 @@ impl<'h> Agent<'h> {
     /// thinking block Anthropic then demands. And a model with other tools
     /// (or without tool search) needs a new frame, which only a run start may
     /// build.
-    fn sync_model(&mut self) {
+    async fn sync_model(&mut self) {
         let Some(slot) = &self.model_sync else {
             return;
         };
@@ -606,7 +606,7 @@ impl<'h> Agent<'h> {
         {
             return;
         }
-        let candidate = (self.context)(&current.model, self.workflow);
+        let candidate = (self.context)(&current.model, self.workflow).await;
         let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
         if self
             .history
@@ -659,9 +659,9 @@ impl<'h> Agent<'h> {
     /// Right before every request. A compaction drops the frame, so it may
     /// have to be built again, and MCP servers that connected since the last
     /// request join here too.
-    fn prepare_request(&mut self) -> Result<(), AgentError> {
+    async fn prepare_request(&mut self) -> Result<(), AgentError> {
         if self.history.live_frame().is_none() {
-            self.refresh_frame()?;
+            self.refresh_frame().await?;
         }
         if let Some(mcp) = &self.mcp {
             self.history
@@ -684,7 +684,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.prepare_request()?;
+        self.prepare_request().await?;
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
@@ -1252,7 +1252,7 @@ impl<'h> Agent<'h> {
         self.defer_pins = false;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
-        self.refresh_frame()?;
+        self.refresh_frame().await?;
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
         if let Some(text) = &steer.continue_text {
@@ -1353,6 +1353,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSou
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::future::ready;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1362,7 +1363,7 @@ pub(crate) mod testing {
     use maki_providers::provider::Provider;
 
     use super::AgentParams;
-    use crate::agent::frame::RunContext;
+    use crate::agent::frame::{RunContext, RunContextBuilder};
     use crate::cancel::CancelMap;
     use crate::permissions::PermissionManager;
     use crate::prompt::ResolvedPrompts;
@@ -1406,6 +1407,12 @@ pub(crate) mod testing {
     pub(crate) fn fixed_context() -> RunContext {
         RunContext::fixed(SYSTEM.into(), RequestTools::default())
     }
+
+    pub(crate) fn sync_builder(
+        build: impl Fn(&Model, bool) -> RunContext + Send + Sync + 'static,
+    ) -> RunContextBuilder {
+        Arc::new(move |model, workflow| Box::pin(ready(build(model, workflow))))
+    }
 }
 
 #[cfg(test)]
@@ -1433,7 +1440,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::compaction::FIELD_CONTINUE;
-    use super::testing::{agent_params, fixed_context};
+    use super::testing::{agent_params, fixed_context, sync_builder};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
@@ -1723,7 +1730,7 @@ mod tests {
                 history,
                 gauge,
                 event_tx: EventSender::new(raw_tx, 0),
-                context: Arc::new(|_, _| fixed_context()),
+                context: sync_builder(|_, _| fixed_context()),
             },
         );
         agent.registry = Arc::new(ToolRegistry::new());
@@ -1770,7 +1777,7 @@ mod tests {
             let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1829,7 +1836,7 @@ mod tests {
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
-        agent.context = Arc::new(move |model, _| {
+        agent.context = sync_builder(move |model, _| {
             RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
         });
         agent.run(default_input()).await.unwrap();
@@ -1873,7 +1880,7 @@ mod tests {
             let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1917,7 +1924,7 @@ mod tests {
             let (mut agent, _events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1956,7 +1963,7 @@ mod tests {
             let (mut agent, _events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent
@@ -2763,7 +2770,7 @@ mod tests {
         let (agent, _event_rx) =
             make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
         let mut agent = agent.with_model_sync(slot).with_interrupt_source(picker);
-        agent.context = Arc::new(build);
+        agent.context = sync_builder(build);
         agent.run(default_input()).await.unwrap();
         drop(agent);
 
@@ -2804,7 +2811,7 @@ mod tests {
 
         fn builder(&self) -> RunContextBuilder {
             let world = self.clone();
-            Arc::new(move |model, _| {
+            sync_builder(move |model, _| {
                 let facts = PromptFacts {
                     model: model.spec(),
                     ..world.facts.lock().unwrap().clone()
@@ -3510,15 +3517,15 @@ mod tests {
             &mut h.history,
         );
         agent.context = builder;
-        agent.refresh_frame().unwrap();
+        agent.refresh_frame().await.unwrap();
 
-        agent.prepare_request().unwrap();
+        agent.prepare_request().await.unwrap();
         assert!(matches!(
             agent.history.as_slice().last().unwrap().role,
             Role::Assistant
         ));
         agent.history.push(Message::user(PENDING_PROMPT.into()));
-        agent.prepare_request().unwrap();
+        agent.prepare_request().await.unwrap();
         assert!(agent.history.as_slice().last().unwrap().is_context_update());
     }
 

@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use maki_agent::{McpPromptInfo, McpPromptRef};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{BuiltinAction, PackCommand, PackPreparation, PluginReach};
 use maki_storage::input_history::InputHistory;
@@ -187,23 +185,17 @@ impl App {
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
-        let prompt = self.command_palette.find_mcp_prompt(name).unwrap().clone();
-
-        let arguments = Self::parse_prompt_args(&prompt, args);
-        let missing: Vec<_> = prompt
-            .arguments
-            .iter()
-            .filter(|a| a.required && !arguments.contains_key(&a.name))
-            .map(|a| format!("<{}>", a.name))
-            .collect();
-        if !missing.is_empty() {
-            self.flash(format!("Usage: {} {}", name, missing.join(" ")));
-            return vec![];
-        }
-
-        let prompt_ref = McpPromptRef {
-            qualified_name: prompt.qualified_name.clone(),
-            arguments,
+        let resolved = self
+            .command_palette
+            .find_mcp_prompt(name)
+            .unwrap()
+            .resolve(args);
+        let prompt_ref = match resolved {
+            Ok(prompt_ref) => prompt_ref,
+            Err(usage) => {
+                self.flash(usage);
+                return vec![];
+            }
         };
         let display_text = if args.trim().is_empty() {
             name.to_string()
@@ -222,30 +214,6 @@ impl App {
         } else {
             self.start_run(input, display_text)
         }
-    }
-
-    fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
-        let mut result = HashMap::new();
-        let mut remaining = args.trim();
-        if remaining.is_empty() || prompt.arguments.is_empty() {
-            return result;
-        }
-        let last_idx = prompt.arguments.len() - 1;
-        for (i, arg) in prompt.arguments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            if i == last_idx {
-                result.insert(arg.name.clone(), remaining.to_string());
-            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
-                result.insert(arg.name.clone(), word.to_string());
-                remaining = rest.trim_start();
-            } else {
-                result.insert(arg.name.clone(), remaining.to_string());
-                break;
-            }
-        }
-        result
     }
 
     fn execute_custom_command(&mut self, name: &str, args: &str) -> Vec<Action> {

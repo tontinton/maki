@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,7 +30,7 @@ use mlua::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -290,39 +289,43 @@ impl Tool for LuaTool {
         &self.meta.name
     }
 
+    /// Only the Lua thread can answer in place. Every other caller gets the
+    /// static text here and the plugin's own through [`Self::describe`].
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        self.has_describe_fn
+            .then(|| local_describe(&self.plugin, &self.meta.name, &dctx_json(ctx)))
+            .flatten()
+            .flatten()
+            .map_or(Cow::Borrowed(&self.meta.description), Cow::Owned)
+    }
+
+    fn describe(&self, ctx: &DescriptionContext) -> Option<BoxFuture<'static, Option<String>>> {
         if !self.has_describe_fn {
-            return Cow::Borrowed(&self.meta.description);
+            return None;
         }
-        let dctx = dctx_json(ctx);
-        if let Some(result) = local_describe(&self.plugin, &self.meta.name, &dctx) {
-            return match result {
-                Some(s) => Cow::Owned(s),
-                None => Cow::Borrowed(&self.meta.description),
-            };
-        }
-        let (reply_tx, reply_rx) = sync_channel(1);
-        let sent = self
-            .tx
+        let (reply, answer) = oneshot::channel();
+        let tool = Arc::clone(&self.meta.name);
+        self.tx
             .send(Request::Describe {
                 plugin: Arc::clone(&self.plugin),
-                tool: Arc::clone(&self.meta.name),
-                dctx,
-                reply: reply_tx,
+                tool: Arc::clone(&tool),
+                dctx: dctx_json(ctx),
+                reply,
             })
-            .is_ok();
-        if sent {
-            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
-                Ok(Some(s)) => return Cow::Owned(s),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    tool = %self.meta.name,
-                    error = %e,
-                    "describe round trip failed; falling back to static description"
-                ),
+            .ok()?;
+        Some(Box::pin(async move {
+            match timeout(DESCRIBE_TIMEOUT, answer).await {
+                Ok(Ok(text)) => text,
+                unanswered => {
+                    tracing::warn!(
+                        %tool,
+                        ?unanswered,
+                        "describe got no answer; falling back to static description"
+                    );
+                    None
+                }
             }
-        }
-        Cow::Borrowed(&self.meta.description)
+        }))
     }
 
     fn schema(&self) -> Value {
@@ -2139,6 +2142,8 @@ mod tests {
     use crate::runtime::wake_or_fail;
 
     const BACKGROUND_PARAM: &str = "background";
+    const DESCRIBED: &str = "described by the plugin";
+    const NO_DESCRIBE_REQUEST: &str = "describe must ask the host before it is awaited";
 
     #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
     #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
@@ -2256,19 +2261,45 @@ mod tests {
         assert_eq!(inv.start_annotation(), expected);
     }
 
+    const DESCRIBE_CTX: DescriptionContext = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+
     #[test]
     fn describe_falls_back_to_static_description_when_runtime_unavailable() {
-        use maki_agent::tools::ToolFilter;
-
         let mut tool = make_lua_tool(None);
         tool.has_describe_fn = true;
-        let ctx = DescriptionContext {
-            filter: &ToolFilter::All,
-            audience: ToolAudience::MAIN,
-            workflow: false,
-            mcp: false,
+        assert!(tool.describe(&DESCRIBE_CTX).is_none());
+        assert_eq!(tool.description(&DESCRIBE_CTX), "test");
+    }
+
+    type DescribeReply = oneshot::Sender<Option<String>>;
+
+    #[test_case::test_case(|reply| { let _ = reply.send(Some(DESCRIBED.into())); None }, Some(DESCRIBED) ; "answered")]
+    #[test_case::test_case(|_| None, None ; "host_gone")]
+    #[test_case::test_case(Some, None ; "host_never_answers")]
+    #[tokio::test(start_paused = true)]
+    async fn describe_waits_for_the_host(
+        host: fn(DescribeReply) -> Option<DescribeReply>,
+        expected: Option<&str>,
+    ) {
+        let (tx, mut rx) = unbounded_channel();
+        let tool = LuaTool {
+            tx,
+            has_describe_fn: true,
+            ..make_lua_tool(None)
         };
-        assert_eq!(tool.description(&ctx), "test");
+        let asked = tool.describe(&DESCRIBE_CTX).unwrap();
+        let Ok(Request::Describe { reply, .. }) = rx.try_recv() else {
+            panic!("{NO_DESCRIBE_REQUEST}");
+        };
+        let _unanswered = host(reply);
+
+        assert_eq!(asked.await.as_deref(), expected);
+        assert_eq!(tool.description(&DESCRIBE_CTX), "test");
     }
 
     fn make_lua_tool(scopes: Option<PermissionScopeKind>) -> LuaTool {

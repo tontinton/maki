@@ -348,13 +348,16 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     } = handle;
     // One prompt, then the input ends. A session that never connected has
     // already said why on the event stream.
-    let _ = input_tx.send(AgentInput::from_defaults(
-        prompt,
-        AgentMode::Build,
-        images,
-        defaults,
-        InputSource::Headless,
-    ));
+    let _ = input_tx.send(
+        AgentInput::from_defaults(
+            prompt,
+            AgentMode::Build,
+            images,
+            defaults,
+            InputSource::Headless,
+        )
+        .into(),
+    );
     drop(input_tx);
     let start = Instant::now();
 

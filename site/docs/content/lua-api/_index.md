@@ -1023,9 +1023,10 @@ events. Everything else fires under `maki -p` and sdk mode as well.
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
 reaped. `data.reason` names the path it came from: `"reset"` (TUI
-`/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"reload"`
-(`/reload` is rebuilding the plugin host, and the session carries on in
-the new one), `"replaced"` (an ACP client took the session's place), or
+`/new`), `"load"`, `"delete"` (tab closed, or ACP `session/close`),
+`"shutdown"`, `"reload"` (`/reload` is rebuilding the plugin host, and the
+session carries on in the new one), `"replaced"` (an ACP client loaded the
+open session again), or
 `"completed"` (a headless run finished).
 
 On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is
@@ -4185,11 +4186,6 @@ Terminals report some keys differently, so maki picks one form:
 Key strings in a plugin and every module it `require`s are checked at
 load. Each invalid one is logged with its file and line, and the status
 bar shows a summary, so a typo shows up at startup.
-
-Upgrading from older versions: `win:recv` used to deliver `"enter"`,
-`"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
-`<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
-spellings.
 
 ---
 
@@ -7586,13 +7582,12 @@ an unnamed plugin that holds `agent` and `session_write` at most,
 which the status bar calls `a plugin`. So does a rewound or forked
 turn that starts with `/` or `!`, or is `exit`.
 
-Upgrading: `input_edit` needs `input` and `session_read` now, plus
-`agent` and `session_write` to change the text, and the editing
-built-in actions need `input`, `agent` and `session_write`. A binding
-on a key that types text, like `a` or `<Paste>`, needs `session_read`
-in any mode. A `plugin.toml` you wrote yourself grants them unless it
-sets them to `false`. A package needs its author to add them, and you to approve
-the package again.
+`input_edit` needs `input` and `session_read`, plus `agent` and
+`session_write` to change the text, and the editing built-in actions
+need `input`, `agent` and `session_write`. A binding on a key that
+types text, like `a` or `<Paste>`, needs `session_read` in any mode. A
+`plugin.toml` you wrote yourself grants them unless it sets them to
+`false`. A package has to declare them.
 
 ### Offsets and versions
 

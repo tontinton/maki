@@ -406,12 +406,18 @@ fn finish_compact(
 /// `next` is what the session would start with now. The summary goes out under
 /// a fresh frame built from it, for the session's own model in `hooks`, so the
 /// gauge measures the prompt the next request really sends and the frame never
-/// goes missing between runs. `model` is the one writing the summary.
+/// goes missing between runs. `model` is the one writing the summary, billed to
+/// `ledger`, whose totals the `Done` reports.
 ///
-/// A retry in here can honour a server `Retry-After` that parks the request for
-/// an hour, so esc has to reach it. The cancel comes back as
-/// `Ok(DoneReason::Cancelled)`, like [`Agent::run`](super::Agent::run) does, to
-/// leave the error path for real failures.
+/// Every ending but an `Err` sends its `Done`, a cancel's too, like
+/// [`Agent::run`](super::Agent::run). A retry in here can honour a server
+/// `Retry-After` that parks the request for an hour, so esc has to reach it.
+/// The cancel comes back as `Ok(DoneReason::Cancelled)`, to leave the error
+/// path for real failures. One that fired before the call counts too, so a
+/// driver that waited on something under the same token need not check.
+///
+/// An empty history ends at once: summarizing nothing would pay for a summary
+/// the model made up.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
@@ -426,28 +432,40 @@ pub async fn compact(
     instructions: Option<&str>,
     retry: RetryPolicy,
     reason: CompactReason,
+    ledger: &RunLedger,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let ledger = RunLedger::default();
-    let finished = |context_size| {
+    let spent_before = ledger.totals();
+    // Only a summary that landed is a turn, so an ending that changed nothing
+    // reports none.
+    let end = |ending: DoneReason,
+               summarized: bool,
+               context_size: u32|
+     -> Result<DoneReason, AgentError> {
         let totals = ledger.totals();
-        AgentEvent::Done {
+        event_tx.send(AgentEvent::Done {
             usage: totals.usage,
             cost: totals.cost,
             list_cost: totals.list_cost,
             context_size,
             context_window: hooks.model.context_window,
-            num_turns: 1,
-            // `Compact` and not `EndTurn`, so a goal loop reading this sees
-            // housekeeping and does not treat it as a turn boundary.
-            reason: DoneReason::Compact,
-        }
+            num_turns: u32::from(summarized),
+            reason: ending,
+        })?;
+        Ok(ending)
     };
-    let CompactionPlan::Proceed(steer) =
+    let plan = if history.is_empty() {
+        CompactionPlan::Skipped
+    } else {
         steer_compaction(hooks, config, reason, instructions, false).await
-    else {
-        event_tx.send(finished(size_before))?;
-        return Ok(DoneReason::Compact);
+    };
+    if hooks.cancel.is_cancelled() {
+        return end(DoneReason::Cancelled, false, size_before);
+    }
+    // `Compact` and not `EndTurn`, so a goal loop reading this sees
+    // housekeeping and does not treat it as a turn boundary.
+    let CompactionPlan::Proceed(steer) = plan else {
+        return end(DoneReason::Compact, false, size_before);
     };
     let Compacted {
         summary, duration, ..
@@ -461,14 +479,14 @@ pub async fn compact(
         steer.instructions.as_deref(),
         0,
         retry,
-        &ledger,
+        ledger,
     )
     .await
     {
-        Ok(done) => done,
+        Ok(compacted) => compacted,
         // `finish_compact` is the only writer in here, so a cancel leaves the
         // transcript and the gauge untouched and the session carries on.
-        Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
+        Err(AgentError::Cancelled) => return end(DoneReason::Cancelled, false, size_before),
         Err(e) => return Err(e),
     };
     if let Some(text) = steer.continue_text {
@@ -485,9 +503,10 @@ pub async fn compact(
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
-    // a turn yet can offer.
-    let context_size_before =
-        size_before.max(ledger.totals().usage.total_input().min(u32::MAX as u64) as u32);
+    // a turn yet can offer. The ledger can open with spend carried from moved
+    // work, which read none of it.
+    let summarized_input = ledger.totals().since(&spent_before).usage.total_input();
+    let context_size_before = size_before.max(summarized_input.min(u32::MAX as u64) as u32);
     let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
@@ -496,9 +515,7 @@ pub async fn compact(
         summary,
         duration_ms: duration.as_millis() as u64,
     })?;
-    event_tx.send(finished(context_size_after))?;
-
-    Ok(DoneReason::Compact)
+    end(DoneReason::Compact, true, context_size_after)
 }
 
 /// Context held back from the transcript.
@@ -732,10 +749,10 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::AgentConfig;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
+    use crate::{AgentConfig, RunTotals};
     use maki_config::CompactionBuffer;
 
     #[test]
@@ -929,6 +946,7 @@ mod tests {
             instructions,
             RetryPolicy::default(),
             CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await
     }
@@ -1073,6 +1091,7 @@ mod tests {
             None,
             RetryPolicy::default(),
             CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await;
 
@@ -1158,6 +1177,7 @@ mod tests {
             None,
             RetryPolicy::default(),
             CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await;
 
@@ -1234,6 +1254,115 @@ mod tests {
         );
     }
 
+    const CARRIED_INPUT: u64 = 900_000;
+
+    /// Runs a manual compaction from an empty gauge and hands back every event
+    /// it sent.
+    async fn compact_events(
+        provider: &MockProvider,
+        history: &mut History,
+        ledger: &RunLedger,
+        cancel: &CancelToken,
+    ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
+        let (raw_tx, mut rx) = unbounded_channel();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let result = compact(
+            provider,
+            &model,
+            history,
+            &mut ContextGauge::default(),
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, cancel),
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+            CompactReason::Manual,
+            ledger,
+        )
+        .await;
+        (
+            result,
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| e.event)
+                .collect(),
+        )
+    }
+
+    /// The mock holds no responses, so any request would panic. A cancel wins
+    /// over an empty history: it is what the user asked for last.
+    #[test_case(Vec::new(), false, DoneReason::Compact ; "empty_history")]
+    #[test_case(Vec::new(), true, DoneReason::Cancelled ; "cancel_on_an_empty_history")]
+    #[test_case(vec![Message::user(KEPT_TEXT.into())], true, DoneReason::Cancelled ; "cancel_before_the_call")]
+    #[tokio::test]
+    async fn an_ending_without_a_request_sends_one_done_with_no_turn(
+        messages: Vec<Message>,
+        cancelled: bool,
+        expected: DoneReason,
+    ) {
+        let provider = MockProvider::new(Vec::new());
+        let mut history = History::new(messages);
+        let (trigger, cancel) = CancelToken::new();
+        if cancelled {
+            trigger.cancel();
+        }
+
+        let (result, events) =
+            compact_events(&provider, &mut history, &RunLedger::default(), &cancel).await;
+
+        assert_eq!(result.unwrap(), expected);
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Done {
+                    num_turns, reason, ..
+                } => Some((*num_turns, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endings, [(0, expected)]);
+    }
+
+    /// A driver's ledger can open with what moved work spent, which read none
+    /// of the transcript.
+    #[tokio::test]
+    async fn the_size_before_ignores_spend_the_ledger_carried() {
+        let provider = MockProvider::new(vec![Ok(StreamResponse {
+            usage: TokenUsage {
+                input: SUMMARISED_INPUT,
+                ..Default::default()
+            },
+            ..text_response(StopReason::EndTurn)
+        })]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let carried = RunTotals {
+            usage: TokenUsage {
+                input: CARRIED_INPUT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ledger = RunLedger::carrying(&Arc::default(), carried);
+
+        let (result, events) =
+            compact_events(&provider, &mut history, &ledger, &CancelToken::none()).await;
+
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+        let sizes_before: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CompactionDone {
+                    context_size_before,
+                    ..
+                } => Some(u64::from(*context_size_before)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes_before, [SUMMARISED_INPUT]);
+    }
+
     /// `summary_prompt_merges_instructions` covers the merge, this one the
     /// wiring around it.
     #[tokio::test]
@@ -1306,6 +1435,7 @@ mod tests {
             instructions,
             RetryPolicy::default(),
             reason,
+            &RunLedger::default(),
         )
         .await;
         (

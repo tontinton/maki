@@ -267,6 +267,11 @@ pub trait ToolInvocation: Send + Sync {
 pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
+    /// The description when its owner has to be asked for it. `None`, from
+    /// the tool or from the answer, leaves it to [`Self::description`].
+    fn describe(&self, _ctx: &DescriptionContext) -> Option<BoxFuture<'static, Option<String>>> {
+        None
+    }
     fn schema(&self) -> Value;
     /// The schema the model is shown, or `None` to leave the tool out of its
     /// array. `background` is whether the model can move a call to the
@@ -518,35 +523,50 @@ impl ToolRegistry {
         supports_examples: bool,
         background: bool,
     ) -> Value {
-        let background = background && ctx.audience.contains(ToolAudience::MAIN);
         let snapshot = self.tools.load();
+        let offered = snapshot.iter().filter_map(|entry| {
+            let schema = offered_schema(entry, ctx, background)?;
+            Some(definition(
+                entry,
+                schema,
+                None,
+                vars,
+                ctx,
+                supports_examples,
+            ))
+        });
+        Value::Array(offered.collect())
+    }
+
+    /// [`Self::definitions_with_background`] once every [`Tool::describe`]
+    /// has answered. One snapshot is read throughout, so a reload in between
+    /// cannot pair a tool with another one's answer. The tools are asked one
+    /// after the other: a slow owner must not use up the patience for the next.
+    pub async fn described_definitions(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext<'_>,
+        supports_examples: bool,
+        background: bool,
+    ) -> Value {
+        let snapshot = self.tools.load_full();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
-                continue;
-            }
-            let Some(schema) = entry.tool.offered_schema(background) else {
+            let Some(schema) = offered_schema(entry, ctx, background) else {
                 continue;
             };
-            let description = vars.apply(&entry.tool.description(ctx)).into_owned();
-            let mut def = json!({
-                "name": entry.name(),
-                "description": description,
-                "input_schema": sanitize_tool_input_schema(schema),
-            });
-            if let Some(examples) = entry.tool.examples() {
-                if supports_examples {
-                    def["input_examples"] = examples;
-                } else if let Some(text) = format_examples_as_text(&examples) {
-                    let merged =
-                        format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
-                    def["description"] = Value::String(merged);
-                }
-            }
-            out.push(def);
+            let described = match entry.tool.describe(ctx) {
+                Some(asked) => asked.await,
+                None => None,
+            };
+            out.push(definition(
+                entry,
+                schema,
+                described,
+                vars,
+                ctx,
+                supports_examples,
+            ));
         }
         Value::Array(out)
     }
@@ -572,6 +592,46 @@ impl RegistrySnapshot {
     }
 }
 
+/// The schema of a tool this array shows, `None` for one it leaves out.
+fn offered_schema(
+    entry: &RegisteredTool,
+    ctx: &DescriptionContext,
+    background: bool,
+) -> Option<Value> {
+    let background = background && ctx.audience.contains(ToolAudience::MAIN);
+    (entry.tool.audience().contains(ctx.audience) && ctx.filter.matches(entry.name()))
+        .then(|| entry.tool.offered_schema(background))
+        .flatten()
+}
+
+/// `described` is what [`Tool::describe`] answered. Without an answer the
+/// tool gives its own description.
+fn definition(
+    entry: &RegisteredTool,
+    schema: Value,
+    described: Option<String>,
+    vars: &Vars,
+    ctx: &DescriptionContext,
+    supports_examples: bool,
+) -> Value {
+    let description = described.map_or_else(|| entry.tool.description(ctx), Cow::Owned);
+    let description = vars.apply(&description).into_owned();
+    let mut def = json!({
+        "name": entry.name(),
+        "description": description,
+        "input_schema": sanitize_tool_input_schema(schema),
+    });
+    if let Some(examples) = entry.tool.examples() {
+        if supports_examples {
+            def["input_examples"] = examples;
+        } else if let Some(text) = format_examples_as_text(&examples) {
+            let merged = format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
+            def["description"] = Value::String(merged);
+        }
+    }
+    def
+}
+
 fn format_examples_as_text(examples: &Value) -> Option<String> {
     let arr = examples.as_array()?;
     if arr.is_empty() {
@@ -593,10 +653,14 @@ mod tests {
     use super::*;
     use crate::template::Vars;
     use test_case::test_case;
+    use tokio::task::yield_now;
 
     use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
 
     const ANY_TOOL_NAME: &str = "schemaless";
+    const DESCRIBED: &str = "described by its owner";
+    const LEFT_OUT_ASKED: &str =
+        "a tool left out of the array must not be asked to describe itself";
     const EMPTY_SCHEMA_REJECTED: &str =
         "strict providers reject a function whose parameters is empty";
 
@@ -640,6 +704,63 @@ mod tests {
             json!({"type": "object", "properties": {}, "additionalProperties": true}),
             "{EMPTY_SCHEMA_REJECTED}"
         );
+    }
+
+    struct Described {
+        tool: Arc<dyn Tool>,
+        offered: bool,
+    }
+
+    impl Tool for Described {
+        fn name(&self) -> &str {
+            self.tool.name()
+        }
+        fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+            self.tool.description(ctx)
+        }
+        fn describe(&self, _: &DescriptionContext) -> Option<BoxFuture<'static, Option<String>>> {
+            assert!(self.offered, "{LEFT_OUT_ASKED}");
+            Some(Box::pin(async {
+                yield_now().await;
+                Some(DESCRIBED.into())
+            }))
+        }
+        fn schema(&self) -> Value {
+            self.tool.schema()
+        }
+        fn offered_schema(&self, _background: bool) -> Option<Value> {
+            self.offered.then(|| self.schema())
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            self.tool.parse(input)
+        }
+    }
+
+    #[test_case(true ; "offered")]
+    #[test_case(false ; "left_out_and_not_asked")]
+    #[tokio::test]
+    async fn only_awaited_definitions_carry_the_described_text(offered: bool) {
+        let reg = ToolRegistry::new();
+        reg.register(mock("plain"), lua_source("p")).unwrap();
+        let tool = mock(ANY_TOOL_NAME);
+        reg.register(Arc::new(Described { tool, offered }), lua_source("p"))
+            .unwrap();
+        let ctx = DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let vars = Vars::new();
+        let mut expected = reg.definitions(&vars, &ctx, false);
+        assert_eq!(expected.as_array().unwrap().len(), 1 + usize::from(offered));
+        if offered {
+            assert_ne!(expected[1]["description"], DESCRIBED);
+            expected[1]["description"] = DESCRIBED.into();
+        }
+
+        let described = reg.described_definitions(&vars, &ctx, false, true).await;
+        assert_eq!(described, expected);
     }
 
     #[test]

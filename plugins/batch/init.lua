@@ -824,7 +824,7 @@ local function handler(input, ctx)
 end
 
 -- Last resort: no state, output isn't section-formatted.
-local function legacy_restore(children, output, tol)
+local function fallback_restore(children, output, tol)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
   view:set_header(render_children(children))
@@ -859,7 +859,7 @@ local function restore(input, output, _is_error, rctx)
     end
     return Batch.new(children, cctx).buf
   end
-  return legacy_restore(children, output, tol)
+  return fallback_restore(children, output, tol)
 end
 
 maki.api.register_tool({
