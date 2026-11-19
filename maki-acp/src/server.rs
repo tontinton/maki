@@ -1085,11 +1085,15 @@ fn start_event_pump(
                     tool_inputs.clear();
                     cost.settle(totals.cost);
                     if let Some(id) = finish_turn(&pending) {
-                        let error = if auth {
+                        let mut error = if auth {
                             AcpError::auth_required()
                         } else {
                             AcpError::internal_error()
                         };
+                        // Clients show `message`, not `data`.
+                        if !auth {
+                            error.message.clone_from(&message);
+                        }
                         let error = error.data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
@@ -1963,6 +1967,8 @@ mod tests {
         assert_eq!(answer["id"], PROMPT_ID);
         assert_eq!(answer["error"]["code"], i32::from(expected.code));
         assert_eq!(answer["error"]["data"], TURN_ERROR);
+        let shows_cause = answer["error"]["message"] == TURN_ERROR;
+        assert_eq!(shows_cause, !auth);
     }
 
     /// A cached input holds the whole file a `write` is about to lay down, and

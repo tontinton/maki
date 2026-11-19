@@ -200,6 +200,11 @@ fn model_from_def(
         // Spelling out how a model thinks is as good as saying that it does.
         .or_else(|| row.thinking_fields.as_ref().map(|_| true))
         .or(Some(base.supports_thinking));
+    // `Model::supports_vision` only looks discovery up under the base spec's
+    // slug, so a custom slug's modalities have to be copied in here.
+    row.supports_vision = row
+        .supports_vision
+        .or_else(|| discovered.and_then(|d| d.supports_vision));
     // Only the openai chat path merges the fragments into the body: the
     // responses path has no thinking wiring yet, and anthropic and google spell
     // thinking their own way. Anywhere else they would vanish without a trace.
@@ -569,6 +574,29 @@ mod tests {
         let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    #[test_case(Some(true), Some(false), true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), true ; "image_discovery_keeps_vision_on")]
+    fn discovered_vision_flows_into_custom_model(
+        declared: Option<bool>,
+        discovered: Option<bool>,
+        expected: bool,
+    ) {
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}");
+        let model_id = "vllm-model";
+        crate::model_registry::set_known_models(
+            &slug,
+            vec![ModelInfo {
+                supports_vision: discovered,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].supports_vision = declared;
+        let model = model_from_def(&def, openai_spec(), &slug, model_id);
+        assert_eq!(model.supports_vision(), expected);
     }
 
     const ENDPOINT_INPUT_PRICE: f64 = 0.5;
