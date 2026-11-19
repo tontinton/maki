@@ -438,6 +438,7 @@ maki.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionRe
 maki.api.register_command({
   name = "/tasks",
   description = "Browse and search tasks",
+  interactive = true,
   handler = open,
 })
 
