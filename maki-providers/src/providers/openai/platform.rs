@@ -40,6 +40,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models match by their `-codex` substring in
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
     "gpt-6-sol",
@@ -59,11 +61,10 @@ const CHAT_THINKING: ThinkingFallback = ThinkingFallback::Dialect(&dialect::STAN
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-// The backend hides models newer than this Codex CLI version, so bump it when
-// a fresh model is missing from the list. 0.156.1 is the first line that
-// surfaces GPT-6 Sol / Luna in the picker, 0.159.x the first with GPT-6.1 Sol;
-// 0.167.0 is latest as of 2026-10-07
-const CODEX_CLIENT_VERSION: &str = "0.167.0";
+// The backend lists a model only to clients at or past its minimal Codex CLI
+// version. That gate guards Codex CLI features Maki never uses, so Maki claims a
+// version no release will reach instead of trailing each one by an update.
+const CODEX_CLIENT_VERSION: &str = "999.0.0";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -471,6 +472,18 @@ fn plan_effort_dialect<'a>(
         .or_else(|| is_codex_model(model_id).then(|| plan_dialect(model_id).clone()))
 }
 
+/// A ChatGPT login opens only the Codex backend. On the chat completions path
+/// its token reaches the platform API, whose 401 reads as a dead login, so a
+/// model the listing has not named yet still goes to the Codex backend.
+fn routed_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a PlanModelInfo>,
+    oauth: bool,
+) -> Option<EffortDialect<'a>> {
+    plan_effort_dialect(model_id, discovered)
+        .or_else(|| oauth.then(|| plan_dialect(model_id).clone()))
+}
+
 pub(super) fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
     match plan_effort_dialect(&model.id, discovered.as_deref()) {
@@ -498,13 +511,13 @@ impl Provider for OpenAi {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.auth.refresh_if_stale().await?;
+            let oauth = self.auth.uses_oauth().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             let discovered =
                 model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
-            if let Some(dialect) = plan_effort_dialect(&model.id, discovered.as_deref()) {
+            if let Some(dialect) = routed_dialect(&model.id, discovered.as_deref(), oauth) {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .auth
@@ -636,6 +649,8 @@ mod tests {
         assert!(is_codex_model(model_id));
     }
 
+    #[test_case("gpt-6.2-sol", Some(272_000))]
+    #[test_case("gpt-6.2-astra", Some(272_000))]
     #[test_case("gpt-6.1-sol", Some(272_000))]
     #[test_case("gpt-6.1-terra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
@@ -695,6 +710,8 @@ mod tests {
             ("gpt-6-sol", &dialect::GPT_6),
             ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-6-astra", &dialect::GPT_6),
+            ("gpt-6.2-sol", &dialect::GPT_6),
+            ("gpt-6.2-astra", &dialect::GPT_6),
             ("gpt-6.1-sol", &dialect::GPT_6),
             ("gpt-6.1-terra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
@@ -714,6 +731,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("{UNREVIEWED}: {model_id}"));
             assert_eq!(plan_dialect(model_id), *expected, "{model_id}");
         }
+    }
+
+    #[test_case("gpt-7-nova", true, Some(&dialect::CODING_PLAN) ; "oauth_sends_unlisted_model_to_codex")]
+    #[test_case("gpt-6.3-sol", true, Some(&dialect::GPT_6) ; "oauth_keeps_family_dialect_for_unlisted_model")]
+    #[test_case("gpt-7-nova", false, None ; "api_key_sends_unlisted_model_to_chat")]
+    #[test_case("gpt-6.2-sol", false, Some(&dialect::GPT_6) ; "api_key_sends_plan_model_to_responses")]
+    fn undiscovered_models_route_by_login(
+        model_id: &str,
+        oauth: bool,
+        expected: Option<&EffortDialect>,
+    ) {
+        assert_eq!(routed_dialect(model_id, None, oauth).as_ref(), expected);
     }
 
     #[test_case("gpt-5.3-codex")]
