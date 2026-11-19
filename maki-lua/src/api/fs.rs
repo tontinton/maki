@@ -286,6 +286,11 @@ impl LineCutter {
         self.kept.extend_from_slice(&rest[..room.min(rest.len())]);
         self.seen += rest.len() as u64;
         self.ends_in_cr = rest.last().map_or(self.ends_in_cr, |last| *last == b'\r');
+        // Don't wait for a `\n` that `/dev/zero` never sends. One byte past the
+        // cap can still be the `\r` of a `\r\n`, which does not count.
+        if self.max_bytes.is_none() && self.seen > self.keep() as u64 + 1 {
+            return Err(too_large());
+        }
         match newline {
             Some(newline) => Ok((newline + 1, Some(self.take()?))),
             None => Ok((buf.len(), None)),
@@ -1647,6 +1652,13 @@ mod tests {
             line.text.len() as u64,
             MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
         );
+    }
+
+    #[test]
+    fn next_line_fails_an_endless_whole_line() {
+        let mut endless = BufReader::new(repeat(b'x'));
+        let err = next_line(&mut endless, None, false).unwrap_err();
+        assert_eq!(err.to_string(), too_large().to_string());
     }
 
     #[test_case("", &[]; "empty")]
