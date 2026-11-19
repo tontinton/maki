@@ -111,12 +111,14 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-terra | $1.00 / $5.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.2-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
 | Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
 | Strong | gpt-6-astra | $10.00 / $50.00 | 1050K ctx / 128K out |
+| Strong | gpt-6.2-astra | $8.00 / $40.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
@@ -129,7 +131,7 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
 `maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
 
-With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped.
+With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. A model the list has not picked up yet still works when named with `--model`, since every request on this login goes to the Codex backend.
 
 ### Google
 
