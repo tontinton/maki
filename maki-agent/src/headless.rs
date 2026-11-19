@@ -799,7 +799,7 @@ async fn compact_session(
         &summary_model,
         run.history,
         run.gauge,
-        context(model, workflow),
+        context(model, workflow).await,
         mcp,
         &run.event_tx,
         &hooks,

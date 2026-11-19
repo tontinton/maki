@@ -13,7 +13,8 @@ use tracing::{debug, error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
+    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
+    forgive_refused_images, model_registry, refuse_sent_images,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
@@ -74,6 +75,7 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
+const IMAGES_WITHHELD: &str = "The server refused the request, retrying without its images:";
 
 fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
@@ -709,6 +711,7 @@ impl<'h> Agent<'h> {
             Ok(r) => {
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
+                accept_sent_images(&self.model, self.history.as_slice());
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -733,6 +736,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_thinking_unbound() => {
                 return self.recover_unbound_thinking(e);
+            }
+            Err(StreamError::Refused(e)) => {
+                return self.recover_refused_body(e);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -979,6 +985,30 @@ impl<'h> Agent<'h> {
         warn!(session = ?self.session_id, model = %self.model.id, dropped, error = %err, "thinking bound to a moved prefix, dropped it all");
         self.event_tx.send(AgentEvent::Notice {
             text: THINKING_DROPPED.into(),
+        })?;
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// A server that refuses a body refuses it again on every later turn, and
+    /// the session is stuck. Each server explains the cause in its own words,
+    /// but images are the usual reason (a model that claims vision it lacks,
+    /// a format it cannot read, a size limit), and they are the one part of a
+    /// request we can drop without breaking it. So we blame images this model
+    /// never took, newest first, and retry without them. Only the wire loses
+    /// them, history keeps the pixels. Each round blames at least one more
+    /// image, so this ends. Once a retry is refused with nothing left to
+    /// blame, our guess was wrong, so we take the blame back and show the
+    /// real error.
+    fn recover_refused_body(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        let withheld = refuse_sent_images(&self.model, self.history.as_slice());
+        if withheld == 0 {
+            let restored = forgive_refused_images(&self.model, self.history.as_slice());
+            error!(error = %err, model = %self.model.id, self.num_turns, restored, "stream_message failed");
+            return Err(err);
+        }
+        warn!(session = ?self.session_id, model = %self.model.id, withheld, error = %err, "server refused a request with images, retrying without them");
+        self.event_tx.send(AgentEvent::Notice {
+            text: format!("{IMAGES_WITHHELD} {}", err.user_message()),
         })?;
         Ok(TurnOutcome::Continue)
     }
@@ -1428,8 +1458,9 @@ mod tests {
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::test_support::isolated_home;
     use maki_providers::{
-        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
-        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, ImageMediaType, Message, Model, ModelPricing, ProviderEvent,
+        RequestOptions, Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        adapt_images_for_model,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
@@ -4065,6 +4096,157 @@ mod tests {
             )),
             "{message}"
         );
+    }
+
+    const IMAGE_REFUSED_MESSAGE: &str = "could not process image";
+    const PARTIAL_REPLY: &str = "Looking at the";
+    const GOOD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const BAD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    /// Refuses with `status` every request that carries the `refused` image,
+    /// or every request at all when `always` is set. With `mid_stream` the
+    /// error comes after a bit of reply, like an error frame in the middle of
+    /// a stream.
+    struct ImageRefusingProvider {
+        status: u16,
+        refused: &'static str,
+        always: bool,
+        mid_stream: bool,
+    }
+
+    impl ImageRefusingProvider {
+        fn refusing(refused: &'static str) -> Self {
+            Self {
+                status: 400,
+                refused,
+                always: false,
+                mid_stream: false,
+            }
+        }
+    }
+
+    impl Provider for ImageRefusingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let refused = self.always || carries_image(messages, self.refused);
+            if refused && self.mid_stream {
+                let _ = events.send(ProviderEvent::TextDelta {
+                    text: PARTIAL_REPLY.into(),
+                });
+            }
+            Box::pin(async move {
+                if refused {
+                    Err(AgentError::api(self.status, IMAGE_REFUSED_MESSAGE))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn carries_image(messages: &[Message], data: &str) -> bool {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Image { source } if *source.data == *data))
+    }
+
+    fn image_input(data: &str) -> AgentInput {
+        AgentInput {
+            images: vec![ImageSource::new(ImageMediaType::Png, data.into())],
+            ..default_input()
+        }
+    }
+
+    #[test_case(400, false, false, true,  true  ; "retries_without_the_image")]
+    #[test_case(400, true,  false, false, true  ; "refused_without_it_gives_it_back")]
+    #[test_case(403, true,  false, false, false ; "forbidden_leaves_it_alone")]
+    #[test_case(400, false, true,  false, false ; "error_mid_reply_leaves_it_alone")]
+    #[tokio::test]
+    async fn refused_body_recovery(
+        status: u16,
+        always: bool,
+        mid_stream: bool,
+        recovers: bool,
+        notices: bool,
+    ) {
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        let provider = ImageRefusingProvider {
+            status,
+            always,
+            mid_stream,
+            ..ImageRefusingProvider::refusing(BAD_PNG)
+        };
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+
+        let recovered = agent.run(image_input(BAD_PNG)).await.is_ok();
+        drop(agent);
+
+        assert_eq!(recovered, recovers);
+        assert!(
+            carries_image(history.as_slice(), BAD_PNG),
+            "history keeps the pixels"
+        );
+        assert_eq!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::Notice { text } if text.starts_with(IMAGES_WITHHELD)
+            )),
+            notices
+        );
+        let next = adapt_images_for_model(&default_model(), history.as_slice()).await;
+        assert_eq!(
+            carries_image(&next, BAD_PNG),
+            !recovers,
+            "only a recovery keeps the image off the wire"
+        );
+    }
+
+    /// The user pastes a screenshot under a model without vision, then
+    /// switches to one that claims vision but cannot read it. Nothing new is
+    /// left to blame, so the older image takes the blame, but never the one
+    /// this model took before.
+    #[tokio::test]
+    async fn an_older_image_is_blamed_when_nothing_new_is_left() {
+        let text_only = Model {
+            supports_vision_override: Some(false),
+            ..default_model()
+        };
+        let switched = Model {
+            id: SWITCHED_MODEL.into(),
+            ..default_model()
+        };
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &switched);
+        for (model, input) in [
+            (&switched, image_input(GOOD_PNG)),
+            (&text_only, image_input(BAD_PNG)),
+            (&switched, default_input()),
+        ] {
+            let (mut agent, _event_rx) = make_agent_with(
+                Arc::new(ImageRefusingProvider::refusing(BAD_PNG)),
+                model.clone(),
+                &mut history,
+            );
+            assert!(agent.run(input).await.is_ok());
+        }
+
+        let next = adapt_images_for_model(&switched, history.as_slice()).await;
+        assert!(carries_image(&next, GOOD_PNG));
+        assert!(!carries_image(&next, BAD_PNG));
     }
 
     const QUEUED_INPUT: &str = "actually, check the other module first";

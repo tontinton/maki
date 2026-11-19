@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use jiff::Timestamp;
 use maki_storage::frame::FactsUpdate;
@@ -90,6 +90,32 @@ pub struct ImageSource {
     /// rides with it: every clone shares one verdict, and it dies with the
     /// pixels instead of outliving them in a side table.
     pub(crate) verdict: Arc<OnceLock<Fix>>,
+    /// What the server of each model said about a request carrying this
+    /// image. Like the verdict it is shared by every clone and never saved.
+    /// It is kept per model because an answer tells us as much about the
+    /// server as about the pixels, so other models still get an image one of
+    /// them refused, and the next run that loads the session asks again.
+    answers: Arc<Mutex<Vec<ServerAnswer>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Accepted,
+    Refused,
+}
+
+/// Holds [`Model::spec`] in parts, so checking every image of every request
+/// allocates nothing.
+struct ServerAnswer {
+    provider: Arc<str>,
+    model: String,
+    answer: Answer,
+}
+
+impl ServerAnswer {
+    fn is_from(&self, model: &Model) -> bool {
+        self.provider == model.provider && self.model == model.id
+    }
 }
 
 /// The payload is the largest string a session holds, and a verdict can carry
@@ -145,11 +171,46 @@ impl ImageSource {
             media_type,
             data,
             verdict: Arc::default(),
+            answers: Arc::default(),
         }
     }
 
     pub fn to_data_url(&self) -> String {
         format!("data:{};base64,{}", self.media_type.mime(), self.data)
+    }
+
+    fn answers(&self) -> MutexGuard<'_, Vec<ServerAnswer>> {
+        self.answers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn answer_from(&self, model: &Model) -> Option<Answer> {
+        self.answers()
+            .iter()
+            .find(|answer| answer.is_from(model))
+            .map(|answer| answer.answer)
+    }
+
+    /// Only the first answer of `model` counts, so an image it once took is
+    /// never blamed for a later refusal. False when it had answered already.
+    fn record(&self, model: &Model, answer: Answer) -> bool {
+        let mut answers = self.answers();
+        if answers.iter().any(|known| known.is_from(model)) {
+            return false;
+        }
+        answers.push(ServerAnswer {
+            provider: Arc::clone(&model.provider),
+            model: model.id.clone(),
+            answer,
+        });
+        true
+    }
+
+    /// False when `model` had not refused it.
+    fn forgive(&self, model: &Model) -> bool {
+        let mut answers = self.answers();
+        let before = answers.len();
+        answers.retain(|known| !(known.is_from(model) && known.answer == Answer::Refused));
+        answers.len() != before
     }
 }
 
@@ -160,6 +221,8 @@ pub const IMAGE_UNUSABLE_NOTE: &str = "[image omitted: the image could not be de
 /// Past [`MAX_IMAGES`] the request itself is refused, so the oldest pixels
 /// make way rather than taking the whole session down.
 pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this conversation]";
+/// See [`refuse_sent_images`].
+const IMAGE_REFUSED_NOTE: &str = "[image omitted: the server refused a request carrying it]";
 /// Stands in for the text of a message that carries only images, both in model
 /// context and in the transcript. One const so the two can never drift apart.
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
@@ -182,22 +245,23 @@ pub fn is_deferred_tool(tool: &Value) -> bool {
     tool[DEFER_LOADING_KEY].as_bool() == Some(true)
 }
 
-/// The last stop before the wire for every image in a request, whatever put
-/// it there. For models without vision, image blocks become a text note
-/// instead of a block the API would reject, and history keeps the pixels, so
-/// switching back to a vision-capable model restores them. For the rest,
-/// oversized payloads are rewritten to fit provider limits, because one image
-/// a provider refuses would otherwise fail every later request in the session
-/// too.
-pub async fn adapt_images_for_model<'a>(
-    model: &Model,
-    messages: &'a [Message],
-) -> Cow<'a, [Message]> {
-    // Newest first: the stale screenshots are the ones a long session can
-    // spare once the request runs out of room for them. Collected rather than
-    // walked lazily, since a borrow of `messages` held across the await below
-    // leaves callers unable to prove their own futures `Send`.
-    let images: Vec<(usize, usize, ImageSource)> = messages
+/// One image of a request, at `(message, block)`.
+struct PlannedImage {
+    message: usize,
+    block: usize,
+    source: ImageSource,
+    /// The note sent in its place when the model must not see it at all.
+    withheld: Option<&'static str>,
+}
+
+/// Every image in `messages`, newest first, because old screenshots are the
+/// ones a long session can spare when the request runs out of room. Both
+/// [`adapt_images_for_model`] and [`sent_images`] ask this one place, so we
+/// only ever judge images that really went out. The images are owned
+/// because a borrow of `messages` held across an await stops callers from
+/// proving their futures are `Send`.
+fn plan_images(model: &Model, messages: &[Message]) -> Vec<PlannedImage> {
+    let images: Vec<(usize, usize, &ImageSource)> = messages
         .iter()
         .enumerate()
         .rev()
@@ -208,28 +272,112 @@ pub async fn adapt_images_for_model<'a>(
                 .enumerate()
                 .rev()
                 .filter_map(move |(b, block)| match block {
-                    ContentBlock::Image { source } => Some((m, b, source.clone())),
+                    ContentBlock::Image { source } => Some((m, b, source)),
                     _ => None,
                 })
         })
         .collect();
-    let note = |text: &str| ContentBlock::Text { text: text.into() };
     let vision = model.supports_vision();
     let kept = images_kept(images.len());
+    images
+        .into_iter()
+        .enumerate()
+        .map(|(newest_first, (message, block, source))| PlannedImage {
+            message,
+            block,
+            source: source.clone(),
+            withheld: if !vision {
+                Some(IMAGE_OMITTED_NOTE)
+            } else if newest_first >= kept {
+                Some(IMAGE_EVICTED_NOTE)
+            } else if source.answer_from(model) == Some(Answer::Refused) {
+                Some(IMAGE_REFUSED_NOTE)
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+/// The images a request to `model` really carried: not withheld, and not
+/// swapped for a note because they would not decode.
+fn sent_images(model: &Model, messages: &[Message]) -> impl Iterator<Item = PlannedImage> {
+    plan_images(model, messages).into_iter().filter(|image| {
+        image.withheld.is_none() && !matches!(image.source.verdict.get(), Some(Fix::Drop))
+    })
+}
+
+/// Called after the server of `model` took a request, so a later refusal
+/// never blames these images.
+pub fn accept_sent_images(model: &Model, messages: &[Message]) {
+    for image in sent_images(model, messages) {
+        image.source.record(model, Answer::Accepted);
+    }
+}
+
+/// Called when the server of `model` refused a request. We guess an image it
+/// never took was the reason, so [`adapt_images_for_model`] leaves it out of
+/// every later request to that model while history keeps the pixels. An
+/// image it took before is never blamed.
+///
+/// The images since the last reply go first, because a fresh paste is the
+/// usual reason, and blaming only it keeps the cached prefix. When none of
+/// those is left, the older ones this model never took are next. They come
+/// from a resumed session (answers are never saved) or from a switch away
+/// from a model that could not see them. Returns how many were blamed.
+pub fn refuse_sent_images(model: &Model, messages: &[Message]) -> usize {
+    let last_reply = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant);
+    let blame = |older_too: bool| {
+        sent_images(model, messages)
+            .filter(|image| older_too || last_reply.is_none_or(|reply| image.message > reply))
+            .filter(|image| image.source.record(model, Answer::Refused))
+            .count()
+    };
+    match blame(false) {
+        0 => blame(true),
+        blamed => blamed,
+    }
+}
+
+/// Takes back the blame `model` put on these images. A request without them
+/// was refused too, so they were innocent, and the user should not lose them
+/// over a wrong guess. Returns how many came back.
+pub fn forgive_refused_images(model: &Model, messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::Image { source } if source.forgive(model)))
+        .count()
+}
+
+/// The last stop before the wire for every image in a request, whatever put
+/// it there. For models without vision, image blocks become a text note
+/// instead of a block the API would reject, and history keeps the pixels, so
+/// switching back to a vision-capable model restores them. The same goes for
+/// images the model's server refused (see [`refuse_sent_images`]). For the
+/// rest, oversized payloads are rewritten to fit provider limits, because one
+/// image a provider refuses would otherwise fail every later request in the
+/// session too.
+pub async fn adapt_images_for_model<'a>(
+    model: &Model,
+    messages: &'a [Message],
+) -> Cow<'a, [Message]> {
+    let note = |text: &str| ContentBlock::Text { text: text.into() };
     let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
-    // Nothing past the cap is decoded at all.
-    for (newest_first, (m, b, source)) in images.into_iter().enumerate() {
-        if !vision {
-            edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
-        } else if newest_first >= kept {
-            edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
-        } else {
-            match fix_for_wire(&source).await {
-                Fix::Keep => {}
-                Fix::Replace(source) => edits.push((m, b, ContentBlock::Image { source })),
-                Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
-            }
-        }
+    for image in plan_images(model, messages) {
+        // Decoding is the slow part, so a withheld image skips it, and a long
+        // session pays nothing for the old screenshots past the cap.
+        let edit = match image.withheld {
+            Some(withheld) => note(withheld),
+            None => match fix_for_wire(&image.source).await {
+                Fix::Keep => continue,
+                Fix::Replace(source) => ContentBlock::Image { source },
+                Fix::Drop => note(IMAGE_UNUSABLE_NOTE),
+            },
+        };
+        edits.push((image.message, image.block, edit));
     }
     if edits.is_empty() {
         return Cow::Borrowed(messages);
@@ -2280,6 +2428,89 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));
+    }
+
+    #[tokio::test]
+    async fn a_refused_image_is_withheld_from_that_model_only() {
+        const OTHER_MODEL: &str = "claude-other";
+        let model = clamp_test_model(anthropic_spec());
+        let mut other = model.clone();
+        other.id = OTHER_MODEL.into();
+        let content = vec![png_block(32)];
+        let messages = vec![user_with(content[0].clone())];
+
+        assert_eq!(refuse_sent_images(&model, &messages), 1);
+        assert_eq!(
+            refuse_sent_images(&model, &messages),
+            0,
+            "a withheld image did not go out, so it cannot be blamed again"
+        );
+        assert!(matches!(
+            adapt(&model, content.clone()).await.as_slice(),
+            [ContentBlock::Text { text }] if text == IMAGE_REFUSED_NOTE
+        ));
+        assert_eq!(image_count(&adapt(&other, content.clone()).await), 1);
+
+        assert_eq!(forgive_refused_images(&model, &messages), 1);
+        assert_eq!(image_count(&adapt(&model, content).await), 1);
+    }
+
+    #[test_case(true,  false, false, 1 ; "new")]
+    #[test_case(false, false, false, 0 ; "text_only_model")]
+    #[test_case(true,  true,  false, 0 ; "undecodable")]
+    #[test_case(true,  false, true,  0 ; "taken_before")]
+    #[tokio::test]
+    async fn only_a_new_image_that_went_out_is_blamed(
+        vision: bool,
+        undecodable: bool,
+        taken_before: bool,
+        blamed: usize,
+    ) {
+        let mut model = clamp_test_model(anthropic_spec());
+        model.supports_vision_override = Some(vision);
+        let block = if undecodable {
+            unreadable_block()
+        } else {
+            png_block(32)
+        };
+        let messages = vec![user_with(block)];
+        adapt_images_for_model(&model, &messages).await;
+        if taken_before {
+            accept_sent_images(&model, &messages);
+        }
+        assert_eq!(refuse_sent_images(&model, &messages), blamed);
+    }
+
+    fn user_with(block: ContentBlock) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![block],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_images_since_the_last_reply_are_blamed_first() {
+        let model = clamp_test_model(anthropic_spec());
+        let messages = vec![
+            user_with(png_block(32)),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                ..Default::default()
+            },
+            user_with(png_block(32)),
+        ];
+        adapt_images_for_model(&model, &messages).await;
+
+        assert_eq!(refuse_sent_images(&model, &messages), 1);
+        let next = adapt_images_for_model(&model, &messages).await;
+        assert_eq!(image_count(&next[0].content), 1);
+        assert_eq!(image_count(&next[2].content), 0);
+
+        assert_eq!(refuse_sent_images(&model, &messages), 1);
+        let next = adapt_images_for_model(&model, &messages).await;
+        assert_eq!(image_count(&next[0].content), 0);
     }
 
     #[test]

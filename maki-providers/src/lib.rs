@@ -46,6 +46,7 @@ pub use types::{
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
     StopReason, StreamResponse, THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingConfig,
-    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
-    dialect, is_deferred_tool, non_empty_tool_result,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, accept_sent_images,
+    adapt_images_for_model, dialect, forgive_refused_images, is_deferred_tool,
+    non_empty_tool_result, refuse_sent_images,
 };
