@@ -119,7 +119,6 @@ keybind_key        = { fg = "cyan", modifiers = ["bold"] }
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
-user_bg            = { bg = "#383534" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "blue" }
 tool_annotation    = { fg = "comment" }
