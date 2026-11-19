@@ -11,7 +11,6 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Use limit=0 to read until the end of file (capped at 2000 lines).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
@@ -162,9 +161,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
+  content = "- When using the **read** tool, only read the sections you actually need.",
 })
 
 maki.api.register_tool({
