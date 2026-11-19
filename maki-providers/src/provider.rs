@@ -49,6 +49,10 @@ pub trait Provider: Send + Sync {
     /// model from the picker's recents.
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
+    fn needs_model_discovery(&self) -> bool {
+        false
+    }
+
     /// The context window the server runs `model` with right now. Only a
     /// server that sizes the window when it loads a model can differ from
     /// discovery, so everyone else says `None`. Asked before every request.
@@ -390,7 +394,8 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
 /// [`refresh_model`] that reads it back into a model.
 pub async fn discover_provider(model: &Model, provider: &dyn Provider) -> Result<(), AgentError> {
     let Some(spec) = ProviderRegistry::get(&model.provider)
-        .filter(|spec| spec.accepts_arbitrary_models && !discovery_complete(spec.slug))
+        .filter(|spec| !discovery_complete(spec.slug))
+        .filter(|spec| spec.accepts_arbitrary_models || provider.needs_model_discovery())
     else {
         return Ok(());
     };
@@ -471,7 +476,19 @@ mod tests {
 
     type Listed = Result<Vec<ModelInfo>, AgentError>;
 
-    struct Listing(fn() -> BoxFuture<'static, Listed>);
+    struct Listing {
+        list: fn() -> BoxFuture<'static, Listed>,
+        needs_discovery: bool,
+    }
+
+    impl Listing {
+        fn new(list: fn() -> BoxFuture<'static, Listed>) -> Self {
+            Self {
+                list,
+                needs_discovery: false,
+            }
+        }
+    }
 
     impl Provider for Listing {
         fn stream_message<'a>(
@@ -488,7 +505,11 @@ mod tests {
         }
 
         fn list_models(&self) -> BoxFuture<'_, Listed> {
-            (self.0)()
+            (self.list)()
+        }
+
+        fn needs_model_discovery(&self) -> bool {
+            self.needs_discovery
         }
 
         fn adjust_model(&self, model: &mut Model) {
@@ -526,28 +547,28 @@ mod tests {
         let mut resolved_before_listing = resolve();
         assert!(!model.supports_thinking());
 
-        discover_provider(&model, &Listing(fails))
+        discover_provider(&model, &Listing::new(fails))
             .await
             .unwrap_err();
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
         assert!(!model.supports_thinking());
 
-        discover_provider(&model, &Listing(lists_thinking))
+        discover_provider(&model, &Listing::new(lists_thinking))
             .await
             .unwrap();
-        refresh_model(&mut model, &Listing(lists_thinking));
+        refresh_model(&mut model, &Listing::new(lists_thinking));
         assert!(model.supports_thinking());
         assert_eq!(model.context_window, LISTED_WINDOW);
         assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
 
-        discover_provider(&resolved_before_listing, &Listing(fails))
+        discover_provider(&resolved_before_listing, &Listing::new(fails))
             .await
             .unwrap();
-        refresh_model(&mut resolved_before_listing, &Listing(fails));
+        refresh_model(&mut resolved_before_listing, &Listing::new(fails));
         assert_eq!(resolved_before_listing.context_window, LISTED_WINDOW);
 
         for no_answer in [fails, hangs] {
-            remember_models(SPEC_WITHOUT_THINKING, &Listing(no_answer), WAIT)
+            remember_models(SPEC_WITHOUT_THINKING, &Listing::new(no_answer), WAIT)
                 .await
                 .unwrap_err();
             assert!(resolve().supports_thinking(), "{NO_ANSWER_KEEPS_LISTING}");
@@ -557,24 +578,38 @@ mod tests {
     #[tokio::test]
     async fn rows_that_cover_a_provider_need_no_listing() {
         let model = Model::from_spec(CURATED_SPEC).unwrap();
-        discover_provider(&model, &Listing(must_not_list))
+        discover_provider(&model, &Listing::new(must_not_list))
             .await
             .unwrap();
     }
 
-    #[test_case(LANDED_SLUG ; "provider_that_takes_any_model")]
-    #[test_case(CURATED_SLUG ; "provider_with_a_curated_table")]
-    fn refresh_model_reads_landed_discovery(slug: &str) {
-        let mut model = Model::from_spec(&format!("{slug}/{LISTED_MODEL}")).unwrap();
+    #[tokio::test]
+    async fn curated_provider_can_require_live_discovery() {
+        let mut model = Model::from_spec(&format!("{CURATED_SLUG}/{LISTED_MODEL}")).unwrap();
+        let provider = Listing {
+            list: lists_thinking,
+            needs_discovery: true,
+        };
+
+        discover_provider(&model, &provider).await.unwrap();
+        refresh_model(&mut model, &provider);
+
+        assert_eq!(model.context_window, LISTED_WINDOW);
+        assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
+    }
+
+    #[test]
+    fn refresh_model_reads_landed_discovery() {
+        let mut model = Model::from_spec(&format!("{LANDED_SLUG}/{LISTED_MODEL}")).unwrap();
         set_known_models(
-            slug,
+            LANDED_SLUG,
             vec![ModelInfo {
                 context_window: Some(LISTED_WINDOW),
                 ..ModelInfo::id_only(LISTED_MODEL.into())
             }],
         );
 
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
 
         assert_eq!(model.context_window, LISTED_WINDOW);
         assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
@@ -588,7 +623,7 @@ mod tests {
         };
         let mut model = unresolvable.clone();
 
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
 
         assert_eq!(model, unresolvable);
     }
