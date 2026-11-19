@@ -47,6 +47,7 @@ use maki_storage::stdin;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, stdout};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio_util::task::AbortOnDropHandle;
@@ -66,6 +67,7 @@ const RESTORED_FAST: bool = false;
 /// already says which session and why.
 const SESSION_BUSY_CODE: i32 = -32000;
 const CWD_UNUSABLE: &str = "session cwd is not a usable folder";
+const SESSION_ENDED: &str = "session ended";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -97,6 +99,10 @@ type PendingState = Arc<Mutex<Pending>>;
 /// Keyed by the id the client names the session with.
 type Sessions = HashMap<SessionId, SessionState>;
 
+/// The level plugins were last told a session is on. Held across a switch's
+/// plugin calls, so one session's switches run one at a time, in arrival order.
+type LevelGate = Arc<AsyncMutex<String>>;
+
 struct SessionState {
     handle: InteractiveHandle,
     /// Stopped before a close is answered, so no update for a closed session
@@ -114,8 +120,10 @@ struct SessionState {
     /// The snapshot installed for plugins reads the mode through this.
     plan_mode: Arc<AtomicBool>,
     current_model: String,
-    /// `ask`, `yolo`, or the id of a plugin's permission mode.
+    /// `ask`, `yolo`, or the id of a plugin's permission mode. Only ever a
+    /// level its owner confirmed, since the client reads it.
     permission_level: String,
+    level_gate: LevelGate,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
@@ -137,6 +145,8 @@ struct Server {
     stack: ProjectStack,
     /// Runs the sessions of other folders in child processes.
     relay: Relay,
+    /// Weak like every other sender into the loop, so it cannot keep it alive.
+    incoming: WeakUnboundedSender<Incoming>,
 }
 
 /// What every session of the process shares, whatever folder it runs in.
@@ -158,12 +168,30 @@ impl Server {
     fn respond(&self, id: RequestId, result: Result<AgentResponse, AcpError>) {
         send(&self.out_tx, Response::new(id, result));
     }
+
+    fn level_owners(&self) -> LevelOwners {
+        LevelOwners {
+            lua_handle: self.stack.lua_handle.clone(),
+            modes: self.permission_modes.clone(),
+        }
+    }
 }
 
 enum Incoming {
     Line(String),
     Models(Vec<String>),
     Relay(RelayEvent),
+    LevelSwitched(LevelSwitched),
+}
+
+/// A permission level switch whose plugin calls ran off the loop.
+struct LevelSwitched {
+    request: RequestId,
+    sid: SessionId,
+    /// Tells the session apart from a later one reopened under the same id.
+    gate: LevelGate,
+    level: String,
+    outcome: Result<(), String>,
 }
 
 /// Where a `session/new` or `session/load` runs.
@@ -227,6 +255,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         closing: HashMap::new(),
         stack,
         relay,
+        incoming: in_tx.downgrade(),
     };
     let reader_task = tokio::spawn(read_stdin(in_tx));
 
@@ -235,6 +264,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
             Incoming::Line(line) => handle_line(&mut server, &line, &settings).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
             Incoming::Relay(event) => server.relay.on_event(event),
+            Incoming::LevelSwitched(switched) => {
+                let request = switched.request.clone();
+                let result = finish_level_switch(&mut server, switched);
+                server.respond(request, result);
+            }
         }
     }
 
@@ -408,7 +442,10 @@ async fn handle_request(
             None => return,
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw).await,
+        "session/set_config_option" => match handle_set_config(srv, raw, &id).await.transpose() {
+            Some(result) => result,
+            None => return,
+        },
         "session/close" => handle_close(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
@@ -754,6 +791,12 @@ async fn start_session(
     })
     .await;
     let sid = client_id(&handle.session_id);
+    let permission_level = if srv.stack.yolo {
+        methods::PERMISSION_YOLO
+    } else {
+        methods::PERMISSION_ASK
+    }
+    .to_owned();
     srv.permission_modes = offered_permission_modes(srv.stack.lua_handle.as_ref()).await;
     let plan_mode = Arc::new(AtomicBool::new(false));
     let snapshot = HeadlessSnapshot::default();
@@ -803,12 +846,8 @@ async fn start_session(
         current_mode: AgentMode::Build,
         plan_mode,
         current_model: srv.stack.model.spec(),
-        permission_level: if srv.stack.yolo {
-            methods::PERMISSION_YOLO
-        } else {
-            methods::PERMISSION_ASK
-        }
-        .to_owned(),
+        level_gate: Arc::new(AsyncMutex::new(permission_level.clone())),
+        permission_level,
         pending,
         claim,
     };
@@ -1001,7 +1040,7 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
         commands_watch,
         mcp,
         pending,
-        permission_level,
+        level_gate,
         ..
     } = state;
     info!(session_id = %handle.session_id, %reason, "closing ACP session");
@@ -1022,19 +1061,13 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
     }
     let id = handle.session_id.id();
     let on_session_end = srv.stack.on_session_end.clone();
-    // A plugin level still on must not outlive the session it was picked for.
-    let leaving = srv.stack.lua_handle.clone().filter(|_| {
-        srv.permission_modes
-            .iter()
-            .any(|m| m.id == permission_level)
-    });
+    let owners = srv.level_owners();
     let teardown = tokio::spawn(async move {
-        if let Some(lua_handle) = leaving
-            && let Err(e) = lua_handle
-                .select_permission_mode(&permission_level, &id.to_string(), false)
-                .await
-        {
-            warn!(mode = %permission_level, error = %e, "permission mode handler failed on close");
+        // A plugin level still on must not outlive its session. The gate waits
+        // out a switch in flight, so this leaves what the plugin really has on.
+        let level = level_gate.lock().await;
+        if let Err(e) = owners.notify(&id.to_string(), &level, false).await {
+            warn!(mode = %*level, error = %e, "permission mode handler failed on close");
         }
         if let Some(hook) = on_session_end {
             hook(id, reason).await;
@@ -1170,7 +1203,7 @@ fn handle_prompt(
         .handle
         .input_tx
         .send(input)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
+        .map_err(|_| AcpError::new(-32603, SESSION_ENDED))?;
     pending.prompt = Some(id.clone());
     Ok(None)
 }
@@ -1198,7 +1231,11 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(
+    srv: &mut Server,
+    raw: &Value,
+    request: &RequestId,
+) -> Result<Option<AgentResponse>, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     open_session(&mut srv.sessions, &req.session_id)?;
     let config_id = req.config_id.0.to_string();
@@ -1213,13 +1250,16 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     };
     let value = value.0.to_string();
     if config_id == methods::PERMISSIONS_CONFIG_ID {
-        set_permission_level(srv, &req.session_id, value).await?;
-    } else {
-        set_model(srv, &req.session_id, value).await?;
+        set_permission_level(srv, &req.session_id, value, request.clone()).await?;
+        return Ok(None);
     }
+    set_model(srv, &req.session_id, value).await?;
+    Ok(Some(config_options_response(srv, &req.session_id)))
+}
 
-    Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(session_config_options(srv, &req.session_id)),
+fn config_options_response(srv: &Server, sid: &SessionId) -> AgentResponse {
+    AgentResponse::SetSessionConfigOptionResponse(SetSessionConfigOptionResponse::new(
+        session_config_options(srv, sid),
     ))
 }
 
@@ -1233,7 +1273,7 @@ async fn set_model(srv: &mut Server, sid: &SessionId, spec: String) -> Result<()
         .handle
         .model_tx
         .send(model)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
+        .map_err(|_| AcpError::new(-32603, SESSION_ENDED))?;
     session.current_model = spec;
     Ok(())
 }
@@ -1255,33 +1295,33 @@ async fn offered_permission_modes(lua_handle: Option<&EventHandle>) -> Vec<Permi
     modes
 }
 
-/// Tells the plugin that owns {level} it was selected or left. Built-in
-/// levels have no owner.
-async fn notify_permission_mode(
-    srv: &Server,
-    session_id: &str,
-    level: &str,
-    selected: bool,
-) -> Result<(), String> {
-    let (Some(lua_handle), true) = (
-        &srv.stack.lua_handle,
-        srv.permission_modes.iter().any(|mode| mode.id == level),
-    ) else {
-        return Ok(());
-    };
-    lua_handle
-        .select_permission_mode(level, session_id, selected)
-        .await
+/// Who to tell about a level. Built-in levels have no owner.
+struct LevelOwners {
+    lua_handle: Option<EventHandle>,
+    modes: Vec<PermissionModeInfo>,
 }
 
-/// Leaving a plugin's level tells its owner first, so two plugin levels never
-/// run at once in a session. A level that fails to take falls back to `ask`
-/// rather than to whatever the client thought it had, and the client is told
-/// either way.
+impl LevelOwners {
+    async fn notify(&self, session_id: &str, level: &str, selected: bool) -> Result<(), String> {
+        let (Some(lua_handle), true) = (
+            &self.lua_handle,
+            self.modes.iter().any(|mode| mode.id == level),
+        ) else {
+            return Ok(());
+        };
+        lua_handle
+            .select_permission_mode(level, session_id, selected)
+            .await
+    }
+}
+
+/// The plugin calls can take seconds, so they run off the loop and the
+/// answer comes back through it as [`Incoming::LevelSwitched`].
 async fn set_permission_level(
     srv: &mut Server,
     sid: &SessionId,
     level: String,
+    request: RequestId,
 ) -> Result<(), AcpError> {
     srv.permission_modes = offered_permission_modes(srv.stack.lua_handle.as_ref()).await;
     let builtin = level == methods::PERMISSION_ASK || level == methods::PERMISSION_YOLO;
@@ -1290,30 +1330,92 @@ async fn set_permission_level(
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
+    let owners = srv.level_owners();
+    let incoming = srv.incoming.clone();
     let session = open_session(&mut srv.sessions, sid)?;
     let session_id = session.handle.session_id.to_string();
-    let previous = session.permission_level.clone();
+    let gate = Arc::clone(&session.level_gate);
+    let sid = sid.clone();
+    tokio::spawn(async move {
+        let mut current = gate.lock().await;
+        let outcome = switch_level(&owners, &session_id, &current, &level).await;
+        *current = level_in_force(&level, &outcome).to_owned();
+        // Under the gate, so results reach the loop in the order switches ran.
+        if let Some(tx) = incoming.upgrade() {
+            let gate = Arc::clone(&gate);
+            let _ = tx.send(Incoming::LevelSwitched(LevelSwitched {
+                request,
+                sid,
+                gate,
+                level,
+                outcome,
+            }));
+        }
+    });
+    Ok(())
+}
+
+/// Leaving a plugin's level tells its owner first, so two plugin levels never
+/// run at once in a session. A pick that fails may have half turned its plugin
+/// on, so the owner is told to turn off again.
+async fn switch_level(
+    owners: &LevelOwners,
+    session_id: &str,
+    previous: &str,
+    level: &str,
+) -> Result<(), String> {
     if previous != level
-        && let Err(e) = notify_permission_mode(srv, &session_id, &previous, false).await
+        && let Err(e) = owners.notify(session_id, previous, false).await
     {
         warn!(mode = %previous, error = %e, "permission mode handler failed on deselect");
     }
+    let picked = owners.notify(session_id, level, true).await;
+    if picked.is_err()
+        && let Err(e) = owners.notify(session_id, level, false).await
+    {
+        warn!(mode = %level, error = %e, "permission mode handler failed to undo a failed pick");
+    }
+    picked
+}
 
-    let applied = notify_permission_mode(srv, &session_id, &level, true).await;
-    let session = open_session(&mut srv.sessions, sid)?;
-    let effective = match applied {
-        Ok(()) => level.as_str(),
+/// A level that fails to take falls back to `ask` rather than to whatever the
+/// client thought it had.
+fn level_in_force<'a>(level: &'a str, outcome: &Result<(), String>) -> &'a str {
+    match outcome {
+        Ok(()) => level,
         Err(_) => methods::PERMISSION_ASK,
-    };
+    }
+}
+
+/// The client is told what is in force either way.
+fn finish_level_switch(
+    srv: &mut Server,
+    switched: LevelSwitched,
+) -> Result<AgentResponse, AcpError> {
+    let LevelSwitched {
+        sid,
+        gate,
+        level,
+        outcome,
+        ..
+    } = switched;
+    let session = srv
+        .sessions
+        .get_mut(&sid)
+        .filter(|session| Arc::ptr_eq(&session.level_gate, &gate))
+        .ok_or_else(|| AcpError::new(-32603, SESSION_ENDED))?;
+    let effective = level_in_force(&level, &outcome);
     session
         .handle
         .permissions
         .set_session_yolo(Some(effective == methods::PERMISSION_YOLO));
     session.permission_level = effective.to_owned();
-    notify_config_options(srv, sid);
-    applied.map_err(|e| {
-        AcpError::internal_error().data(json_str(&format!("permission level {level}: {e}")))
-    })
+    notify_config_options(srv, &sid);
+    outcome
+        .map(|()| config_options_response(srv, &sid))
+        .map_err(|e| {
+            AcpError::internal_error().data(json_str(&format!("permission level {level}: {e}")))
+        })
 }
 
 /// `session/close`: the client is done with the session for good. An id we
@@ -1973,6 +2075,7 @@ mod tests {
                 plan_mode: Arc::default(),
                 current_model: String::new(),
                 permission_level: methods::PERMISSION_ASK.to_owned(),
+                level_gate: Arc::new(AsyncMutex::new(methods::PERMISSION_ASK.to_owned())),
                 pending: Arc::default(),
                 claim,
             },
@@ -2022,6 +2125,7 @@ mod tests {
                 sessions: Sessions::new(),
                 closing: HashMap::new(),
                 stack: test_stack(),
+                incoming: unbounded_channel::<Incoming>().0.downgrade(),
             };
             Self {
                 srv,
@@ -3536,6 +3640,7 @@ mod tests {
     const UNKNOWN_LEVEL: &str = "no-such-level";
     const SELECTED_PREFIX: &str = "/selected-";
     const DESELECTED_PREFIX: &str = "/deselected-";
+    const SET_LEVEL_ID: i64 = 11;
     /// Records each call as a command named after it, which is how a test sees
     /// that the handler ran and with which arguments.
     const LEVEL_PLUGIN: &str = r#"
@@ -3549,10 +3654,21 @@ mod tests {
             end,
         })
     "#;
+    /// Turns itself off fine, which a failed pick must ask it to do.
     const FAILING_LEVEL_PLUGIN: &str = r#"
         maki.api.register_permission_mode({
             id = "judge",
-            on_select = function() error("judge is down") end,
+            on_select = function(session, selected)
+                if selected then error("judge is down") end
+                maki.api.register_command({ name = "/deselected-" .. session, handler = function() end })
+            end,
+        })
+    "#;
+    /// A pick never comes back, like a plugin stuck on a slow call.
+    const PARKED_LEVEL_PLUGIN: &str = r#"
+        maki.api.register_permission_mode({
+            id = "judge",
+            on_select = function() maki.async.await(1, function(_done) end) end,
         })
     "#;
 
@@ -3562,6 +3678,46 @@ mod tests {
             methods::PERMISSIONS_CONFIG_ID,
             level,
         ))
+    }
+
+    /// Where switch tasks report back, standing in for the loop's channel.
+    fn level_results(srv: &mut Server) -> (UnboundedSender<Incoming>, UnboundedReceiver<Incoming>) {
+        let (tx, rx) = unbounded_channel();
+        srv.incoming = tx.downgrade();
+        (tx, rx)
+    }
+
+    async fn start_level_switch(srv: &mut Server, sid: &SessionId, level: &str) {
+        let answer = handle_set_config(
+            srv,
+            &set_level_request(sid, level),
+            &RequestId::Number(SET_LEVEL_ID),
+        )
+        .await
+        .unwrap();
+        assert!(answer.is_none(), "a level switch is answered once it ran");
+    }
+
+    async fn finish_next_switch(
+        srv: &mut Server,
+        results: &mut UnboundedReceiver<Incoming>,
+    ) -> (SessionId, Result<AgentResponse, AcpError>) {
+        let Some(Incoming::LevelSwitched(switched)) = results.recv().await else {
+            panic!("a switch task reports back to the loop");
+        };
+        assert_eq!(switched.request, RequestId::Number(SET_LEVEL_ID));
+        let sid = switched.sid.clone();
+        (sid, finish_level_switch(srv, switched))
+    }
+
+    async fn set_level(
+        srv: &mut Server,
+        sid: &SessionId,
+        level: &str,
+    ) -> Result<AgentResponse, AcpError> {
+        let (_tx, mut results) = level_results(srv);
+        start_level_switch(srv, sid, level).await;
+        finish_next_switch(srv, &mut results).await.1
     }
 
     fn permissions_option(response: &AgentResponse) -> Value {
@@ -3619,9 +3775,7 @@ mod tests {
             .permissions
             .set_session_yolo(Some(!yolo));
 
-        let response = handle_set_config(&mut srv, &set_level_request(&sid, level))
-            .await
-            .unwrap();
+        let response = set_level(&mut srv, &sid, level).await.unwrap();
 
         assert_eq!(is_yolo(&srv, &sid), yolo);
         let option = permissions_option(&response);
@@ -3657,7 +3811,9 @@ mod tests {
             "sessionId": sid, "configId": config_id, "value": value,
         } });
 
-        let err = handle_set_config(&mut srv, &request).await.unwrap_err();
+        let err = handle_set_config(&mut srv, &request, &RequestId::Number(SET_LEVEL_ID))
+            .await
+            .unwrap_err();
 
         assert_eq!(err.code, AcpError::invalid_params().code);
         assert!(!is_yolo(&srv, &sid));
@@ -3670,12 +3826,9 @@ mod tests {
         let first = only_sid(&srv);
         let second = install(&mut srv, fixture_session().state);
 
-        handle_set_config(
-            &mut srv,
-            &set_level_request(&first, methods::PERMISSION_YOLO),
-        )
-        .await
-        .unwrap();
+        set_level(&mut srv, &first, methods::PERMISSION_YOLO)
+            .await
+            .unwrap();
 
         assert!(is_yolo(&srv, &first));
         assert!(!is_yolo(&srv, &second));
@@ -3691,9 +3844,7 @@ mod tests {
         let sid = only_sid(&srv);
         let id = srv.sessions[&sid].handle.session_id.to_string();
 
-        let response = handle_set_config(&mut srv, &set_level_request(&sid, PLUGIN_LEVEL))
-            .await
-            .unwrap();
+        let response = set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap();
         let option = permissions_option(&response);
         assert_eq!(option["currentValue"], PLUGIN_LEVEL);
         assert_eq!(
@@ -3710,7 +3861,7 @@ mod tests {
         assert!(!is_yolo(&srv, &sid), "a plugin level is not yolo");
         assert!(command_names(&host).contains(&format!("{SELECTED_PREFIX}{id}")));
 
-        handle_set_config(&mut srv, &set_level_request(&sid, methods::PERMISSION_YOLO))
+        set_level(&mut srv, &sid, methods::PERMISSION_YOLO)
             .await
             .unwrap();
         assert!(is_yolo(&srv, &sid));
@@ -3719,20 +3870,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_plugin_level_falls_back_to_ask() {
-        let (mut srv, mut out_rx, _host) = server_with_level_plugin(FAILING_LEVEL_PLUGIN);
+    async fn a_failing_plugin_level_is_turned_off_and_falls_back_to_ask() {
+        let (mut srv, mut out_rx, host) = server_with_level_plugin(FAILING_LEVEL_PLUGIN);
         let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
         srv.sessions[&sid]
             .handle
             .permissions
             .set_session_yolo(Some(true));
 
-        let err = handle_set_config(&mut srv, &set_level_request(&sid, PLUGIN_LEVEL))
-            .await
-            .unwrap_err();
+        let err = set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap_err();
 
         assert_eq!(err.code, AcpError::internal_error().code);
         assert!(err.data.unwrap().to_string().contains("judge is down"));
+        assert!(
+            command_names(&host).contains(&format!("{DESELECTED_PREFIX}{id}")),
+            "a pick that failed may have half turned the plugin on"
+        );
         assert!(
             !is_yolo(&srv, &sid),
             "a level that did not take must not leave yolo on"
@@ -3746,13 +3900,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parked_plugin_level_holds_back_no_other_session() {
+        let (mut srv, out_rx, _host) = server_with_level_plugin(PARKED_LEVEL_PLUGIN);
+        let parked = only_sid(&srv);
+        let other = install(&mut srv, fixture_session().state);
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &parked, PLUGIN_LEVEL).await;
+        start_level_switch(&mut srv, &other, methods::PERMISSION_YOLO).await;
+        let (sid, response) = finish_next_switch(&mut srv, &mut results).await;
+
+        assert_eq!(sid, other);
+        response.unwrap();
+        assert!(is_yolo(&srv, &other));
+        assert_eq!(
+            srv.sessions[&parked].permission_level,
+            methods::PERMISSION_ASK,
+            "a level its plugin has not confirmed is not shown"
+        );
+        assert_eq!(out_rx.len(), 1, "only the switch that ran is announced");
+    }
+
+    #[tokio::test]
+    async fn back_to_back_switches_settle_on_the_last_one() {
+        let (mut srv, _out_rx, host) = server_with_level_plugin(LEVEL_PLUGIN);
+        let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &sid, PLUGIN_LEVEL).await;
+        start_level_switch(&mut srv, &sid, methods::PERMISSION_YOLO).await;
+        let first = finish_next_switch(&mut srv, &mut results).await.1.unwrap();
+        let last = finish_next_switch(&mut srv, &mut results).await.1.unwrap();
+
+        assert_eq!(permissions_option(&first)["currentValue"], PLUGIN_LEVEL);
+        assert_eq!(
+            permissions_option(&last)["currentValue"],
+            methods::PERMISSION_YOLO
+        );
+        assert!(is_yolo(&srv, &sid));
+        assert_eq!(
+            srv.sessions[&sid].permission_level,
+            methods::PERMISSION_YOLO
+        );
+        let names = command_names(&host);
+        assert!(names.contains(&format!("{SELECTED_PREFIX}{id}")));
+        assert!(
+            names.contains(&format!("{DESELECTED_PREFIX}{id}")),
+            "the second switch leaves the level the first one picked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_outlives_its_session_leaves_a_reopened_one_alone() {
+        let (mut srv, ..) = test_server();
+        let sid = only_sid(&srv);
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &sid, methods::PERMISSION_YOLO).await;
+        close_session(&mut srv, &sid, SessionEndReason::Replaced).await;
+        srv.sessions.insert(sid.clone(), fixture_session().state);
+        let err = finish_next_switch(&mut srv, &mut results)
+            .await
+            .1
+            .unwrap_err();
+
+        assert_eq!(err.message, SESSION_ENDED);
+        assert!(
+            !is_yolo(&srv, &sid),
+            "the reopened session keeps its own level"
+        );
+    }
+
+    #[tokio::test]
     async fn closing_a_session_leaves_the_plugin_level_it_was_on() {
         let (mut srv, _out_rx, host) = server_with_level_plugin(LEVEL_PLUGIN);
         let sid = only_sid(&srv);
         let id = srv.sessions[&sid].handle.session_id.to_string();
-        handle_set_config(&mut srv, &set_level_request(&sid, PLUGIN_LEVEL))
-            .await
-            .unwrap();
+        set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap();
 
         close_session(&mut srv, &sid, SessionEndReason::Replaced).await;
         finish_teardowns(&mut srv).await;

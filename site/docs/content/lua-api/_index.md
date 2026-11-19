@@ -1196,8 +1196,9 @@ has no picker ignores it.
 
 Choosing the mode calls `on_select(session, true)`. Choosing another level
 afterwards, or the session ending, calls `on_select(session, false)`, so
-the handler is where the plugin switches its behavior on and off. What the
-mode does is up to the plugin, typically by layering `permission.prompt`.
+the handler is where the plugin switches its behavior on and off. A pick
+whose handler throws or times out is followed by `on_select(session, false)`,
+so a half-done switch gets undone. What the mode does is up to the plugin, typically by layering `permission.prompt`.
 The host only knows the id, so pick one that is unlikely to collide.
 Registering an id again replaces the earlier mode, and the mode goes away
 when your plugin unloads.
