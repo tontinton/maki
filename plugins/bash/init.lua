@@ -37,6 +37,57 @@ local EARLIER_DROPPED = "[%d earlier lines dropped]"
 local FULL_OUTPUT_PATTERN = "^(.*)\nFull output: ([^\n]+)$"
 local FULL_OUTPUT_LINE = "Full output: %s"
 local EXPIRE_BACKGROUND = { expire = "background" }
+-- A shell command a file tool does the same job as: only with these flags,
+-- never past `reject`, and only with `require` when it has one. Anything
+-- else stays in bash without a note, since the tool could not do it.
+local FILE_TOOLS = {
+  cat = { tool = "read", flags = { ["-n"] = true } },
+  head = { tool = "read", flags = { ["-n"] = true } },
+  tail = { tool = "read", flags = { ["-n"] = true } },
+  sed = { tool = "read", flags = { ["-n"] = true }, require = "%s%-n%s+['\"]?%d+,?%d*p['\"]?%s" },
+  grep = {
+    tool = "grep",
+    flags = {
+      ["-n"] = true,
+      ["-i"] = true,
+      ["-r"] = true,
+      ["-R"] = true,
+      ["-E"] = true,
+      ["-H"] = true,
+      ["-e"] = true,
+      ["-A"] = true,
+      ["-B"] = true,
+      ["-C"] = true,
+      ["--include"] = true,
+    },
+  },
+  rg = {
+    tool = "grep",
+    flags = {
+      ["-n"] = true,
+      ["-i"] = true,
+      ["-e"] = true,
+      ["-A"] = true,
+      ["-B"] = true,
+      ["-C"] = true,
+      ["-g"] = true,
+      ["--glob"] = true,
+    },
+  },
+  find = {
+    tool = "glob",
+    flags = { ["-name"] = true, ["-iname"] = true, ["-path"] = true, ["-type"] = true },
+    reject = "%-type%s+[^f%s]",
+  },
+  ls = { tool = "list", flags = { ["-a"] = true, ["-A"] = true, ["-1"] = true } },
+}
+local FLAG_PATTERN = "%s(%-%-?%w[%w%-]*)"
+local SHORT_FLAGS_PATTERN = "^%-(%w+)$"
+local WRITES_FILE_PATTERN = ">>?%s*[^&%s]"
+local DEV_NULL = "/dev/null"
+local FILE_TOOL_NOTE_HEAD = "Use dedicated tools for files, not bash: "
+local FILE_TOOL_NOTE = FILE_TOOL_NOTE_HEAD .. "%s."
+local FILE_TOOL_ITEM = "%s instead of %s"
 
 local rtk_available
 local fallback_log_seq = 0
@@ -270,6 +321,111 @@ local function node_text(node, source)
   return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
 end
 
+local STDIN_REDIRECT_TYPES = {
+  heredoc_redirect = true,
+  herestring_redirect = true,
+}
+
+-- A command fed by a here-document filters text, and one whose output lands
+-- in a file writes it, so neither is a read a file tool could do.
+local function redirect_rules_out_file_tool(node, source)
+  for child in node:iter_children() do
+    local kind = child:type()
+    if STDIN_REDIRECT_TYPES[kind] then
+      return true
+    end
+    if kind == "file_redirect" then
+      local text = node_text(child, source)
+      if text:find(WRITES_FILE_PATTERN) and not text:find(DEV_NULL, 1, true) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- `-rn` and `-20` are short flags and a line count written together.
+local function flag_allowed(flags, flag)
+  if flags[flag] then
+    return true
+  end
+  local short = flag:match(SHORT_FLAGS_PATTERN)
+  if not short then
+    return false
+  end
+  for char in short:gmatch(".") do
+    if not char:match("%d") and not flags["-" .. char] then
+      return false
+    end
+  end
+  return true
+end
+
+local function file_tool_for(name, text)
+  local spec = FILE_TOOLS[name]
+  if not spec or (spec.reject and text:find(spec.reject)) or (spec.require and not text:find(spec.require)) then
+    return nil
+  end
+  for flag in text:gmatch(FLAG_PATTERN) do
+    if not flag_allowed(spec.flags, flag) then
+      return nil
+    end
+  end
+  return spec.tool
+end
+
+-- Only a plain command that reads files counts. In a pipe the other side
+-- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), and
+-- block forms and substitutions are scripting.
+local function collect_file_tool_uses(node, source, uses)
+  if redirect_rules_out_file_tool(node, source) then
+    return
+  end
+  local kind = node:type()
+  if kind == "command" then
+    local name_node = node:field("name")[1]
+    local name = name_node and node_text(name_node, source)
+    local tool = name and file_tool_for(name, node_text(node, source))
+    if tool then
+      uses[#uses + 1] = { tool = tool, command = name }
+    end
+    return
+  end
+  if kind == "pipeline" or not WALK_THROUGH_TYPES[kind] then
+    return
+  end
+  for child in node:iter_children() do
+    if child:named() then
+      collect_file_tool_uses(child, source, uses)
+    end
+  end
+end
+
+local function file_tool_note(command, ctx)
+  local parser = maki.treesitter.get_parser(command, "bash")
+  if not parser then
+    return nil
+  end
+  local uses = {}
+  collect_file_tool_uses(parser:parse()[1]:root(), command, uses)
+  if #uses == 0 then
+    return nil
+  end
+  local callable = {}
+  for _, tool in ipairs(maki.agent.callable_tools(ctx) or {}) do
+    callable[tool.name] = true
+  end
+  local items, seen = {}, {}
+  for _, use in ipairs(uses) do
+    local item = FILE_TOOL_ITEM:format(use.tool, use.command)
+    if callable[use.tool] and not seen[item] then
+      seen[item] = true
+      items[#items + 1] = item
+    end
+  end
+  return #items > 0 and FILE_TOOL_NOTE:format(table.concat(items, ", ")) or nil
+end
+
 -- Anything we don't walk through becomes one scope, its own text. That covers
 -- plain commands and the block forms (`if`, `while`, subshells) we deliberately
 -- keep whole, plus any node type we never thought of, which is what we want:
@@ -333,6 +489,10 @@ local opts = maki.api.register_options(output_limits.extend({
   background_on_timeout = {
     default = false,
     desc = "Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed.",
+  },
+  file_tool_note = {
+    default = false,
+    desc = "Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does. The command still runs.",
   },
   background_log_bytes = {
     default = LOG_MAX_BYTES,
@@ -398,6 +558,10 @@ maki.api.register_tool({
   restore = function(input, output, is_error, ctx)
     local command = parse_cd_hint(input)
     local buf, view = create_bash_view(command, ctx)
+    -- The note is for the model; the live view never showed it.
+    if output:sub(1, #FILE_TOOL_NOTE_HEAD) == FILE_TOOL_NOTE_HEAD then
+      output = output:match("^[^\n]*\n(.*)$") or ""
+    end
     local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
     local text, log_file = output:match(FULL_OUTPUT_PATTERN)
     text = text or output
@@ -438,6 +602,9 @@ maki.api.register_tool({
 
     ctx:set_deadline(timeout_secs, opts.background_on_timeout and EXPIRE_BACKGROUND or nil)
 
+    -- Code that calls bash parses the reply, so a note would corrupt it.
+    local notes = { opts.file_tool_note and ctx:output_mode() ~= "full" and file_tool_note(command, ctx) or nil }
+
     local rewritten = rtk_rewrite(command, ctx)
     if rewritten then
       command = rewritten
@@ -453,7 +620,6 @@ maki.api.register_tool({
     local log_gate = maki.async.semaphore(1)
     local has_output = false
     local finishing, finished = false, false
-    local foreground_note
 
     -- The log opens right before the collector drops its first line, so it
     -- starts with everything printed so far. A failed open is remembered.
@@ -572,7 +738,7 @@ maki.api.register_tool({
         view:append({ { log_line, "dim" } })
         llm_output = llm_output .. "\n" .. log_line
       end
-      return foreground_note and (foreground_note .. "\n" .. llm_output) or llm_output
+      return table.concat(notes, "\n") .. (#notes > 0 and "\n" or "") .. llm_output
     end
 
     local function finish(exit_code)
@@ -671,7 +837,7 @@ maki.api.register_tool({
     if input.background == true then
       local moved, move_err = ctx:background()
       if not moved then
-        foreground_note = FOREGROUND_NOTE:format(tostring(move_err))
+        notes[#notes + 1] = FOREGROUND_NOTE:format(tostring(move_err))
       end
     end
 
