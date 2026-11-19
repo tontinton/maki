@@ -167,14 +167,8 @@ impl ManagedAuth {
         }
     }
 
-    /// Catches up with the stored tokens when the held ones expired or a peer
-    /// changed them.
-    pub async fn refresh_if_stale(&self) -> Result<(), AgentError> {
-        self.uses_oauth().await.map(drop)
-    }
-
     /// Whether the provider is on OAuth tokens. Catches up with the stored
-    /// tokens first, like [`Self::refresh_if_stale`].
+    /// tokens first, when the held ones expired or a peer changed them.
     pub async fn uses_oauth(&self) -> Result<bool, AgentError> {
         let Source::Stored { held, storage } = &self.source else {
             return Ok(false);

@@ -134,7 +134,7 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
 }
 
 /// A tool can be registered and still stay invisible to the model, so this
-/// goes through the definitions a real request is built from.
+/// reads the array under a request's filter. No describe fn is asked here.
 fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
     let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
     let filter = ToolFilter::from_config(agent, &model, &[]);
@@ -7576,27 +7576,18 @@ maki.api.register_tool({{
 
 /// A key compared inside Lua is one the host never parses, so the source lint
 /// is the only thing that can catch it, and it has to work through a real load.
-// The `legacy_spelling` case goes away with `key_lint::legacy`.
-#[test_case::test_case(
-    r#"local function on_key(ev) return ev.key == "ctrl+n" end
-return on_key"#,
-    "<C-n>" ;
-    "legacy_spelling"
-)]
-#[test_case::test_case(
-    r#"local function on_key(ev) return ev.key == "<Escc>" end
-return on_key"#,
-    "<Esc>" ;
-    "misspelling"
-)]
-fn a_wrong_key_spelling_in_plugin_source_is_reported(source: &str, expected: &str) {
+#[test]
+fn a_wrong_key_spelling_in_plugin_source_is_reported() {
+    const SOURCE: &str = r#"local function on_key(ev) return ev.key == "<Escc>" end
+return on_key"#;
+    const SUGGESTION: &str = "<Esc>";
     let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source("keys_plugin", source).unwrap();
+    host.load_source("keys_plugin", SOURCE).unwrap();
 
     let warning = host.take_key_warning().expect("a key warning");
 
     assert!(warning.starts_with(KEY_WARNING), "{warning}");
-    assert!(warning.contains(expected), "{warning}");
+    assert!(warning.contains(SUGGESTION), "{warning}");
     assert_eq!(
         host.take_key_warning(),
         None,
@@ -7614,12 +7605,12 @@ fn a_config_init_lua_and_the_modules_it_requires_are_linted() {
     std::fs::create_dir_all(maki_dir.join("lua")).unwrap();
     std::fs::write(
         maki_dir.join("lua").join("keys.lua"),
-        "return function(ev) return ev.key == \"esc\" end\n",
+        "return function(ev) return ev.key == \"<Escc>\" end\n",
     )
     .unwrap();
     std::fs::write(
         maki_dir.join("init.lua"),
-        "local on_key = require(\"keys\")\nlocal submit = \"enter\"\n",
+        "local on_key = require(\"keys\")\nlocal submit = \"<Tabb>\"\n",
     )
     .unwrap();
 

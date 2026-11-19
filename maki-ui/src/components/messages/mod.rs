@@ -1123,7 +1123,6 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
-        let width = body_width(width);
         if !self.streaming_thinking.is_empty() {
             let collapsed = thinking::collapsed_view(
                 thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
@@ -1138,23 +1137,17 @@ impl MessagesPanel {
             let drawn_collapsed = collapsed.is_some();
             let lines =
                 collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
-            self.push_live_segment(lines, drawn_collapsed, thinking_style().gutter());
+            self.push_live_segment(lines, drawn_collapsed);
         }
         if !self.streaming_text.is_empty() {
             let lines = self.streaming_text.render_lines(width).to_vec();
-            self.push_live_segment(lines, false, assistant_style().gutter());
+            self.push_live_segment(lines, false);
         }
     }
 
-    fn push_live_segment(
-        &mut self,
-        lines: Vec<Line<'static>>,
-        collapsed: bool,
-        gutter: Span<'static>,
-    ) {
+    fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool) {
         self.cache.push_spacer_if_needed();
         let mut seg = Segment::with_lines(lines, None);
-        seg.gutter = Some(gutter);
         seg.truncation.output = collapsed;
         self.cache.push(seg);
     }
@@ -1787,28 +1780,12 @@ fn message_label(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
     }
 }
 
-fn message_gutter(msg: &DisplayMessage, style: &RoleStyle) -> Option<Span<'static>> {
-    if msg.plan_path.is_some() {
-        None
-    } else if let Some(end) = msg.task_end {
-        Some(outcome_glyph(end))
-    } else {
-        Some(style.gutter())
-    }
-}
-
-/// Starts with the marker and label the reader sees, so a query for "❯" or
-/// "thinking>" lands on them too. A blank marker trims down to nothing, and
-/// collapsed thinking draws its header from the same label, so neither needs
-/// a case of its own.
+/// Starts with the label the reader sees, so a query for "you>" or
+/// "thinking>" lands on it too. Collapsed thinking draws its header from the
+/// same label, so it needs no case of its own.
 fn message_search_text(msg: &DisplayMessage) -> String {
     let style = message_style(&msg.role);
-    let marker = if message_gutter(msg, &style).is_some() {
-        style.marker.trim_start()
-    } else {
-        ""
-    };
-    format!("{marker}{}{}", message_label(msg, &style), msg.text)
+    format!("{}{}", message_label(msg, &style), msg.text)
 }
 
 struct MessageView {
@@ -1818,11 +1795,11 @@ struct MessageView {
     collapsed: bool,
 }
 
-/// A non-Tool message's lines at the body width of `width`, with the gutter
-/// they sit behind.
+/// A non-Tool message's lines. Prose sits flush left; only a finished task's
+/// notice keeps a gutter, for its outcome dot.
 fn message_view(msg: &DisplayMessage, mode: ThinkingLines, width: u16) -> MessageView {
     let style = message_style(&msg.role);
-    let gutter = message_gutter(msg, &style);
+    let gutter = msg.task_end.map(outcome_glyph);
     let body = if gutter.is_some() {
         body_width(width)
     } else {

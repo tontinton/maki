@@ -637,7 +637,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         dctx: Value,
-        reply: SyncSender<Option<String>>,
+        reply: oneshot::Sender<Option<String>>,
     },
     /// Runs the tool's `start` fn so it can publish a live buf before the
     /// permission prompt paints. Best-effort: Lua errors are logged, never

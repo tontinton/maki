@@ -29,7 +29,7 @@ use super::instructions::build_system_prompt;
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
-use crate::tools::{RequestTools, ToolRegistry};
+use crate::tools::{BoxFuture, RequestTools, ToolRegistry};
 
 const UPDATE_OPEN: &str = "<context-update>\nThis changed since the conversation started and replaces what the system prompt says about it.\n\n";
 const UPDATE_CLOSE: &str = "\n</context-update>";
@@ -155,7 +155,8 @@ impl HostPrompt {
 
 /// Each frontend brings its own, because only it knows how its prompt and
 /// tools are put together.
-pub type RunContextBuilder = Arc<dyn Fn(&Model, bool) -> RunContext + Send + Sync>;
+pub type RunContextBuilder =
+    Arc<dyn Fn(&Model, bool) -> BoxFuture<'static, RunContext> + Send + Sync>;
 
 fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
     let mut hints: BTreeMap<String, String> = BTreeMap::new();

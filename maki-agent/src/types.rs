@@ -665,7 +665,8 @@ pub enum SessionEndReason {
     /// `/reload` is rebuilding the plugin host. The session carries on in the
     /// next generation, so a handler cleaning up for good wants `Shutdown`.
     Reload,
-    /// An ACP client started or loaded a session over this one.
+    /// An ACP client loaded this session again while it was open, and the
+    /// reload took its place.
     Replaced,
     /// A headless run finished.
     Completed,

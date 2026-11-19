@@ -177,16 +177,20 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get(CODE_EXECUTION)
+    let asked = reg
+        .get(CODE_EXECUTION)
         .expect("code_execution registered")
         .tool
-        .description(&DescriptionContext {
+        .describe(&DescriptionContext {
             filter,
             audience,
             workflow,
             mcp: false,
         })
-        .into_owned()
+        .expect("code_execution asks its plugin");
+    runtime()
+        .block_on(asked)
+        .expect("the plugin describes code_execution")
 }
 
 fn run_tool(

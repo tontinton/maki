@@ -49,6 +49,7 @@ use maki_agent::SessionMailbox;
 use maki_agent::session::{StoreError, save_new};
 use maki_lua::PackPlan;
 use maki_storage::StateDir;
+use maki_storage::blocking;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SAVE_FAILED, SessionClaim, SessionError};
 
@@ -75,6 +76,17 @@ impl OpenSession {
     pub fn load(id: MakiId, storage: &StateDir) -> Result<Self, SessionError> {
         let (session, claim) = AppSession::claim_and_load(id, storage)?;
         Ok(Self { session, claim })
+    }
+
+    /// [`Self::load`] with a busy claim waited out on the tokio timer. The
+    /// parse is CPU work, so it still goes to the blocking pool.
+    pub(crate) async fn load_async(id: MakiId, storage: StateDir) -> Result<Self, SessionError> {
+        let claim = SessionClaim::acquire_async(id, &storage).await?;
+        blocking(move || {
+            let session = AppSession::load_claimed(&claim, &storage)?;
+            Ok(Self { session, claim })
+        })
+        .await
     }
 
     /// For a session no tab opens. The write lands before this returns, so a
