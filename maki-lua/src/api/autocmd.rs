@@ -387,9 +387,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"SessionEnd"` is the teardown signal: it fires first so handlers can
 /// still inspect or stop the session's jobs, then session-owned jobs are
 /// reaped. `data.reason` names the path it came from: `"reset"` (TUI
-/// `/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"reload"`
-/// (`/reload` is rebuilding the plugin host, and the session carries on in
-/// the new one), `"replaced"` (an ACP client took the session's place), or
+/// `/new`), `"load"`, `"delete"` (tab closed, or ACP `session/close`),
+/// `"shutdown"`, `"reload"` (`/reload` is rebuilding the plugin host, and the
+/// session carries on in the new one), `"replaced"` (an ACP client loaded the
+/// open session again), or
 /// `"completed"` (a headless run finished).
 ///
 /// On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_acp::ProjectStack;
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, load_env_files};
@@ -58,10 +59,14 @@ pub async fn run(
     trust_mode: TrustMode,
     legacy_notice: Option<String>,
 ) -> Result<()> {
+    // Taken before any `.env` loads, so a child for another folder never sees this one's.
+    let child_env = env::vars_os().collect();
+    let relay = env::var_os(maki_acp::RELAYED_ENV).is_none();
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let launch_dir = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     let mut trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
@@ -100,24 +105,29 @@ pub async fn run(
     let event_handle = plugin_host.event_handle();
     let interrupt = Interrupt::install();
     maki_acp::run(maki_acp::AcpParams {
-        model,
-        config: config.agent,
-        timeouts,
-        initial_wd: cwd,
-        prompt_slots: Arc::new(prompt_slots),
-        yolo: yolo || config.always_yolo,
-        defaults: config.session_defaults,
-        model_policy: Arc::new(config.provider.model_policy.clone()),
-        plugin_rules: plugin_host.plugin_rules(),
+        stack: ProjectStack {
+            model,
+            config: config.agent,
+            timeouts,
+            prompt_slots: Arc::new(prompt_slots),
+            defaults: config.session_defaults,
+            model_policy: Arc::new(config.provider.model_policy),
+            plugin_rules: plugin_host.plugin_rules(),
+            trust_policy: Arc::new(config.trust),
+            yolo: yolo || config.always_yolo,
+            on_session_end: Some(Arc::new(move |id, reason| {
+                let handle = event_handle.clone();
+                Box::pin(async move { handle.end_sessions([id], reason).await })
+            })),
+        },
+        launch_dir,
+        child_env,
+        relay,
         trust_mode,
-        trust_policy: Arc::new(config.trust),
-        on_session_end: Some(Arc::new(move |id, reason| {
-            let handle = event_handle.clone();
-            Box::pin(async move { handle.end_sessions([id], reason).await })
-        })),
         storage,
         background: cli.background_wait().is_some(),
         host_prompt: cli.host_prompt(),
+        commands: !cli.no_commands,
         stop: interrupt.stop(),
     })
     .await?;
