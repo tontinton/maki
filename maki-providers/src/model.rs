@@ -720,9 +720,12 @@ impl Model {
     }
 
     /// Vision support, most specific first: per-model override, discovery,
-    /// [`ModelSources`], the family default.
+    /// [`ModelSources`], the family default. Checked here under the model's own
+    /// slug too, since a custom slug can be discovered after its `Model` is built.
     pub fn supports_vision(&self) -> bool {
-        if let Some(vision) = self.supports_vision_override {
+        let discovered_here =
+            || model_registry::discovered(&self.provider, &self.id).and_then(|d| d.supports_vision);
+        if let Some(vision) = self.supports_vision_override.or_else(discovered_here) {
             return vision;
         }
         let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
@@ -2060,6 +2063,31 @@ mod tests {
             context_window: 200_000,
             thinking_fields: None,
         }
+    }
+
+    #[test_case(None, Some(false), false ; "discovery_after_build_turns_vision_off")]
+    #[test_case(None, Some(true), true ; "discovery_after_build_keeps_vision_on")]
+    #[test_case(Some(true), Some(false), true ; "override_outranks_discovery")]
+    fn vision_follows_discovery_under_the_models_own_slug(
+        declared: Option<bool>,
+        discovered: Option<bool>,
+        expected: bool,
+    ) {
+        let slug = format!("vision-late-discovery-{declared:?}-{discovered:?}");
+        let model = Model {
+            provider: Arc::from(slug.as_str()),
+            family: ModelFamily::Gpt,
+            supports_vision_override: declared,
+            ..ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT))
+        };
+        model_registry::set_known_models(
+            &slug,
+            vec![ModelInfo {
+                supports_vision: discovered,
+                ..ModelInfo::id_only(model.id.clone())
+            }],
+        );
+        assert_eq!(model.supports_vision(), expected);
     }
 
     /// The Lua picker draws its rows straight from this list, so the shape is
