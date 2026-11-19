@@ -1049,11 +1049,6 @@ lua_table! {
     /// Key strings in a plugin and every module it `require`s are checked at
     /// load. Each invalid one is logged with its file and line, and the status
     /// bar shows a summary, so a typo shows up at startup.
-    ///
-    /// Upgrading from older versions: `win:recv` used to deliver `"enter"`,
-    /// `"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
-    /// `<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
-    /// spellings.
     "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>, grants: PluginPermissions), DOCS [
         set(plugin, grants), del(plugin), normalize,
     ]

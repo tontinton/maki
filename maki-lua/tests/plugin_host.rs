@@ -7575,27 +7575,18 @@ maki.api.register_tool({{
 
 /// A key compared inside Lua is one the host never parses, so the source lint
 /// is the only thing that can catch it, and it has to work through a real load.
-// The `legacy_spelling` case goes away with `key_lint::legacy`.
-#[test_case::test_case(
-    r#"local function on_key(ev) return ev.key == "ctrl+n" end
-return on_key"#,
-    "<C-n>" ;
-    "legacy_spelling"
-)]
-#[test_case::test_case(
-    r#"local function on_key(ev) return ev.key == "<Escc>" end
-return on_key"#,
-    "<Esc>" ;
-    "misspelling"
-)]
-fn a_wrong_key_spelling_in_plugin_source_is_reported(source: &str, expected: &str) {
+#[test]
+fn a_wrong_key_spelling_in_plugin_source_is_reported() {
+    const SOURCE: &str = r#"local function on_key(ev) return ev.key == "<Escc>" end
+return on_key"#;
+    const SUGGESTION: &str = "<Esc>";
     let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source("keys_plugin", source).unwrap();
+    host.load_source("keys_plugin", SOURCE).unwrap();
 
     let warning = host.take_key_warning().expect("a key warning");
 
     assert!(warning.starts_with(KEY_WARNING), "{warning}");
-    assert!(warning.contains(expected), "{warning}");
+    assert!(warning.contains(SUGGESTION), "{warning}");
     assert_eq!(
         host.take_key_warning(),
         None,

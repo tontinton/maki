@@ -9,7 +9,7 @@ use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use maki_config_macro::{ConfigSection, Merge};
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
-use serde::de::{Error as DeError, IgnoredAny};
+use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::VariantArray;
@@ -445,11 +445,6 @@ pub enum ConfigError {
          package is named \"{plugin}\" (available: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
-    #[error(
-        "invalid config: ui.show_thinking was replaced by ui.thinking_lines. \
-         Use thinking_lines = -1 for show_thinking = true, or 0 for show_thinking = false"
-    )]
-    RenamedShowThinking,
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -586,9 +581,6 @@ impl RawConfig {
     /// state: it is not written in any config file and must not survive a
     /// merge between two of them.
     pub fn into_config(self, packages: &[String]) -> Result<Config, ConfigError> {
-        if self.ui.show_thinking.is_some() {
-            return Err(ConfigError::RenamedShowThinking);
-        }
         self.validate_plugin_tables(packages)?;
         let mut agent = AgentConfig::from_file(self.agent);
         agent.instructions = InstructionsConfig::from_file(self.instructions)?;
@@ -700,9 +692,6 @@ pub struct UiFileConfig {
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub thinking_lines: Option<ThinkingLines>,
-    /// Gone, replaced by `thinking_lines`. We still read it so an old config
-    /// gets told about the new key, not a vague unknown-field error.
-    show_thinking: Option<IgnoredAny>,
     pub theme: Option<ThemePair>,
     pub clock_format: Option<ClockFormat>,
     #[merge(nested_option)]
@@ -2226,13 +2215,6 @@ pub fn is_valid_server_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Validates the *tool* portion of an MCP qualified name.
-/// Currently identical to `is_valid_wire_name`, but kept distinct
-/// in case MCP tools need different constraints from native wire names.
-fn is_valid_tool_name(name: &str) -> bool {
-    is_valid_wire_name(name)
-}
-
 fn push_mcp_tool_rule(
     rules: &mut Vec<PermissionRule>,
     server_name: &str,
@@ -2523,17 +2505,15 @@ fn load_permissions_inner(
     project_config: &ProjectConfig,
 ) -> PermissionsConfig {
     let global_perms = global_dir
-        .and_then(|dir| read_permissions_file(&dir.join(PERMISSIONS_FILE), true))
+        .and_then(|dir| read_permissions_file(&dir.join(PERMISSIONS_FILE)))
         .unwrap_or_default();
 
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
     // scopes when nobody vouched for the folder.
-    let mut project_perms = read_permissions_file(
-        &project_config.project_file(GatedFile::Permissions),
-        project_config.is_trusted(),
-    )
-    .unwrap_or_default();
+    let mut project_perms =
+        read_permissions_file(&project_config.project_file(GatedFile::Permissions))
+            .unwrap_or_default();
     if !project_config.is_trusted() {
         project_perms.restrict_to_deny_scopes();
     }
@@ -2541,167 +2521,8 @@ fn load_permissions_inner(
     build_permissions(global_perms, project_perms)
 }
 
-fn migrate_mcp_entry(
-    doc: &mut toml_edit::DocumentMut,
-    server_name: &str,
-    tool_name: &str,
-    item: &toml_edit::Item,
-) {
-    // Old format: ["mcp:server__tool"] with booleans or scope-string arrays.
-    // New format: [mcp.server] allow = ["tool_name"]. Old scope strings were
-    // dead code (MCP scopes are always wildcarded), so only the effect survives.
-    let mut push = |effect_key: &str| {
-        let res = child_table(doc.as_table_mut(), "mcp")
-            .and_then(|mcp| child_table(mcp, server_name))
-            .and_then(|server| push_unique(server, effect_key, tool_name));
-        if let Err(e) = res {
-            warn!(
-                server = server_name,
-                tool = tool_name,
-                error = %e,
-                "skipping MCP entry migration"
-            );
-        }
-    };
-
-    // Bare boolean: old format like [mcp]\ndeepwiki__search = true
-    // means "allow this tool".
-    if let Some(b) = item.as_bool() {
-        if b {
-            push("allow");
-        }
-        return;
-    }
-
-    if let Some(old_table) = item.as_table() {
-        for (key, value) in old_table.iter() {
-            match key {
-                "allow" | "deny" => {
-                    if value.as_bool() == Some(true) || value.as_array().is_some() {
-                        push(key);
-                    }
-                }
-                _ => {
-                    warn!(
-                        key,
-                        server = server_name,
-                        tool = tool_name,
-                        "dropping unknown key in old MCP entry during migration"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Migrates old permission formats and returns the (possibly rewritten)
-/// file content. The rewrite to disk is best-effort: loading uses the
-/// migrated content even when the write fails.
-///
-/// `persist` is off for an untrusted project: its deny rules still apply, but
-/// declining to trust a repository must not leave Maki editing files in it.
-fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
+fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
     let content = fs::read_to_string(path).ok()?;
-    let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return Some(content);
-    };
-    let mut migrated = false;
-
-    if let Some(item) = doc.remove("allow_all") {
-        migrated = true;
-        if item.as_bool() == Some(true) {
-            doc.insert("default", toml_edit::value("allow"));
-        }
-    }
-
-    // Migrate flat MCP keys: "mcp:server__tool" → [mcp.server]
-    // Two TOML representations to handle:
-    // 1. Quoted keys: ["mcp:server__tool"] → flat top-level key
-    // 2. Bare keys: [mcp:server__tool] → nested "mcp" → {"server__tool": ...}
-
-    // Path 1: Flat quoted keys starting with "mcp:" containing "__"
-    let flat_old_keys: Vec<String> = doc
-        .iter()
-        .filter_map(|(k, _)| {
-            k.strip_prefix("mcp:")
-                .and_then(|rest| rest.contains("__").then(|| k.to_string()))
-        })
-        .collect();
-
-    for old_key in flat_old_keys {
-        if let Some(item) = doc.remove(&old_key) {
-            let rest = &old_key[4..]; // strip "mcp:"
-            if let Some((server, tool)) = rest.split_once("__") {
-                if !is_valid_server_name(server) || !is_valid_tool_name(tool) {
-                    tracing::error!(
-                        key = old_key.as_str(),
-                        server = server,
-                        tool = tool,
-                        "SECURITY: skipping migration of malformed MCP key: \
-                         rules for this tool will not be restored"
-                    );
-                    continue;
-                }
-                migrate_mcp_entry(&mut doc, server, tool, &item);
-                migrated = true;
-            }
-        }
-    }
-
-    // Path 2: Nested "mcp" sub-table (bare key mcp: created nesting)
-    let nested_old_entries: Vec<(String, String, toml_edit::Item)> = {
-        let mut entries = Vec::new();
-        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp") {
-            for (key, _) in mcp_table.iter() {
-                if key.contains("__")
-                    && let Some((server, tool)) = key.split_once("__")
-                {
-                    let item = mcp_table.get(key).cloned();
-                    if let Some(item) = item {
-                        entries.push((server.to_string(), tool.to_string(), item));
-                    }
-                }
-            }
-        }
-        entries
-    };
-
-    for (server_name, tool_name, item) in nested_old_entries {
-        if !is_valid_server_name(&server_name) || !is_valid_tool_name(&tool_name) {
-            tracing::error!(
-                server = server_name.as_str(),
-                tool = &*tool_name,
-                "SECURITY: skipping migration of malformed nested MCP key: \
-                 rules for this tool will not be restored"
-            );
-            continue;
-        }
-        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get_mut("mcp") {
-            mcp_table.remove(&format!("{server_name}__{tool_name}"));
-        }
-        migrate_mcp_entry(&mut doc, &server_name, &tool_name, &item);
-        migrated = true;
-    }
-
-    // Clean up the now-empty "mcp" parent table if it has no children
-    if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp")
-        && mcp_table.is_empty()
-    {
-        doc.remove("mcp");
-    }
-
-    if !migrated {
-        return Some(content);
-    }
-    let new_content = doc.to_string();
-    if persist && let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
-        warn!(path = %path.display(), error = %e, "failed to persist migrated permissions file");
-    }
-    Some(new_content)
-}
-
-fn read_permissions_file(path: &Path, persist_migration: bool) -> Option<PermissionsFileConfig> {
-    let content = migrate_permissions_file(path, persist_migration)?;
     match toml::from_str(&content) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -3712,37 +3533,6 @@ mod tests {
         assert_eq!(allow_rules[1].tool, ToolKey::native("read"));
     }
 
-    #[test_case(false ; "untrusted_project_file_is_left_alone")]
-    #[test_case(true ; "trusted_project_file_is_migrated")]
-    fn legacy_project_permissions_migrate_only_when_trusted(trusted: bool) {
-        const LEGACY_KEY: &str = "allow_all";
-        const DENY_SCOPE: &str = "rm -rf *";
-
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        let legacy = format!("{LEGACY_KEY} = true\n\n[bash]\ndeny = [\"{DENY_SCOPE}\"]\n");
-        write_project_permissions(dir.path(), &legacy);
-
-        let perms = load_permissions_inner(
-            Some(&global),
-            &ProjectConfig::discover(dir.path()).with_trust(trusted),
-        );
-
-        assert!(perms.rules.iter().any(|rule| {
-            rule.tool == ToolKey::native("bash")
-                && rule.effect == Effect::Deny
-                && rule.scope.as_deref() == Some(DENY_SCOPE)
-        }));
-
-        let on_disk =
-            fs::read_to_string(dir.path().join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap();
-        if trusted {
-            assert!(!on_disk.contains(LEGACY_KEY));
-        } else {
-            assert_eq!(on_disk, legacy);
-        }
-    }
-
     /// An untrusted repository may only narrow the agent: deny scopes survive,
     /// allow scopes and every default the file sets are dropped.
     #[test_case(false, 2, DefaultEffect::Prompt, None ; "untrusted_keeps_only_deny")]
@@ -4288,15 +4078,6 @@ mod tests {
     }
 
     #[test]
-    fn show_thinking_points_to_thinking_lines() {
-        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
-        assert!(matches!(
-            raw.into_config(&[]),
-            Err(ConfigError::RenamedShowThinking)
-        ));
-    }
-
-    #[test]
     fn max_input_lines_defaults_and_deserializes() {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(&[]).unwrap();
@@ -4646,58 +4427,6 @@ mod tests {
                 tool: "search".into()
             }
         );
-    }
-
-    #[test]
-    fn migrate_mcp_old_flat_keys() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        // Old maki format used quoted TOML keys for mcp:server__tool
-        fs::write(
-            global.join("permissions.toml"),
-            "[\"mcp:deepwiki__search\"]\nallow = true\n\
-             [\"mcp:github__issue\"]\nallow = [\"read\"]\n",
-        )
-        .unwrap();
-
-        let _perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[mcp.deepwiki]"), "server table present");
-        assert!(content.contains("[mcp.github]"), "server table present");
-        assert!(content.contains("\"search\""), "tool name migrated");
-        assert!(content.contains("\"issue\""), "tool name migrated");
-        assert!(
-            !content.contains("mcp:deepwiki__search"),
-            "old flat key gone"
-        );
-        assert!(!content.contains("mcp:github__issue"), "old flat key gone");
-        assert!(!content.contains("__"), "no old __ separator remains");
-    }
-
-    #[test]
-    fn migrate_mcp_nested_bare_keys() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        // Bare TOML key [mcp.deepwiki__search] creates nested mcp → deepwiki__search
-        fs::write(
-            global.join("permissions.toml"),
-            "[mcp]\n\
-             deepwiki__search = true\n\
-             github__issue = true\n",
-        )
-        .unwrap();
-
-        let _perms = load_permissions_inner(Some(&global), &session_trusted(dir.path()));
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[mcp.deepwiki]"), "server table present");
-        assert!(content.contains("[mcp.github]"), "server table present");
-        assert!(content.contains("\"search\""), "tool name migrated");
-        assert!(content.contains("\"issue\""), "tool name migrated");
-        assert!(!content.contains("__"), "no old __ separator remains");
     }
 
     #[test]
