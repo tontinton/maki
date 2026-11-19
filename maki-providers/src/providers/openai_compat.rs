@@ -262,6 +262,7 @@ impl OpenAiCompatProvider {
             .and_then(|v| u32::try_from(v).ok());
         let supports_vision = m["input_modalities"]
             .as_array()
+            .or_else(|| m["architecture"]["input_modalities"].as_array())
             .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
         let pricing = m["pricing"].as_object().and_then(|p| {
             Some(crate::model::ModelPricing::per_million(
@@ -882,6 +883,8 @@ data: [DONE]\n\n";
 
     #[test_case(json!({"id": "m", "input_modalities": ["text", "image"]}), Some(true) ; "image_modality_enables_vision")]
     #[test_case(json!({"id": "m", "input_modalities": ["text"]}), Some(false) ; "text_only_disables_vision")]
+    #[test_case(json!({"id": "m", "architecture": {"input_modalities": ["text"]}}), Some(false) ; "nested_text_only_disables_vision")]
+    #[test_case(json!({"id": "m", "architecture": {"input_modalities": ["text", "image"]}}), Some(true) ; "nested_image_modality_enables_vision")]
     #[test_case(json!({"id": "m"}), None ; "missing_modalities_stays_unknown")]
     fn default_model_parser_vision_flag(m: Value, expected: Option<bool>) {
         let info = OpenAiCompatProvider::default_model_parser(&m).unwrap();
