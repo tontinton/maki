@@ -1,14 +1,25 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::McpPromptInfo;
+
 const COMMANDS_DIR: &str = "commands";
 const PROJECT_COMMAND_DIRS: &[&str] = &[".maki/commands", ".claude/commands"];
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+pub const APPENDED_ARGUMENTS_LABEL: &str = "ARGUMENTS:";
+const PROJECT_SCOPE: &str = "project";
+const USER_SCOPE: &str = "user";
+const SCOPE_SEPARATOR: char = ':';
+pub const COMMAND_PREFIX: char = '/';
+pub const COMPACT_NAME: &str = "compact";
+pub const COMPACT_DESCRIPTION: &str =
+    "Summarize and compact conversation history (optional guidance)";
 
 #[derive(Debug, Default, Deserialize)]
 struct Frontmatter {
@@ -76,6 +87,15 @@ pub enum CommandScope {
     User,
 }
 
+impl CommandScope {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Project => PROJECT_SCOPE,
+            Self::User => USER_SCOPE,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomCommand {
     pub name: String,
@@ -83,23 +103,107 @@ pub struct CustomCommand {
     pub content: String,
     pub scope: CommandScope,
     pub accepts_args: bool,
+    pub argument_hint: Option<String>,
 }
 
 impl CustomCommand {
     pub fn display_name(&self) -> String {
-        let prefix = match self.scope {
-            CommandScope::Project => "/project",
-            CommandScope::User => "/user",
-        };
-        format!("{prefix}:{}", self.name)
+        PromptCommand::Custom(self).slash_name()
     }
 
-    pub fn has_args(&self) -> bool {
-        self.accepts_args
-    }
-
+    /// A body without `$ARGUMENTS` still gets {args}, appended on a labeled
+    /// line, so an `argument-hint` alone never swallows what the user typed.
     pub fn render(&self, args: &str) -> String {
-        self.content.replace(ARGUMENTS_PLACEHOLDER, args)
+        if self.content.contains(ARGUMENTS_PLACEHOLDER) {
+            self.content.replace(ARGUMENTS_PLACEHOLDER, args)
+        } else if args.is_empty() {
+            self.content.clone()
+        } else {
+            format!("{}\n\n{APPENDED_ARGUMENTS_LABEL} {args}", self.content)
+        }
+    }
+
+    fn is_named(&self, typed: &str) -> bool {
+        typed
+            .split_once(SCOPE_SEPARATOR)
+            .is_some_and(|(scope, name)| {
+                scope.eq_ignore_ascii_case(self.scope.label())
+                    && name.eq_ignore_ascii_case(&self.name)
+            })
+    }
+
+    fn summary(&self) -> &str {
+        non_blank(&self.description)
+            .or_else(|| self.content.lines().find_map(non_blank))
+            .unwrap_or(&self.name)
+    }
+}
+
+fn non_blank(text: &str) -> Option<&str> {
+    Some(text.trim()).filter(|text| !text.is_empty())
+}
+
+/// A command that becomes a prompt, besides each front end's built-ins. The
+/// TUI palette and ACP both read it, so a name typed in one runs the same
+/// command in the other. `Display` is the name after the `/`.
+#[derive(Clone, Copy)]
+pub enum PromptCommand<'a> {
+    Custom(&'a CustomCommand),
+    Mcp(&'a McpPromptInfo),
+}
+
+impl<'a> PromptCommand<'a> {
+    /// Custom commands, then MCP prompts, each with its index in its own
+    /// slice. A prompt whose name holds whitespace is left out: the argument
+    /// split would cut it, so nobody can type it.
+    pub fn catalog(
+        custom: &'a [CustomCommand],
+        prompts: &'a [McpPromptInfo],
+    ) -> impl Iterator<Item = (usize, Self)> + 'a {
+        let custom = custom.iter().map(Self::Custom).enumerate();
+        let prompts = prompts
+            .iter()
+            .enumerate()
+            .filter(|(_, prompt)| !prompt.display_name.contains(char::is_whitespace))
+            .map(|(i, prompt)| (i, Self::Mcp(prompt)));
+        custom.chain(prompts)
+    }
+
+    pub fn slash_name(&self) -> String {
+        format!("{COMMAND_PREFIX}{self}")
+    }
+
+    /// {typed} is the name without its `/`, compared case-blind.
+    pub fn is_named(&self, typed: &str) -> bool {
+        match self {
+            Self::Custom(cmd) => cmd.is_named(typed),
+            Self::Mcp(prompt) => prompt.display_name.eq_ignore_ascii_case(typed),
+        }
+    }
+
+    pub fn takes_args(&self) -> bool {
+        match self {
+            Self::Custom(cmd) => cmd.accepts_args,
+            Self::Mcp(prompt) => !prompt.arguments.is_empty(),
+        }
+    }
+
+    /// Never blank: a custom command falls back to the first line of its
+    /// body, an MCP prompt to its name.
+    pub fn description(&self) -> &'a str {
+        match *self {
+            Self::Custom(cmd) => cmd.summary(),
+            Self::Mcp(prompt) => non_blank(&prompt.description).unwrap_or(&prompt.display_name),
+        }
+    }
+}
+
+impl fmt::Display for PromptCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Custom(cmd) => write!(f, "{}{SCOPE_SEPARATOR}{}", cmd.scope.label(), cmd.name),
+            Self::Mcp(prompt) => f.write_str(&prompt.display_name),
+        }
     }
 }
 
@@ -179,7 +283,8 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         return None;
     }
 
-    let accepts_args = fm.argument_hint.is_some() || body.contains(ARGUMENTS_PLACEHOLDER);
+    let argument_hint = fm.argument_hint.filter(|hint| !hint.trim().is_empty());
+    let accepts_args = argument_hint.is_some() || body.contains(ARGUMENTS_PLACEHOLDER);
 
     Some(CustomCommand {
         name: fm.name.unwrap_or(name_from_file),
@@ -187,6 +292,7 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         content: body.to_string(),
         scope,
         accepts_args,
+        argument_hint,
     })
 }
 
@@ -197,37 +303,130 @@ mod tests {
 
     use super::*;
 
+    const FIX: &str = "fix";
+    const FIX_BODY: &str = "Fix the code";
+    const FIX_DESCRIPTION: &str = "Quick fix";
+    const REVIEW_BODY: &str = "Review $ARGUMENTS";
+    const ARGS: &str = "src/main.rs";
+    const REVIEW_RENDERED: &str = "Review src/main.rs";
+    const MULTILINE_BODY: &str = "\n  First line  \nSecond line";
+    const MULTILINE_FIRST_LINE: &str = "First line";
+    const PROMPT_NAME: &str = "srv:greet";
+    const PROMPT_QUALIFIED: &str = "srv.greet";
+    const PROMPT_DESCRIPTION: &str = "Say hello";
+    const SPACED_PROMPT_NAME: &str = "srv:say hello";
+
+    fn custom(scope: CommandScope, content: &str, description: &str) -> CustomCommand {
+        CustomCommand {
+            name: FIX.into(),
+            description: description.into(),
+            content: content.into(),
+            scope,
+            accepts_args: true,
+            argument_hint: None,
+        }
+    }
+
+    #[test_case(REVIEW_BODY, ARGS, REVIEW_RENDERED ; "fills_placeholder")]
+    #[test_case(FIX_BODY, "", FIX_BODY ; "no_args_keeps_body")]
+    fn render_custom_command(content: &str, args: &str, expected: &str) {
+        let cmd = custom(CommandScope::User, content, "");
+        assert_eq!(cmd.render(args), expected);
+    }
+
+    #[test]
+    fn render_appends_args_without_placeholder() {
+        let cmd = custom(CommandScope::User, FIX_BODY, "");
+        assert_eq!(
+            cmd.render(ARGS),
+            format!("{FIX_BODY}\n\n{APPENDED_ARGUMENTS_LABEL} {ARGS}")
+        );
+    }
+
+    #[test_case(FIX_DESCRIPTION, FIX_BODY, FIX_DESCRIPTION ; "own_description")]
+    #[test_case("", MULTILINE_BODY, MULTILINE_FIRST_LINE ; "first_body_line")]
+    #[test_case("  ", FIX_BODY, FIX_BODY ; "blank_description")]
+    #[test_case("", "", FIX ; "falls_back_to_name")]
+    fn custom_description(description: &str, content: &str, expected: &str) {
+        let cmd = custom(CommandScope::User, content, description);
+        assert_eq!(PromptCommand::Custom(&cmd).description(), expected);
+    }
+
+    #[test_case(PROMPT_DESCRIPTION, PROMPT_DESCRIPTION ; "own_description")]
+    #[test_case("", PROMPT_NAME ; "falls_back_to_name")]
+    fn mcp_description(description: &str, expected: &str) {
+        let prompt = McpPromptInfo {
+            description: description.into(),
+            ..McpPromptInfo::new(PROMPT_NAME, PROMPT_QUALIFIED, &[])
+        };
+        assert_eq!(PromptCommand::Mcp(&prompt).description(), expected);
+    }
+
+    #[test_case(CommandScope::User, "user:fix", true ; "exact")]
+    #[test_case(CommandScope::User, "USER:Fix", true ; "case_blind")]
+    #[test_case(CommandScope::Project, "user:fix", false ; "other_scope")]
+    #[test_case(CommandScope::User, "fix", false ; "no_scope")]
+    #[test_case(CommandScope::User, "user:fi", false ; "prefix")]
+    fn custom_is_named(scope: CommandScope, typed: &str, expected: bool) {
+        let cmd = custom(scope, FIX_BODY, "");
+        assert_eq!(PromptCommand::Custom(&cmd).is_named(typed), expected);
+    }
+
+    #[test]
+    fn catalog_skips_prompts_nobody_can_type() {
+        let commands = [custom(CommandScope::User, FIX_BODY, "")];
+        let prompts = [
+            McpPromptInfo::new(SPACED_PROMPT_NAME, PROMPT_QUALIFIED, &[]),
+            McpPromptInfo::new(PROMPT_NAME, PROMPT_QUALIFIED, &[]),
+        ];
+        let names: Vec<_> = PromptCommand::catalog(&commands, &prompts)
+            .map(|(i, command)| (i, command.slash_name()))
+            .collect();
+        let expected = [
+            (0, commands[0].display_name()),
+            (1, format!("{COMMAND_PREFIX}{PROMPT_NAME}")),
+        ];
+        assert_eq!(names, expected);
+    }
+
     #[test_case(
         "---\nname: review\ndescription: Code review\nargument-hint: <file>\n---\nReview $ARGUMENTS",
-        "review", "Code review", true
+        "review", "Code review", true, Some("<file>")
         ; "full_frontmatter"
     )]
     #[test_case(
         "Review $ARGUMENTS",
-        "test-cmd", "", true
+        "test-cmd", "", true, None
         ; "body_placeholder_without_hint"
     )]
     #[test_case(
         "Just do things",
-        "test-cmd", "", false
+        "test-cmd", "", false, None
         ; "no_frontmatter_uses_filename"
     )]
     #[test_case(
         "---\ndescription: Quick fix\n---\nFix the code",
-        "test-cmd", "Quick fix", false
+        "test-cmd", "Quick fix", false, None
         ; "no_args_placeholder"
+    )]
+    #[test_case(
+        "---\nargument-hint: \"  \"\n---\nFix the code",
+        "test-cmd", "", false, None
+        ; "blank_hint_is_no_hint"
     )]
     fn parse_command_fields(
         content: &str,
         expected_name: &str,
         expected_desc: &str,
         expected_has_args: bool,
+        expected_hint: Option<&str>,
     ) {
         let path = PathBuf::from("/fake/test-cmd.md");
         let cmd = parse_command(content, &path, CommandScope::Project).unwrap();
         assert_eq!(cmd.name, expected_name);
         assert_eq!(cmd.description, expected_desc);
-        assert_eq!(cmd.has_args(), expected_has_args);
+        assert_eq!(cmd.accepts_args, expected_has_args);
+        assert_eq!(cmd.argument_hint.as_deref(), expected_hint);
     }
 
     #[test]
@@ -245,6 +444,7 @@ mod tests {
             content: "body".into(),
             scope,
             accepts_args: false,
+            argument_hint: None,
         };
         assert_eq!(cmd.display_name(), expected);
     }
