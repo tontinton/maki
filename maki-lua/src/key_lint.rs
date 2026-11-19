@@ -238,7 +238,10 @@ mod tests {
 
     #[test]
     fn findings_name_the_chunk_and_line_in_source_order() {
-        let source = format!("local a = \"<Escc>\"\n{}local b = \"<Tabb>\"\n", "\n".repeat(8));
+        let source = format!(
+            "local a = \"<Escc>\"\n{}local b = \"<Tabb>\"\n",
+            "\n".repeat(8)
+        );
 
         let findings = lint(CHUNK, &source);
 
@@ -252,7 +255,10 @@ mod tests {
     #[test]
     fn many_findings_are_one_summary_line() {
         let key_lint = KeyLint::default();
-        key_lint.check(CHUNK, "local a, b, c = \"<Escc>\", \"<Tabb>\", \"<C-nn>\"\n");
+        key_lint.check(
+            CHUNK,
+            "local a, b, c = \"<Escc>\", \"<Tabb>\", \"<C-nn>\"\n",
+        );
 
         let summary = key_lint.take_summary().expect("findings summarized");
 
