@@ -157,14 +157,22 @@ impl ModelSlots {
             Err(format!("{BUILD_PANICKED_ERR}: {spec}"))
         });
         let built = built.map(|slot| Arc::clone(self.built.entry(spec.clone()).or_insert(slot)));
+        if let Ok(slot) = &built
+            && spec == self.fallback.model.spec()
+        {
+            self.fallback = Arc::clone(slot);
+        }
         Some((spec, built))
     }
 
     /// Discovery landed or a provider was re-authenticated, so every spec
-    /// builds again the next time somebody asks for it.
+    /// builds again the next time somebody asks for it. The fallback builds
+    /// again right away, or a session that falls back later would get a
+    /// provider on the credentials from before.
     pub(crate) fn invalidate(&mut self) {
         self.built.clear();
         self.epoch += 1;
+        self.request(&self.fallback.model.spec());
     }
 }
 
@@ -196,6 +204,7 @@ pub(crate) mod tests {
     const NO_FLOOR: &str = "invalidate must keep the fallback floor";
     const POISONED: &str = "a failed lookup must not leave a cache entry";
     const STALE_KEPT: &str = "only a slot built since the last invalidate may be kept";
+    const STALE_FALLBACK: &str = "a fallback must not keep a provider from before an invalidate";
     const NOT_RUNNING: &str = "a requested spec with no slot has a build running";
     const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
 
@@ -268,8 +277,8 @@ pub(crate) mod tests {
 
     /// `fallback` lives outside `built` on purpose. A clear that took it down
     /// too would leave session-open with nothing to land on.
-    #[test]
-    fn invalidate_rebuilds_and_keeps_the_fallback_floor() {
+    #[tokio::test]
+    async fn invalidate_rebuilds_and_keeps_the_fallback_floor() {
         let mut slots = slots(strict_policy());
         let first = slots.try_get(STARTUP_SPEC).unwrap();
         slots.invalidate();
@@ -283,23 +292,30 @@ pub(crate) mod tests {
         assert!(reason.is_some(), "{NO_FLOOR}");
     }
 
+    /// Lands builds until the one for `spec` is taken in, and says how many
+    /// were turned away as stale on the way.
     async fn build(
         slots: &mut ModelSlots,
         spec: &str,
-    ) -> Option<Result<Arc<super::ModelSlot>, String>> {
+    ) -> (usize, Result<Arc<super::ModelSlot>, String>) {
         slots.request(spec);
-        let landed = slots.next_built().await.expect(NOT_RUNNING);
-        slots.land(landed).map(|(landed_spec, built)| {
-            assert_eq!(landed_spec, spec);
-            built
-        })
+        let mut stale = 0;
+        loop {
+            let landed = slots.next_built().await.expect(NOT_RUNNING);
+            match slots.land(landed) {
+                Some((landed_spec, built)) if landed_spec == spec => return (stale, built),
+                Some(_) => {}
+                None => stale += 1,
+            }
+        }
     }
 
     #[tokio::test]
     async fn a_spec_has_one_build_however_many_ask() {
         let mut slots = slots(ModelPolicy::default());
         slots.request(OTHER_SPEC);
-        let built = build(&mut slots, OTHER_SPEC).await.unwrap().unwrap();
+        let (_, built) = build(&mut slots, OTHER_SPEC).await;
+        let built = built.unwrap();
 
         assert!(
             Arc::ptr_eq(&slots.get(OTHER_SPEC).unwrap(), &built),
@@ -317,14 +333,23 @@ pub(crate) mod tests {
         slots.request(OTHER_SPEC);
         slots.invalidate();
 
-        assert!(
-            build(&mut slots, OTHER_SPEC).await.is_none(),
-            "{STALE_KEPT}"
-        );
-        assert!(slots.get(OTHER_SPEC).is_none(), "{STALE_KEPT}");
-        let rebuilt = build(&mut slots, OTHER_SPEC).await.expect(STALE_KEPT);
+        let (stale, rebuilt) = build(&mut slots, OTHER_SPEC).await;
+        assert_eq!(stale, 1, "{STALE_KEPT}");
         assert_eq!(rebuilt.is_ok(), builds);
         assert_eq!(slots.get(OTHER_SPEC).is_some(), builds, "{CACHED}");
+    }
+
+    #[tokio::test]
+    async fn a_fallback_after_an_invalidate_was_built_after_it() {
+        let mut slots = slots(strict_policy());
+        let (before, _) = slots.fall_back(OTHER_SPEC, MODEL_POLICY_ERR.to_owned());
+        slots.invalidate();
+        let landed = slots.next_built().await.expect(NOT_RUNNING);
+        slots.land(landed).expect(STALE_KEPT).1.unwrap();
+
+        let (after, _) = slots.fall_back(OTHER_SPEC, MODEL_POLICY_ERR.to_owned());
+        assert_eq!(after.model.spec(), STARTUP_SPEC, "{NO_FLOOR}");
+        assert!(!Arc::ptr_eq(&before, &after), "{STALE_FALLBACK}");
     }
 
     /// A cache hit skips both the policy check and the build, so a refusal must
@@ -348,7 +373,7 @@ pub(crate) mod tests {
         let err = slots.try_get(spec).err().unwrap();
         assert!(err.starts_with(expected), "{err}");
         assert!(slots.try_get(spec).is_err(), "{POISONED}");
-        let off_loop = build(&mut slots, spec).await.unwrap().err();
+        let off_loop = build(&mut slots, spec).await.1.err();
         assert_eq!(off_loop.as_ref(), Some(&err), "{OFF_LOOP_DIFFERS}");
         assert!(slots.get(spec).is_none(), "{POISONED}");
 
