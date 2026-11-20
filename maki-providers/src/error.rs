@@ -36,9 +36,12 @@ const RETRY_AFTER_HEADER: &str = "retry-after";
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
 const REASONING_SUMMARY_PARAM: &str = "reasoning.summary";
-/// OpenAI, Azure and LiteLLM refuse a field with a 400. Servers that validate
-/// with pydantic, like vLLM, answer 422 instead.
-const REJECTED_PARAM_STATUSES: [u16; 2] = [400, 422];
+/// How a server refuses a body it will not take. OpenAI, Azure and LiteLLM
+/// answer 400, and servers that validate with pydantic, like vLLM, answer 422.
+/// Auth, permission, billing and routing failures have statuses of their own,
+/// and nothing in the body causes them. There is no 413 here because every
+/// 413 reads as an overflow.
+const BODY_REFUSED_STATUSES: [u16; 2] = [400, 422];
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +310,16 @@ impl AgentError {
         matches!(self, Self::Api { status: 400, message, .. } if message.contains(THINKING_UNBOUND))
     }
 
+    /// The server will not take the body as it is, and none of the narrower
+    /// checks knows why, so sending it again fails the same way every time.
+    /// Overflow and unbound thinking are refusals too, but each has its own
+    /// fix, so they stay out of here.
+    pub fn is_body_refused(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if BODY_REFUSED_STATUSES.contains(status))
+            && !self.is_context_overflow()
+            && !self.is_thinking_unbound()
+    }
+
     pub fn is_auth_error(&self) -> bool {
         matches!(self, Self::Api { status: 401, .. }) && self.non_login_error().is_none()
     }
@@ -340,7 +353,7 @@ impl AgentError {
         else {
             return false;
         };
-        REJECTED_PARAM_STATUSES.contains(status)
+        BODY_REFUSED_STATUSES.contains(status)
             && message
                 .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
                 .any(|word| word == param)
@@ -915,6 +928,15 @@ mod tests {
         assert!(!err.is_retryable() || status >= 500);
     }
 
+    #[test_case(400, PLAIN_MESSAGE, true             ; "bad_request")]
+    #[test_case(422, PLAIN_MESSAGE, true             ; "unprocessable")]
+    #[test_case(403, PLAIN_MESSAGE, false            ; "forbidden")]
+    #[test_case(400, OVERFLOW_MESSAGE, false         ; "overflow")]
+    #[test_case(400, THINKING_UNBOUND_MESSAGE, false ; "thinking_unbound")]
+    fn is_body_refused(status: u16, message: &str, expected: bool) {
+        assert_eq!(api_msg(status, message).is_body_refused(), expected);
+    }
+
     #[test]
     fn context_overflow_is_not_retryable() {
         let err = api_msg(400, "request exceeds the available context size");
@@ -1033,6 +1055,7 @@ mod tests {
         quota_exhausted: bool,
         auth_error: bool,
         thinking_unbound: bool,
+        body_refused: bool,
         rotate_key: bool,
     }
 
@@ -1045,6 +1068,7 @@ mod tests {
                 quota_exhausted: error.is_quota_exhausted(),
                 auth_error: error.is_auth_error(),
                 thinking_unbound: error.is_thinking_unbound(),
+                body_refused: error.is_body_refused(),
                 rotate_key: error.should_rotate_key(),
             }
         }

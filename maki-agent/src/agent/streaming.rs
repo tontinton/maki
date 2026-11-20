@@ -45,15 +45,18 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
+/// Returns the text the attempt streamed, or `None` when the server sent
+/// nothing back at all.
 async fn forward_provider_events(
     mut prx: UnboundedReceiver<ProviderEvent>,
     event_tx: &EventSender,
-) -> String {
-    let mut streamed = String::new();
+) -> Option<String> {
+    let mut streamed: Option<String> = None;
     while let Some(pe) = prx.recv().await {
+        let reply = streamed.get_or_insert_default();
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
-                streamed.push_str(&text);
+                reply.push_str(&text);
                 AgentEvent::TextDelta { text }
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
@@ -84,7 +87,13 @@ async fn forward_provider_events(
 /// attempt's text (`stream_reset`), and history must agree with the view.
 #[derive(Debug)]
 pub(crate) enum StreamError {
-    Cancelled { streamed: String },
+    Cancelled {
+        streamed: String,
+    },
+    /// The server turned the body down before sending anything back. Only
+    /// then can the body be the cause. An error frame after the reply began
+    /// means the server took the body and failed later.
+    Refused(AgentError),
     Other(AgentError),
 }
 
@@ -98,7 +107,7 @@ impl From<StreamError> for AgentError {
     fn from(e: StreamError) -> Self {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
-            StreamError::Other(e) => e,
+            StreamError::Refused(e) | StreamError::Other(e) => e,
         }
     }
 }
@@ -257,10 +266,19 @@ pub(crate) async fn stream_with_retry(
                 }
                 return Ok(r);
             }
-            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
+            Err(AgentError::Cancelled) => {
+                return Err(StreamError::Cancelled {
+                    streamed: streamed.unwrap_or_default(),
+                });
+            }
             Err(e) => {
                 attempt += 1;
                 emit_api_error(model, &e, attempt, started.elapsed());
+                // Nothing below would retry a refused body or switch keys for
+                // it, so it can leave right here.
+                if streamed.is_none() && e.is_body_refused() {
+                    return Err(StreamError::Refused(e));
+                }
                 // Rotation is decided above anything `retry_kind()` says: a
                 // fresh key and a delay cure different problems. A 401 or a 403
                 // is dead for the key that produced it, fine for the next one,

@@ -382,7 +382,7 @@ print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
 maki.NIL
 ```
 
-`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments use nil for null instead, and so does an event payload, except for the message of `TurnComplete`, which is a session table.
+`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil instead. The one exception is `data.message` of `TurnComplete`, which has the shape `maki.session.messages` returns.
 
 **Example:**
 
@@ -924,27 +924,22 @@ name the session now running or focused. What each event adds:
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
   wants.
-- `"TurnComplete"`: `data.message`, the model's message, with
-  `data.context_window` and `data.context_size` when the host knows it.
-  Fires after each response, before that response's tool calls run.
-  `data.message` needs `session_read` and is the same table a
-  `maki.session.messages()` entry is, so a null arrives as `maki.NIL` and
-  an image block carries an image handle instead of base64. The keys and
-  blocks are [listed here](#maki-session-messages). Each block is tagged
-  by `type`, and each type carries its own fields. A
-  subagent's response carries its own message and sizes with `data.id`,
-  the task id `maki.session.notify` takes as `task`. Skip events with an
-  `id` to watch only the main context. No payload carries a cost, and
-  `"TurnEnd"` holds the bill.
+- `"TurnComplete"`: `data.message` and `data.context_window`, plus
+  `data.context_size` when the host knows it. Fires after each model
+  response, before its tool calls run. `data.message` is that response,
+  shaped like a [`maki.session.messages`](#maki-session-messages) entry.
+  A subagent's response fires it too, with the subagent's own message
+  and sizes and `data.id`, its task id. Pass that id as `task` to
+  `maki.session.notify` or `maki.session.request_compact`. Skip events
+  with an `id` to watch only the main context. A compaction's summary
+  request fires it as well, with the summary as `data.message`. Nothing
+  marks it as a summary, and it fires even when the summary comes back
+  empty and no `"CompactionDone"` follows. For cost, read `"TurnEnd"`.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, `data.context_window`, and `data.summary`,
-  the text that replaced the history. A compaction asks the model for
-  that summary first, so its `"TurnComplete"` arrives before this event,
-  carrying the summary as `data.message`. The payload does not say it is
-  a summary there, and a compaction whose summary fails fires that
-  `"TurnComplete"` without ever reaching this event.
+  the text that replaced the history.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
   agent just wrote. Fires once per draft. Plan state is per session, so
   pass `data.session_id` to `maki.plan.read`.
@@ -1007,13 +1002,14 @@ name the session now running or focused. What each event adds:
 Conversation content needs the `session_read` permission. Without it a
 host event still arrives, carrying only its metadata fields:
 `"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
-`"CompactionDone"` without `data.summary`, and `"InputChanged"` without
-`data.text`. Maki warns once per plugin and event, naming what was left
-out. Events a plugin fires under its own names arrive as fired.
+`"TurnComplete"` without `data.message`, `"CompactionDone"` without
+`data.summary`, and `"InputChanged"` without `data.text`. Maki warns once
+per plugin and event, naming what was left out. Events a plugin fires
+under its own names arrive as fired.
 
 A subagent's run fires only `"TurnComplete"`, never tool or other turn
-events. `"TurnEnd"` fires once per turn of the main session. A manual `/compact` fires no `"TurnEnd"`, only the
-`"TurnComplete"` of its summary request.
+events. `"TurnEnd"` fires once per turn of the main session. A manual
+`/compact` fires no `"TurnEnd"`.
 
 Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
@@ -1023,10 +1019,10 @@ events. Everything else fires under `maki -p` and sdk mode as well.
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
 reaped. `data.reason` names the path it came from: `"reset"` (TUI
-`/new`), `"load"`, `"delete"` (tab closed, or ACP `session/close`),
-`"shutdown"`, `"reload"` (`/reload` is rebuilding the plugin host, and the
-session carries on in the new one), `"replaced"` (an ACP client loaded the
-open session again), or
+`/new`), `"load"` (the tab opened another session), `"delete"` (tab
+closed, or ACP `session/close`), `"shutdown"`, `"reload"` (`/reload` is
+rebuilding the plugin host, and the session carries on in the new one),
+`"replaced"` (an ACP client loaded the open session again), or
 `"completed"` (a headless run finished).
 
 On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is
@@ -1319,9 +1315,10 @@ the [Hooks price table](/docs/hooks/#rules).
 
 The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
-contract. Wrapping one costs `agent`, `session_read` and `session_write`,
-since every slot can hand a layer text the user or the model wrote, and a
-layer steers what happens next. See [Hooks](/docs/hooks/).
+contract. Wrapping one needs `session_read`, because each slot hands the
+layer text the user or the model wrote. It also needs `agent` and
+`session_write`, what sending a prompt needs, because the layer steers the
+agent. See [Hooks](/docs/hooks/).
 
 `permission.prompt` fires where the permission prompt would show, with
 the prompt as its default. A layer takes `function(prev, req, ctx)` and
@@ -5295,8 +5292,8 @@ maki.provider.auth.get({slug})
 Read the credentials this plugin stored for one of its providers. Returns
 nil when nothing was stored yet, for example before the first login.
 
-Reading the store yields, so this cannot run in a callback that must not
-yield, like a `table.sort` comparator or a metamethod.
+Reading the store yields, so this fails in a callback that cannot yield,
+like a `table.sort` comparator or a metamethod.
 
 **Parameters:**
 
@@ -5854,9 +5851,8 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
 - `{text}` (`string`) What to report. Must not be blank.
 - `{opts?}` (`table`) Options:
   - `session` (`string`) id of a live session.
-  - `task` (`string?`) id of a live subagent of `session`, as `TurnComplete`
-    reports it; the report goes to that subagent instead of the session's
-    own mailbox.
+  - `task` (`string?`) send to this live subagent of `session` instead, by
+    the `data.id` that `TurnComplete` reports.
   - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
     false). Needs the `agent` permission.
   - `display` (`string?`) one-line note for the transcript, shown and saved
@@ -5911,13 +5907,13 @@ maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = 
 maki.session.request_compact({opts?})
 ```
 
-Queues a compaction of a live session, the API behind `/compact`.
+Asks a live session to compact its history, like `/compact`.
 
-Answers once the request is queued, not when the summary lands: a
-running agent compacts before its next request, an idle one when it
-next runs. While one sits unclaimed, a repeat request fails.
-`agent.compact.before` still steers or skips it, and sees it with
-reason `requested`.
+Returns once the request is queued. A running agent compacts before its
+next model request. The TUI compacts an idle session right away, and
+other hosts wait for its next run. A second request fails until the
+first is taken. `agent.compact.before` sees it with reason `requested`
+and can still steer or skip it. `"CompactionDone"` reports the result.
 
 Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
 
@@ -5925,8 +5921,8 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 
 - `{opts?}` (`table`) Options:
   - `session` (`string`) id of a live session.
-  - `task` (`string?`) id of a live subagent of `session`, as `TurnComplete`
-    reports it; that subagent's own conversation compacts.
+  - `task` (`string?`) compact this live subagent of `session` instead, by
+    the `data.id` that `TurnComplete` reports.
   - `instructions` (`string?`) guidance for this one summary, like
     `/compact <text>`.
 
@@ -7631,13 +7627,6 @@ A draft a plugin wrote, restored after a restart, counts as written by
 an unnamed plugin that holds `agent` and `session_write` at most,
 which the status bar calls `a plugin`. So does a rewound or forked
 turn that starts with `/` or `!`, or is `exit`.
-
-`input_edit` needs `input` and `session_read`, plus `agent` and
-`session_write` to change the text, and the editing built-in actions
-need `input`, `agent` and `session_write`. A binding on a key that
-types text, like `a` or `<Paste>`, needs `session_read` in any mode. A
-`plugin.toml` you wrote yourself grants them unless it sets them to
-`false`. A package has to declare them.
 
 ### Offsets and versions
 

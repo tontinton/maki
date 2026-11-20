@@ -1164,9 +1164,8 @@ async fn prompt(
 /// @param text string What to report. Must not be blank.
 /// @param opts table Options:
 ///   `session` (string) id of a live session.
-///   `task` (string?) id of a live subagent of `session`, as `TurnComplete`
-///     reports it; the report goes to that subagent instead of the session's
-///     own mailbox.
+///   `task` (string?) send to this live subagent of `session` instead, by
+///     the `data.id` that `TurnComplete` reports.
 ///   `wake` (boolean) start a TUI turn when it next becomes idle (default
 ///     false). Needs the `agent` permission.
 ///   `display` (string?) one-line note for the transcript, shown and saved
@@ -1243,18 +1242,18 @@ async fn set_mode(
     roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
 }
 
-/// Queues a compaction of a live session, the API behind `/compact`.
+/// Asks a live session to compact its history, like `/compact`.
 ///
-/// Answers once the request is queued, not when the summary lands: a
-/// running agent compacts before its next request, an idle one when it
-/// next runs. While one sits unclaimed, a repeat request fails.
-/// `agent.compact.before` still steers or skips it, and sees it with
-/// reason `requested`.
+/// Returns once the request is queued. A running agent compacts before its
+/// next model request. The TUI compacts an idle session right away, and
+/// other hosts wait for its next run. A second request fails until the
+/// first is taken. `agent.compact.before` sees it with reason `requested`
+/// and can still steer or skip it. `"CompactionDone"` reports the result.
 ///
 /// @param opts table Options:
 ///   session (string) id of a live session.
-///   task (string?) id of a live subagent of `session`, as `TurnComplete`
-///     reports it; that subagent's own conversation compacts.
+///   task (string?) compact this live subagent of `session` instead, by
+///     the `data.id` that `TurnComplete` reports.
 ///   instructions (string?) guidance for this one summary, like
 ///     `/compact <text>`.
 /// @return (boolean|nil, string|nil) true once queued, or nil and an error.
