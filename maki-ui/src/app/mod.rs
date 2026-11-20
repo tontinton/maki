@@ -214,14 +214,21 @@ pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 /// drifted apart. So a new overlay goes in here, where it answers keys, and the
 /// compiler points at every `match` that has to place it.
 ///
-/// This is not the paint order: the permission prompt is drawn under every
-/// picker and float, but defers to a focused Lua window.
+/// This is not the paint order: the permission prompt, pack review and plan
+/// form sit in the bottom panel under every modal, picker and float, yet
+/// answer before the modals and pickers once no alert or focused Lua window
+/// holds the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
     Alert,
-    /// A tool is blocked on it and it owns the bottom panel, so with the pack
-    /// review also up it goes first. The pack review waits on nothing.
+    /// Drawn under only [`Self::Alert`], so a focused Lua window answers
+    /// before the permission prompt, pack review and plan form. An unfocused
+    /// popup never holds the keyboard.
+    FocusedWindow,
+    /// A tool is blocked on it and it owns the bottom panel, hiding the pack
+    /// review and plan form, so after [`Self::FocusedWindow`] it goes before
+    /// both. The pack review waits on nothing.
     Permission,
     PackReview,
     /// Hands `<Tab>` on to the owner under it, see [`PlanFormAction::Passthrough`].
@@ -229,9 +236,6 @@ enum KeyboardOwner {
     Help,
     Usage,
     Btw,
-    /// The focused Lua window takes every key. An unfocused popup never holds
-    /// the keyboard.
-    FocusedWindow,
     Search,
     FilePicker,
     Queue,
@@ -791,9 +795,6 @@ impl App {
 
     fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
         match owner {
-            KeyboardOwner::Permission => {
-                self.permission_prompt.is_open() && self.float_mgr.focused_id().is_none()
-            }
             KeyboardOwner::PlanForm => self.plan_form_active(),
             KeyboardOwner::Queue => self.queue_focused(),
             KeyboardOwner::Chat => true,
