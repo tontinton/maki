@@ -184,8 +184,9 @@ async fn unhosted_snapshot(lua: &Lua, raw: &str) -> Result<JsonValue, String> {
 }
 
 /// One-call snapshot of a session: queue, usage, context, cost, mode, and
-/// status. Reads the focused session, or the one you name in `session`: a
-/// background tab, or a stored session nothing has open.
+/// status. Reads the session of the running tool call, else the focused one,
+/// or the one you name in `session`: a background tab, or a stored session
+/// nothing has open.
 ///
 /// Metadata only, so it needs no permission. Not to be confused with the
 /// `session_read` permission, which guards transcript content
@@ -215,7 +216,7 @@ async fn unhosted_snapshot(lua: &Lua, raw: &str) -> Result<JsonValue, String> {
 /// `list_cost` here: the un-subsidised total for a run arrives on the
 /// `TurnEnd` autocmd, and `maki.model.info` carries the rates behind it.
 ///
-/// @param opts table? `session` (string?) Session id, live or stored. Defaults to the focused one.
+/// @param opts table? `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 /// @return (table|nil, string|nil) Snapshot table, or nil and an error.
 /// @example
 /// local s = maki.session.read()
@@ -231,8 +232,9 @@ async fn read(
     let id = match opts {
         Some(t) => t.opt::<String>("session")?,
         None => None,
-    };
-    // A headless driver installs a provider for the one session it runs. The
+    }
+    .or_else(|| Lineage::current(&lua).session.map(|id| id.to_string()));
+    // A headless driver installs a provider for the sessions it runs. The
     // UI leaves the slot empty and answers from its event loop, which owns
     // the live runtimes. The slot is asked in its own statement, so its
     // borrow ends before anything below parks the task.
@@ -260,7 +262,22 @@ async fn read(
     Ok((Some(json_to_lua(&lua, &snapshot)?), None))
 }
 
-/// The focused tab, or under a headless driver the one session it runs.
+/// The session whose tool call is running, so a tool in a background tab or
+/// in one of many ACP sessions gets its own. Else the focused tab, or under a
+/// single session driver the one it runs.
+async fn calling_session(
+    lua: &Lua,
+    tx: Option<&UnboundedSender<UiAction>>,
+) -> Result<MakiId, String> {
+    match Lineage::current(lua).session {
+        Some(id) => Ok(id),
+        None => focused_session(lua, tx)
+            .await?
+            .parse::<MakiId>()
+            .map_err(|e| e.to_string()),
+    }
+}
+
 async fn focused_session(
     lua: &Lua,
     tx: Option<&UnboundedSender<UiAction>>,
@@ -289,16 +306,15 @@ async fn focused_session(
         .ok_or_else(|| NO_FOCUSED_ERR.to_owned())
 }
 
-async fn named_or_focused(
+async fn named_or_calling(
     lua: &Lua,
     tx: Option<&UnboundedSender<UiAction>>,
     id: Option<String>,
 ) -> Result<MakiId, String> {
-    let raw = match id {
-        Some(id) => id,
-        None => focused_session(lua, tx).await?,
-    };
-    raw.parse::<MakiId>().map_err(|e| e.to_string())
+    match id {
+        Some(raw) => raw.parse::<MakiId>().map_err(|e| e.to_string()),
+        None => calling_session(lua, tx).await,
+    }
 }
 
 /// A live session from memory, unsaved messages included, any other from
@@ -399,7 +415,7 @@ async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> 
 /// `maki.session.export(...)` encodes to the same document as the CLI file.
 /// Copy it with `maki.deepcopy` before editing, which keeps both intact.
 ///
-/// @param opts table? `session` (string?) Session id, live or stored. Defaults to the focused one.
+/// @param opts table? `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 /// @return (table|nil, string|nil) The document, or nil and an error.
 /// @example
 /// local doc = assert(maki.session.export({ session = maki.session.current() }))
@@ -414,7 +430,7 @@ async fn export(
         Some(opts) => opts.opt::<String>("session")?,
         None => None,
     };
-    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let session = try_pair!(named_or_calling(&lua, tx.as_ref(), id).await);
     let session_export = try_pair!(session_export(&lua, tx.as_ref(), session).await);
     Ok((Some(transcript_table(&lua, session_export).await?), None))
 }
@@ -460,7 +476,7 @@ async fn export(
 /// from disk.
 ///
 /// @param opts table? Options:
-///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+///   `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 ///   `window` (string?) `"current"` or an archive id from `maki.session.windows`.
 ///     Defaults to the current window.
 ///   `last` (integer?) only the newest `last` messages.
@@ -485,7 +501,7 @@ async fn messages(
         ),
         None => (None, None, None),
     };
-    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let session = try_pair!(named_or_calling(&lua, tx.as_ref(), id).await);
     if let Some(window) = window.filter(|window| window != CURRENT_WINDOW_ID) {
         let seq = try_pair!(parse_window_id(&window));
         let messages = try_pair!(archive_messages(&lua, session, seq).await);
@@ -504,8 +520,10 @@ async fn messages(
     ))
 }
 
-/// Returns the id of the focused session. Under `maki -p` and the sdk,
-/// that is the one session they run.
+/// Returns the id of the session whose tool call is running, so a tool in a
+/// background tab gets its own tab. Else the focused session, and under
+/// `maki -p` and the sdk the one session they run. ACP has no focused
+/// session, so outside a tool call it fails there.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
 /// @example
@@ -515,7 +533,11 @@ async fn current(
     lua: Lua,
     #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<String>> {
-    Ok(pair(focused_session(&lua, tx.as_ref()).await))
+    Ok(pair(
+        calling_session(&lua, tx.as_ref())
+            .await
+            .map(|id| id.to_string()),
+    ))
 }
 
 /// Returns this plugin's data directory for a session,
@@ -549,12 +571,9 @@ async fn data_dir(
         let named = named
             .map(|raw| raw.parse::<MakiId>().map_err(|e| e.to_string()))
             .transpose()?;
-        let session = match named.or_else(|| Lineage::current(&lua).session) {
+        let session = match named {
             Some(id) => id,
-            None => focused_session(&lua, tx.as_ref())
-                .await?
-                .parse::<MakiId>()
-                .map_err(|e| e.to_string())?,
+            None => calling_session(&lua, tx.as_ref()).await?,
         };
         let state = state_dir(&lua)?;
         Ok(session_data_dir(state.path(), session)
@@ -581,7 +600,7 @@ async fn data_dir(
 /// ```
 ///
 /// @param opts table? Options:
-///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+///   `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 /// @return (table|nil, string|nil) Array of windows, or nil and an error.
 /// @example
 /// for _, window in ipairs(assert(maki.session.windows())) do
@@ -597,7 +616,7 @@ async fn windows(
         Some(opts) => opts.opt::<String>("session")?,
         None => None,
     };
-    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let session = try_pair!(named_or_calling(&lua, tx.as_ref(), id).await);
     let dir = try_pair!(state_dir(&lua));
     let live = live_history(session).is_some();
     let read = spawn_blocking(move || {
@@ -634,7 +653,7 @@ async fn windows(
 /// subagent shows only the turns saved so far.
 ///
 /// @param opts table? Options:
-///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+///   `session` (string?) Session id, live or stored. Defaults to the session of the running tool call, else the focused one.
 ///   `window` (string?) `"current"` or an archive id from `maki.session.windows`.
 ///     Defaults to the current window.
 /// @return (table|nil, string|nil) Array of subagents, or nil and an error.
@@ -655,7 +674,7 @@ async fn subagents(
         ),
         None => (None, None),
     };
-    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let session = try_pair!(named_or_calling(&lua, tx.as_ref(), id).await);
     let live = live_history(session);
     let live_exists = live.is_some();
     let dir = try_pair!(state_dir(&lua));
@@ -1293,9 +1312,10 @@ lua_table! {
     ///
     /// Without a UI, most functions return `nil, "no interactive UI attached"`.
     /// `current`, `read`, `export`, `messages`, `windows`, `subagents`,
-    /// `notify` and `new` without `prompt` or `focus` still work. ACP has no
-    /// focused session, so there `current` fails and the read functions need
-    /// `session`. Hook and event payloads carry it as `session_id`.
+    /// `notify` and `new` without `prompt` or `focus` still work. The readers
+    /// default to the session whose tool call is running, else the focused one.
+    /// ACP has no focused session, so outside a tool call they need `session`
+    /// there. Hook and event payloads carry it as `session_id`.
     "maki.session" => pub(crate) fn create_session_table(
         tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
@@ -1313,7 +1333,7 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arc_swap::ArcSwap;
     use base64::Engine as _;
@@ -1322,6 +1342,7 @@ mod tests {
         History, HistorySnapshot, SharedHeader, SharedMessages, publish_live_history,
         publish_live_session,
     };
+    use maki_agent::cancel::CancelToken;
     use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
     use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
@@ -1337,7 +1358,11 @@ mod tests {
     use crate::api::top::add_top_methods;
     use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
     use crate::plugin_permissions::denied_error;
-    use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
+    use crate::runtime::{TaskCell, TaskHandle};
+    use crate::session_snapshot::{
+        HeadlessMeta, HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN,
+        NO_CALLING_SESSION_ERR, RegisteredSession, STATUS_IDLE, STATUS_STORED,
+    };
     use mlua::Value;
     use serde_json::json;
     use test_case::test_case;
@@ -1402,19 +1427,20 @@ mod tests {
         assert!(!want.exists(), "asking for the dir must not create it");
     }
 
+    /// Runs what follows as a tool call of `session` would.
+    fn serving(lua: &Lua, session: MakiId) {
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.lineage.session = Some(session);
+        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+    }
+
     #[tokio::test]
     async fn data_dir_prefers_the_named_then_the_lineage_session() {
-        use crate::runtime::{TaskCell, TaskHandle};
-        use maki_agent::cancel::CancelToken;
-        use std::sync::Mutex;
-
-        let (serving, focused) = (MakiId::generate(), MakiId::generate());
+        let (serving_id, focused) = (MakiId::generate(), MakiId::generate());
         let tmp = TempDir::new().unwrap();
         let lua = headless_focused_on(focused);
         lua.set_app_data(StateDir::from_path(tmp.path().to_path_buf()));
-        let mut cell = TaskCell::new(CancelToken::none(), None, None);
-        cell.lineage.session = Some(serving);
-        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+        serving(&lua, serving_id);
 
         let (got, err): (Option<String>, Option<String>) = lua
             .load("return session.data_dir()")
@@ -1422,7 +1448,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(err, None);
-        let want = session_data_dir(tmp.path(), serving).join(PLUGIN);
+        let want = session_data_dir(tmp.path(), serving_id).join(PLUGIN);
         assert_eq!(got, Some(want.display().to_string()));
 
         let (got, err): (Option<String>, Option<String>) = lua
@@ -1435,6 +1461,117 @@ mod tests {
         assert_eq!(err, None);
         let want = session_data_dir(tmp.path(), focused).join(PLUGIN);
         assert_eq!(got, Some(want.display().to_string()));
+    }
+
+    /// The slot ACP installs, empty until sessions register.
+    fn acp(lua: &Lua) -> HeadlessSessions {
+        let sessions = HeadlessSessions::default();
+        lua.set_app_data(SessionSnapshotSlot(sessions.provider()));
+        sessions
+    }
+
+    fn register(sessions: &HeadlessSessions, id: MakiId) -> RegisteredSession {
+        let meta = HeadlessMeta {
+            id: id.to_string(),
+            cwd: FACTS_CWD.to_owned(),
+            model: MODEL.to_owned(),
+        };
+        sessions.register(id, &HeadlessSnapshot::default(), meta, || MODE_BUILD)
+    }
+
+    async fn current_and_read(lua: &Lua) -> (Pair<String>, Pair<String>) {
+        lua.load(
+            "local id, err = session.current()
+             local s, read_err = session.read()
+             return id, err, s and s.id, read_err",
+        )
+        .eval_async::<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>()
+        .await
+        .map(|(id, err, read, read_err)| ((id, err), (read, read_err)))
+        .unwrap()
+    }
+
+    /// ACP runs many sessions on one host. A call made for one of them never
+    /// sees another, a closed one leaves nothing behind, and outside a tool
+    /// call there is no session to default to.
+    #[tokio::test]
+    async fn under_acp_id_less_calls_answer_for_the_calling_session_only() {
+        let lua = lua_with_session(None);
+        let sessions = acp(&lua);
+        let (a, b) = (MakiId::generate(), MakiId::generate());
+        let _a = register(&sessions, a);
+        let b_registered = register(&sessions, b);
+        let none_calling = (
+            (None, Some(NO_CALLING_SESSION_ERR.to_owned())),
+            (None, Some(NO_CALLING_SESSION_ERR.to_owned())),
+        );
+
+        assert_eq!(current_and_read(&lua).await, none_calling);
+        serving(&lua, a);
+        let a_answers = ((Some(a.to_string()), None), (Some(a.to_string()), None));
+        assert_eq!(current_and_read(&lua).await, a_answers);
+
+        drop(b_registered);
+        let (_, read_b_err): (Value, Option<String>) = lua
+            .load(format!("return session.read({{ session = '{b}' }})"))
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(read_b_err.is_some(), "a closed session must not read live");
+        assert_eq!(current_and_read(&lua).await, a_answers);
+        lua.remove_app_data::<TaskHandle>();
+        assert_eq!(current_and_read(&lua).await, none_calling);
+    }
+
+    /// The TUI asks for the focused tab unless a tool call runs, and then
+    /// for the tab that call serves, which may be in the background.
+    #[test_case(None ; "focused_tab_outside_a_tool_call")]
+    #[test_case(Some(MakiId::generate()) ; "calling_tab_inside_a_tool_call")]
+    #[tokio::test]
+    async fn ui_read_asks_for_the_calling_tab_else_the_focused_one(calling: Option<MakiId>) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        if let Some(id) = calling {
+            serving(&lua, id);
+        }
+        let asked = std::thread::spawn(move || {
+            let Some(UiAction::Session {
+                req: SessionRequest::Read { id },
+                reply_tx,
+            }) = rx.blocking_recv()
+            else {
+                panic!("expected read request");
+            };
+            reply_tx.send(Ok(json!({ "id": id }))).unwrap();
+            id
+        });
+        let (_, err): (Table, Option<String>) = lua
+            .load("return session.read()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        assert_eq!(asked.join().unwrap(), calling.map(|id| id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn ui_current_names_the_calling_tab_without_asking_the_ui() {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let calling = MakiId::generate();
+        serving(&lua, calling);
+        let (id, err): (Option<String>, Option<String>) = lua
+            .load("return session.current()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!((id, err), (Some(calling.to_string()), None));
+        assert!(rx.try_recv().is_err(), "the focused tab is not asked for");
     }
 
     #[tokio::test]
@@ -2755,12 +2892,15 @@ mod tests {
         assert_eq!(session.cwd, DRIVER_CWD);
     }
 
-    /// ACP installs no slot. The one session it happens to have open must not
-    /// decide where an import lands, or a second open session would move it.
+    /// ACP's slot answers no id-less ask. The one session it happens to have
+    /// open must not decide where an import lands, or a second one would move it.
     #[tokio::test]
     async fn headless_new_without_a_driver_session_lands_where_maki_runs() {
         let (lua, _dir) = headless();
-        let _live = live_unsaved(MakiId::generate(), Vec::new());
+        let open = MakiId::generate();
+        let _live = live_unsaved(open, Vec::new());
+        let sessions = acp(&lua);
+        let _registered = register(&sessions, open);
 
         let id: String = eval(
             &lua,
