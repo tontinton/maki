@@ -98,14 +98,14 @@ struct StdioProcess {
     _stderr: AbortOnDropHandle<()>,
 }
 
-/// `timeout` bounds the handshake and each request after it, as the server
-/// config says.
+/// `startup_timeout` bounds the handshake, `timeout` each request after it, as
+/// the server config says.
 pub async fn connect(
     config: &ServerConfig,
     storage: Option<&StateDir>,
 ) -> Result<Connection, McpError> {
     let name = config.name.as_str();
-    let (service, process) = within(config.timeout, name, async {
+    let (service, process) = within(config.startup_timeout, name, async {
         match &config.transport {
             Transport::Stdio {
                 program,
@@ -848,6 +848,7 @@ mod tests {
         ServerConfig {
             name: SERVER.into(),
             timeout: TIMEOUT,
+            startup_timeout: TIMEOUT,
             always_load: false,
             transport: Transport::Http {
                 url: format!("{base}{MCP_PATH}"),

@@ -1497,6 +1497,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            startup_timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
@@ -1595,6 +1596,7 @@ mod tests {
         ServerConfig {
             name: name.into(),
             timeout: Duration::from_secs(1),
+            startup_timeout: Duration::from_secs(1),
             always_load: false,
             transport: Transport::Stdio {
                 program: MISSING_PROGRAM.into(),
@@ -2257,7 +2259,7 @@ mod tests {
     }
 
     /// `sleep` spawns fine and never answers `initialize`, so its connect only
-    /// ends on the request timeout, far past the shutdown one. Shutdown has to
+    /// ends on the startup timeout, far past the shutdown one. Shutdown has to
     /// preempt it, or quitting during startup hangs.
     #[cfg(unix)]
     #[tokio::test]
