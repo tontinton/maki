@@ -671,6 +671,10 @@ impl Provider for CompatProvider {
         })
     }
 
+    fn needs_model_discovery(&self) -> bool {
+        false
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         let auth = self.auth.lock().unwrap().clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
