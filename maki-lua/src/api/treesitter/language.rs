@@ -1,39 +1,114 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::hash_map::Entry;
+use std::mem;
+use std::sync::{Arc, LazyLock, Mutex};
 
+use libloading::{Library, Symbol};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Table, Value as LuaValue};
+use tree_sitter::{LANGUAGE_VERSION, Language as TsLanguage, MIN_COMPATIBLE_LANGUAGE_VERSION};
+use tree_sitter_language::LanguageFn;
 
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::fs::expand_tilde;
+use crate::api::util::convert::TableExt;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::language::Language;
+use crate::plugin_permissions::{Permission, PluginPermissions, require};
+
+const SYMBOL_PREFIX: &str = "tree_sitter_";
+const LANGUAGE_NOT_FOUND: &str = "language not found";
+const LOAD_FAILED: &str = "cannot load";
+
+type LanguageConstructor = unsafe extern "C" fn() -> *const ();
+
+/// Grammars `add` loaded from a path. Process wide, like the libraries behind them.
+static LOADED_GRAMMARS: LazyLock<Mutex<HashMap<String, TsLanguage>>> =
+    LazyLock::new(Mutex::default);
 
 struct LangRegistry {
     lang_to_filetypes: HashMap<String, Vec<String>>,
     filetype_to_lang: HashMap<String, String>,
 }
 
-/// Registers {lang} for use with tree-sitter.
-/// Call this to confirm a language grammar is available. Like
-/// `vim.treesitter.language.add`. Custom grammar paths are not yet supported.
+/// Registers {lang} for use with tree-sitter. Like `vim.treesitter.language.add`.
+/// Without a `path` it confirms a built-in grammar is available. With one it
+/// loads a compiled parser, such as one nvim-treesitter or Helix installed.
+/// That runs native code, so it needs the `run` permission.
 ///
 /// @param lang string Language name, e.g. `"rust"`.
-/// @param opts table? Options table (the `path` key is not yet supported).
-/// @return (boolean?, string?) `true`, or nil plus an error if {lang} is unknown.
+/// @param opts table? Options table:
+///   - path (string): parser library to load, e.g. `"~/.local/share/nvim/site/parser/nu.so"`.
+///   - symbol_name (string): constructor to call. Default `tree_sitter_{lang}`.
+/// @return (boolean?, string?) `true`, or nil plus an error if {lang} is unknown or fails to load.
 /// @example
 /// if not maki.treesitter.language.add("lua") then return end
 #[lua_fn]
-fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<Pair<bool>> {
-    if let Some(ref opts) = opts
-        && opts.contains_key("path")?
-    {
-        return Err(mlua::Error::runtime(
-            "custom grammar paths not supported yet",
-        ));
-    }
-    if Language::from_name(&lang).is_none() {
-        return Ok(err_pair(format!("language not found: {lang}")));
+fn add(
+    lua: &Lua,
+    #[ctx] grants: PluginPermissions,
+    lang: String,
+    opts: Option<Table>,
+) -> mlua::Result<Pair<bool>> {
+    let opts = opts.as_ref();
+    let Some(path) = opts.opt::<String>("path")? else {
+        if resolve_language(&lang).is_none() {
+            return Ok(err_pair(format!("{LANGUAGE_NOT_FOUND}: {lang}")));
+        }
+        return Ok((Some(true), None));
+    };
+    require(lua, &grants, Permission::Run)?;
+    let mut loaded = LOADED_GRAMMARS
+        .lock()
+        .map_err(|_| mlua::Error::runtime("grammar registry lock poisoned"))?;
+    if let Entry::Vacant(slot) = loaded.entry(lang) {
+        let symbol = opts
+            .opt::<String>("symbol_name")?
+            .unwrap_or_else(|| format!("{SYMBOL_PREFIX}{}", slot.key()));
+        let language = try_pair!(load_grammar(&path, &symbol));
+        tracing::info!(
+            lang = slot.key(),
+            path,
+            abi = language.abi_version(),
+            "loaded tree-sitter grammar"
+        );
+        slot.insert(language);
     }
     Ok((Some(true), None))
+}
+
+fn load_grammar(path: &str, symbol: &str) -> Result<TsLanguage, String> {
+    let path = expand_tilde(path);
+    let display = path.display();
+    // SAFETY: like Neovim, a parser the user points at is trusted native code.
+    let library =
+        unsafe { Library::new(&path) }.map_err(|e| format!("{LOAD_FAILED} {display}: {e}"))?;
+    let language = {
+        // SAFETY: tree-sitter parsers export `tree_sitter_<lang>` with this signature.
+        let constructor: Symbol<LanguageConstructor> = unsafe { library.get(symbol.as_bytes()) }
+            .map_err(|e| format!("no {symbol} in {display}: {e}"))?;
+        // SAFETY: the constructor returns a static `TSLanguage` living in `library`.
+        TsLanguage::new(unsafe { LanguageFn::from_raw(*constructor) })
+    };
+    let abi = language.abi_version();
+    if !(MIN_COMPATIBLE_LANGUAGE_VERSION..=LANGUAGE_VERSION).contains(&abi) {
+        return Err(format!(
+            "{display} has ABI {abi}, supported are {MIN_COMPATIBLE_LANGUAGE_VERSION} to {LANGUAGE_VERSION}"
+        ));
+    }
+    // The language points into the library, so it stays mapped for good.
+    mem::forget(library);
+    Ok(language)
+}
+
+/// A built-in grammar, or one `add` loaded from a path.
+pub(crate) fn resolve_language(lang: &str) -> Option<TsLanguage> {
+    if let Some(builtin) = Language::from_name(lang) {
+        return Some(builtin.ts_language());
+    }
+    LOADED_GRAMMARS
+        .lock()
+        .ok()
+        .and_then(|loaded| loaded.get(lang).cloned())
 }
 
 /// Associates {lang} with one or more filetypes, so you can look up the right
@@ -47,6 +122,7 @@ fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<Pair<bool>
 fn register(
     _lua: &Lua,
     #[ctx] reg: Arc<Mutex<LangRegistry>>,
+    #[ctx] plugin: Arc<str>,
     lang: String,
     filetype: LuaValue,
 ) -> mlua::Result<()> {
@@ -71,6 +147,7 @@ fn register(
         .map_err(|_| mlua::Error::runtime("language registry lock poisoned"))?;
     for ft in &filetypes {
         reg.filetype_to_lang.insert(ft.clone(), lang.clone());
+        maki_highlight::treesitter::alias(&plugin, ft, &lang);
     }
     let existing = reg.lang_to_filetypes.entry(lang.clone()).or_default();
     for ft in filetypes {
@@ -103,7 +180,7 @@ fn get_lang(
         return Ok(Some(lang.clone()));
     }
     drop(guard);
-    if Language::from_name(&filetype).is_some() {
+    if resolve_language(&filetype).is_some() {
         return Ok(Some(filetype));
     }
     Ok(None)
@@ -145,9 +222,8 @@ fn get_filetypes(
 /// for _, nt in ipairs(info.node_types) do print(nt) end
 #[lua_fn]
 fn inspect(lua: &Lua, lang: String) -> mlua::Result<Table> {
-    let language = Language::from_name(&lang)
-        .ok_or_else(|| mlua::Error::runtime(format!("language not found: {lang}")))?
-        .ts_language();
+    let language = resolve_language(&lang)
+        .ok_or_else(|| mlua::Error::runtime(format!("{LANGUAGE_NOT_FOUND}: {lang}")))?;
 
     let tbl = lua.create_table()?;
     tbl.raw_set("abi_version", language.abi_version())?;
@@ -187,17 +263,82 @@ lua_table! {
     /// maki.treesitter.language.add("lua")
     /// maki.treesitter.language.register("lua", "luau")
     /// ```
-    extend "maki.treesitter.language" => fn language_fns(reg: Arc<Mutex<LangRegistry>>), DOCS [
-        add, register(reg), get_lang(reg), get_filetypes(reg), inspect,
+    extend "maki.treesitter.language" => fn language_fns(reg: Arc<Mutex<LangRegistry>>, grants: PluginPermissions, plugin: Arc<str>), DOCS [
+        add(grants), register(reg, plugin), get_lang(reg), get_filetypes(reg), inspect,
     ]
 }
 
-pub(crate) fn create_language_module(lua: &Lua) -> mlua::Result<Table> {
+pub(crate) fn create_language_module(
+    lua: &Lua,
+    grants: &PluginPermissions,
+    plugin: Arc<str>,
+) -> mlua::Result<Table> {
     let reg = Arc::new(Mutex::new(LangRegistry {
         lang_to_filetypes: HashMap::new(),
         filetype_to_lang: HashMap::new(),
     }));
     let t = lua.create_table()?;
-    language_fns(&t, lua, reg)?;
+    language_fns(&t, lua, reg, grants.clone(), plugin)?;
     Ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Function, Lua};
+
+    use super::*;
+    use crate::plugin_permissions::PERMISSION_DENIED;
+
+    const MISSING_PARSER: &str = "/nonexistent/parser/nu.so";
+    const PLUGIN: &str = "language_test";
+
+    fn add_fn(lua: &Lua, grants: &PluginPermissions) -> Function {
+        create_language_module(lua, grants, Arc::from(PLUGIN))
+            .unwrap()
+            .get("add")
+            .unwrap()
+    }
+
+    fn path_opts(lua: &Lua) -> Table {
+        let opts = lua.create_table().unwrap();
+        opts.set("path", MISSING_PARSER).unwrap();
+        opts
+    }
+
+    #[test]
+    fn add_without_a_path_confirms_a_built_in_grammar_without_run() {
+        let lua = Lua::new();
+        let add = add_fn(&lua, &PluginPermissions::denied());
+        let answer: Pair<bool> = add.call("lua").unwrap();
+        assert_eq!(answer, (Some(true), None));
+    }
+
+    #[test]
+    fn add_without_a_path_rejects_an_unknown_grammar() {
+        let lua = Lua::new();
+        let add = add_fn(&lua, &PluginPermissions::denied());
+        let (ok, err): Pair<bool> = add.call("cobol").unwrap();
+        assert_eq!(ok, None);
+        assert!(err.unwrap().starts_with(LANGUAGE_NOT_FOUND));
+    }
+
+    #[test]
+    fn add_with_a_path_needs_run() {
+        let lua = Lua::new();
+        let add = add_fn(&lua, &PluginPermissions::denied());
+        let err = add
+            .call::<mlua::MultiValue>(("nu", path_opts(&lua)))
+            .unwrap_err();
+        assert!(err.to_string().contains(PERMISSION_DENIED), "{err}");
+    }
+
+    #[test]
+    fn add_with_a_missing_library_answers_an_error() {
+        let lua = Lua::new();
+        let add = add_fn(&lua, &PluginPermissions::trusted());
+        let (ok, err): Pair<bool> = add.call(("nu_missing", path_opts(&lua))).unwrap();
+        assert_eq!(ok, None);
+        assert!(err.unwrap().starts_with(LOAD_FAILED));
+        assert!(resolve_language("nu_missing").is_none());
+    }
 }

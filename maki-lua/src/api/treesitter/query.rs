@@ -1,24 +1,31 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
+use maki_highlight::predicates::predicates_hold;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Lua, MultiValue, Value as LuaValue};
-use regex::{Error as RegexError, Regex};
-use tree_sitter::{Query, QueryCursor, QueryPredicateArg, StreamingIterator};
+use regex::Regex;
+use tree_sitter::{Language as TsLanguage, Query, QueryCursor, StreamingIterator};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::language::Language;
 
+use super::language::resolve_language;
 use super::node::LuaNode;
 
-const KNOWN_PREDICATES: &[&str] = &[
-    "eq?",
-    "match?",
-    "lua-match?",
-    "contains?",
-    "has-ancestor?",
-    "has-parent?",
-];
+const HIGHLIGHTS_QUERY: &str = "highlights";
+const UNKNOWN_LANGUAGE: &str = "unknown language";
+
+struct SetQuery {
+    owner: Arc<str>,
+    query: Arc<Query>,
+}
+
+/// Keyed by language and query name.
+type QueryRegistry = HashMap<(String, String), SetQuery>;
+
+/// Queries `set` replaced. Shared by all plugins, like in Neovim, but each
+/// leaves with the plugin that set it.
+static SET_QUERIES: LazyLock<Mutex<QueryRegistry>> = LazyLock::new(Mutex::default);
 
 #[allow(non_upper_case_globals)]
 const iter_captures__doc: FnDoc = FnDoc {
@@ -141,23 +148,78 @@ lua_class! {
 /// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
 #[lua_fn]
 fn parse(_lua: &Lua, lang: String, query: String) -> mlua::Result<LuaQuery> {
-    let ts_lang = Language::from_name(&lang)
-        .ok_or_else(|| mlua::Error::runtime(format!("unknown language: {lang}")))?
-        .ts_language();
-    let q = Query::new(&ts_lang, &query)
-        .map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))?;
+    let q = compile(&known_language(&lang)?, &query)?;
     Ok(LuaQuery { inner: Arc::new(q) })
 }
 
-/// Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
+fn known_language(lang: &str) -> mlua::Result<TsLanguage> {
+    resolve_language(lang)
+        .ok_or_else(|| mlua::Error::runtime(format!("{UNKNOWN_LANGUAGE}: {lang}")))
+}
+
+fn compile(ts_lang: &TsLanguage, query: &str) -> mlua::Result<Query> {
+    Query::new(ts_lang, query).map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))
+}
+
+/// Looks up the query {name} for {lang} that `set()` gave it. There are no
+/// built-in queries yet, so anything else returns nil.
 ///
 /// @param lang string Language name.
 /// @param name string Query name, e.g. `"highlights"`.
 /// @return (Query|nil) Query object, or nil if not found.
 #[lua_fn]
 fn get(_lua: &Lua, lang: String, name: String) -> mlua::Result<Option<LuaQuery>> {
-    let _ = (lang, name);
-    Ok(None)
+    let queries = SET_QUERIES
+        .lock()
+        .map_err(|_| mlua::Error::runtime("query registry lock poisoned"))?;
+    Ok(queries.get(&(lang, name)).map(|set| LuaQuery {
+        inner: Arc::clone(&set.query),
+    }))
+}
+
+/// Sets the query {name} for {lang} to {text}, like `vim.treesitter.query.set`.
+/// A `highlights` query makes code in {lang} highlight with tree-sitter instead
+/// of the built-in syntaxes, in chat code blocks and `maki.ui.highlight`.
+/// Throws if the language is unknown or the query has a syntax error.
+///
+/// @param lang string Language name.
+/// @param name string Query name, e.g. `"highlights"`.
+/// @param text string Tree-sitter S-expression query.
+/// @example
+/// maki.treesitter.language.add("nu", { path = "~/.local/share/nvim/site/parser/nu.so" })
+/// local text = assert(maki.fs.read("~/.local/share/nvim/site/queries/nu/highlights.scm"))
+/// maki.treesitter.query.set("nu", "highlights", text)
+#[lua_fn]
+fn set(
+    _lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    lang: String,
+    name: String,
+    text: String,
+) -> mlua::Result<()> {
+    let ts_lang = known_language(&lang)?;
+    let query = Arc::new(compile(&ts_lang, &text)?);
+    if name == HIGHLIGHTS_QUERY {
+        maki_highlight::treesitter::register(&plugin, &lang, ts_lang, Arc::clone(&query));
+    }
+    SET_QUERIES
+        .lock()
+        .map_err(|_| mlua::Error::runtime("query registry lock poisoned"))?
+        .insert(
+            (lang, name),
+            SetQuery {
+                owner: plugin,
+                query,
+            },
+        );
+    Ok(())
+}
+
+pub(crate) fn forget_plugin_queries(plugin: &str) {
+    SET_QUERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, set| *set.owner != *plugin);
 }
 
 lua_table! {
@@ -169,8 +231,8 @@ lua_table! {
     /// ```lua
     /// local q = maki.treesitter.query.parse("lua", "(string) @str")
     /// ```
-    "maki.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
-        parse, get,
+    "maki.treesitter.query" => pub(crate) fn create_query_module(plugin: Arc<str>), DOCS [
+        parse, get, set(plugin),
     ]
 }
 
@@ -350,24 +412,6 @@ fn collect_matches(query: &Query, args: &IterArgs) -> mlua::Result<Vec<MatchEntr
     Ok(results)
 }
 
-#[derive(Clone, Copy)]
-struct PredicateModifiers {
-    negated: bool,
-    any: bool,
-}
-
-fn parse_predicate_op(op: &str) -> (PredicateModifiers, &str) {
-    let (negated, rest) = op
-        .strip_prefix("not-")
-        .map(|r| (true, r))
-        .unwrap_or((false, op));
-    let (any, base) = rest
-        .strip_prefix("any-")
-        .map(|r| (true, r))
-        .unwrap_or((false, rest));
-    (PredicateModifiers { negated, any }, base)
-}
-
 fn evaluate_predicates(
     query: &Query,
     pattern_index: usize,
@@ -384,218 +428,82 @@ fn evaluate_predicates(
     predicates_hold(query, pattern_index, captures, source, regex_cache)
 }
 
-/// Whether {op}, with its `not-` and `any-` prefixes, is one
-/// [`predicates_hold`] knows. Tree-sitter itself only checks `eq?`,
-/// `match?` and `any-of?`, and hands the rest over untouched.
-pub(crate) fn is_known_predicate(op: &str) -> bool {
-    KNOWN_PREDICATES.contains(&parse_predicate_op(op).1)
-}
-
-/// The first regex of a `match?` or `lua-match?` in {pattern}, `not-` and
-/// `any-` forms included, that [`predicates_hold`] could not compile, since
-/// there it only makes the predicate fail.
-pub(crate) fn broken_regex(query: &Query, pattern: usize) -> Option<(&str, RegexError)> {
-    query
-        .general_predicates(pattern)
-        .iter()
-        .find_map(|predicate| {
-            let (_, base_op) = parse_predicate_op(&predicate.operator);
-            let ("match?" | "lua-match?", Some(QueryPredicateArg::String(regex))) =
-                (base_op, predicate.args.get(1))
-            else {
-                return None;
-            };
-            Regex::new(regex).err().map(|e| (regex.as_ref(), e))
-        })
-}
-
-/// The predicates tree-sitter leaves to its caller. `#set!` never gets
-/// here: tree-sitter files it under the pattern's property settings.
-pub(crate) fn predicates_hold(
-    query: &Query,
-    pattern_index: usize,
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &[u8],
-    regex_cache: &mut HashMap<String, Option<Regex>>,
-) -> bool {
-    for predicate in query.general_predicates(pattern_index) {
-        let (mods, base_op) = parse_predicate_op(predicate.operator.as_ref());
-        let args = &predicate.args;
-
-        match base_op {
-            "eq?" if eval_eq(captures, source, args, mods.any) == mods.negated => {
-                return false;
-            }
-            "match?" | "lua-match?"
-                if eval_match(captures, source, args, mods.any, regex_cache) == mods.negated =>
-            {
-                return false;
-            }
-            "contains?" if eval_contains(captures, source, args, mods.any) == mods.negated => {
-                return false;
-            }
-            "any-of?" if eval_any_of(captures, source, args) == mods.negated => {
-                return false;
-            }
-            "has-ancestor?" if eval_has_ancestor(captures, args) == mods.negated => {
-                return false;
-            }
-            "has-parent?" if eval_has_parent(captures, args) == mods.negated => {
-                return false;
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
-fn capture_text<'a>(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &'a [u8],
-    idx: u32,
-) -> Option<&'a str> {
-    captures
-        .iter()
-        .find(|c| c.index == idx)
-        .and_then(|c| std::str::from_utf8(&source[c.node.start_byte()..c.node.end_byte()]).ok())
-}
-
-fn resolve_arg<'a>(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &'a [u8],
-    arg: &'a QueryPredicateArg,
-) -> Option<&'a str> {
-    match arg {
-        QueryPredicateArg::Capture(idx) => capture_text(captures, source, *idx),
-        QueryPredicateArg::String(s) => Some(s.as_ref()),
-    }
-}
-
-fn eval_eq(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &[u8],
-    args: &[QueryPredicateArg],
-    any: bool,
-) -> bool {
-    let (Some(lhs), Some(rhs)) = (
-        args.first().and_then(|a| resolve_arg(captures, source, a)),
-        args.get(1).and_then(|a| resolve_arg(captures, source, a)),
-    ) else {
-        return false;
-    };
-    if any {
-        lhs.lines().any(|line| line == rhs)
-    } else {
-        lhs == rhs
-    }
-}
-
-fn eval_match(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &[u8],
-    args: &[QueryPredicateArg],
-    any: bool,
-    regex_cache: &mut HashMap<String, Option<Regex>>,
-) -> bool {
-    let Some(text) = args.first().and_then(|a| resolve_arg(captures, source, a)) else {
-        return false;
-    };
-    let Some(QueryPredicateArg::String(pattern)) = args.get(1) else {
-        return false;
-    };
-    let re = regex_cache.entry(pattern.to_string()).or_insert_with(|| {
-        Regex::new(pattern.as_ref())
-            .inspect_err(|_| tracing::debug!(pattern = pattern.as_ref(), "invalid regex predicate"))
-            .ok()
-    });
-    let Some(re) = re else { return false };
-    if any {
-        text.lines().any(|line| re.is_match(line))
-    } else {
-        re.is_match(text)
-    }
-}
-
-fn eval_contains(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &[u8],
-    args: &[QueryPredicateArg],
-    any: bool,
-) -> bool {
-    let Some(text) = args.first().and_then(|a| resolve_arg(captures, source, a)) else {
-        return false;
-    };
-    let Some(needle) = args.get(1).and_then(|a| resolve_arg(captures, source, a)) else {
-        return false;
-    };
-    if any {
-        text.lines().any(|line| line.contains(needle))
-    } else {
-        text.contains(needle)
-    }
-}
-
-fn eval_any_of(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    source: &[u8],
-    args: &[QueryPredicateArg],
-) -> bool {
-    let Some(QueryPredicateArg::Capture(idx)) = args.first() else {
-        return false;
-    };
-    let Some(text) = capture_text(captures, source, *idx) else {
-        return false;
-    };
-    args[1..].iter().any(|arg| match arg {
-        QueryPredicateArg::String(s) => text == s.as_ref(),
-        QueryPredicateArg::Capture(idx) => {
-            capture_text(captures, source, *idx).is_some_and(|t| t == text)
-        }
-    })
-}
-
-fn eval_has_ancestor(
-    captures: &[tree_sitter::QueryCapture<'_>],
-    args: &[QueryPredicateArg],
-) -> bool {
-    let Some(QueryPredicateArg::Capture(idx)) = args.first() else {
-        return false;
-    };
-    let Some(QueryPredicateArg::String(type_name)) = args.get(1) else {
-        return false;
-    };
-    let Some(cap) = captures.iter().find(|c| c.index == *idx) else {
-        return false;
-    };
-    let mut current = cap.node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == type_name.as_ref() {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
-}
-
-fn eval_has_parent(captures: &[tree_sitter::QueryCapture<'_>], args: &[QueryPredicateArg]) -> bool {
-    let Some(QueryPredicateArg::Capture(idx)) = args.first() else {
-        return false;
-    };
-    let Some(QueryPredicateArg::String(type_name)) = args.get(1) else {
-        return false;
-    };
-    let Some(cap) = captures.iter().find(|c| c.index == *idx) else {
-        return false;
-    };
-    cap.node
-        .parent()
-        .is_some_and(|p| p.kind() == type_name.as_ref())
-}
-
 fn lua_to_usize(v: LuaValue) -> Option<usize> {
     match v {
         LuaValue::Integer(n) => Some(n as usize),
         LuaValue::Number(n) => Some(n as usize),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Lua, Table};
+
+    use super::*;
+
+    const LANG: &str = "lua";
+    const FOLDS: &str = "folds";
+    const LOCALS: &str = "locals";
+    const FOLDS_QUERY: &str = "(function_declaration) @fold";
+    const FOLD_CAPTURE: &str = "fold";
+    const PLUGIN: &str = "query_test";
+    const FORGOTTEN_PLUGIN: &str = "query_test_forgotten";
+
+    fn query_module(lua: &Lua) -> Table {
+        query_module_of(lua, PLUGIN)
+    }
+
+    fn query_module_of(lua: &Lua, plugin: &str) -> Table {
+        create_query_module(lua, Arc::from(plugin)).unwrap()
+    }
+
+    fn set_query(query: &Table, name: &str) {
+        query
+            .get::<mlua::Function>("set")
+            .unwrap()
+            .call::<()>((LANG, name, FOLDS_QUERY))
+            .unwrap();
+    }
+
+    fn get_query(query: &Table, name: &str) -> Option<mlua::AnyUserData> {
+        query
+            .get::<mlua::Function>("get")
+            .unwrap()
+            .call((LANG, name))
+            .unwrap()
+    }
+
+    #[test]
+    fn get_returns_the_query_set_gave_it() {
+        let lua = Lua::new();
+        let query = query_module(&lua);
+        set_query(&query, FOLDS);
+        let got = get_query(&query, FOLDS).unwrap();
+        let got = got.borrow::<LuaQuery>().unwrap();
+        assert_eq!(got.inner.capture_names(), [FOLD_CAPTURE]);
+    }
+
+    #[test]
+    fn a_set_query_is_shared_until_its_plugin_is_forgotten() {
+        let lua = Lua::new();
+        set_query(&query_module_of(&lua, FORGOTTEN_PLUGIN), LOCALS);
+        let other = query_module(&lua);
+        assert!(get_query(&other, LOCALS).is_some());
+
+        forget_plugin_queries(FORGOTTEN_PLUGIN);
+
+        assert!(get_query(&other, LOCALS).is_none());
+    }
+
+    #[test]
+    fn set_rejects_an_unknown_language() {
+        let lua = Lua::new();
+        let err = query_module(&lua)
+            .get::<mlua::Function>("set")
+            .unwrap()
+            .call::<()>(("cobol", HIGHLIGHTS_QUERY, FOLDS_QUERY))
+            .unwrap_err();
+        assert!(err.to_string().contains(UNKNOWN_LANGUAGE), "{err}");
     }
 }
