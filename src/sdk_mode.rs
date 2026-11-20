@@ -29,7 +29,6 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use maki_storage::stdin;
@@ -458,7 +457,6 @@ pub struct SdkParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -556,7 +554,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         cli,
         resumed,
         claim,
-        storage,
         model,
         config,
         permissions_config,
@@ -593,7 +590,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         initial_wd: cwd.clone(),
         resumed,
         claim,
-        storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         unattended: false,
         host_prompt: cli.host_prompt(),

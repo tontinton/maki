@@ -10,9 +10,9 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_providers::{Message, RequestOptions, Timeouts};
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
-use maki_storage::{StateDir, blocking};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -425,11 +425,8 @@ pub struct InteractiveParams {
     pub initial_wd: PathBuf,
     pub resumed: Resumed,
     /// The right to write [`Self::resumed`]'s session, taken before its
-    /// transcript was read.
+    /// transcript was read, in the dir it was read from.
     pub claim: SessionClaim,
-    /// Where the transcript is written. The same dir the caller resolved the
-    /// session from, so a run cannot read one session and write another.
-    pub storage: StateDir,
     pub yolo: bool,
     /// Nobody answers permission prompts, so they are denied at once instead
     /// of waiting forever.
@@ -559,7 +556,6 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
-            params.storage,
             mailbox.clone(),
             track_spend,
             &working_dir,
@@ -886,6 +882,7 @@ mod tests {
     };
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
+    use maki_storage::StateDir;
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1166,7 +1163,6 @@ mod tests {
             initial_wd: tmp.path().to_path_buf(),
             resumed: Resumed::empty(SessionRef::from(id)),
             claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
-            storage: dir,
             yolo: false,
             unattended: true,
             host_prompt: HostPrompt::default(),
@@ -1504,7 +1500,6 @@ mod tests {
         let track = SessionTrack::open(
             Resumed::empty(SessionRef::from(id)),
             claim,
-            dir,
             mailbox,
             Arc::default(),
             CWD,
