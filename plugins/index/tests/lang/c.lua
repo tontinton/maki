@@ -2,6 +2,7 @@
 -- C-header constructs (typedefs, enums, includes, guards) work the same way
 -- under both `c` and `cpp`. C++-specific syntax lives in cpp.lua.
 
+local indexer = require("indexer")
 local th = require("maki.test_helpers")
 local helpers = require("tests.helpers")
 local case = th.case
@@ -293,4 +294,13 @@ void process(const char *input, size_t len);
       "void process(const char *input, size_t len)",
     })
   end
+end)
+
+-- One grammar that parsed most of the file has already reported its own error
+-- the usual way; the fallback marker is for a file another grammar could only
+-- partly read.
+case("c_partial_parse_adds_no_fallback_note", function()
+  local out = idx("int f(){}\nint g( {\nint h(){}\n", "c")
+  has(out, { "int f()", "int h()" })
+  lacks(out, { indexer.PARTIAL_INDEX_NOTE })
 end)
