@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 maki-highlight = { workspace = true }
+pulldown-cmark = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 

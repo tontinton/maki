@@ -9,8 +9,8 @@ use crate::markdown::{
 use crate::theme;
 
 use maki_config::ThinkingLines;
-use maki_markdown::code_block_start;
 use maki_markdown::render::{Line as RLine, Renderer};
+use maki_markdown::render_start_from;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -85,9 +85,11 @@ fn header(line_count: usize, expandable: bool) -> Line<'static> {
 /// starts at its fence and stays there while the block grows, so a streaming
 /// renderer can highlight just the new lines instead of the whole block on
 /// every frame. That only holds while the start stays put, so moving it
-/// starts over with a fresh renderer.
+/// starts over with a fresh renderer. `settled` is the last start whose first
+/// line had ended, which later frames find their start from.
 pub(crate) struct LiveTail {
     start: usize,
+    settled: usize,
     renderer: Renderer,
 }
 
@@ -95,6 +97,7 @@ impl Default for LiveTail {
     fn default() -> Self {
         Self {
             start: 0,
+            settled: 0,
             renderer: Renderer::streaming_wrapped(),
         }
     }
@@ -103,10 +106,11 @@ impl Default for LiveTail {
 impl LiveTail {
     fn render(&mut self, text: &str, start: usize, width: u16) -> Vec<RLine> {
         if start != self.start {
-            *self = Self {
-                start,
-                ..Self::default()
-            };
+            self.start = start;
+            self.renderer = Renderer::streaming_wrapped();
+        }
+        if text[start..].contains('\n') {
+            self.settled = start;
         }
         self.renderer.render(&text[start..], width)
     }
@@ -127,8 +131,9 @@ pub(crate) fn render_tail(
     mut live: Option<&mut LiveTail>,
 ) -> Option<Vec<Line<'static>>> {
     let mut source_lines = rows.saturating_add(MIN_TRUNCATABLE_LINES);
+    let settled = live.as_ref().map_or(0, |live| live.settled);
     loop {
-        let start = tail_start(text, source_lines);
+        let start = tail_start(text, source_lines, settled);
         let whole = start == 0;
         let semantic = match live.as_deref_mut() {
             Some(live) => live.render(text, start, width),
@@ -147,14 +152,15 @@ pub(crate) fn render_tail(
     }
 }
 
-/// Where the end of `text` holding its last `min_lines` lines starts. If that
-/// is inside a code block it starts at the opening fence instead, so the code
-/// still renders as code.
-fn tail_start(text: &str, min_lines: usize) -> usize {
+/// Where the end of `text` holding its last `min_lines` lines starts, moved
+/// back when the text would read differently from there (see
+/// [`render_start_from`]). Only the text from a live tail's settled start is
+/// parsed.
+fn tail_start(text: &str, min_lines: usize, settled: usize) -> usize {
     let Some((newline, _)) = text.rmatch_indices('\n').nth(min_lines.saturating_sub(1)) else {
         return 0;
     };
-    code_block_start(text, newline + 1)
+    render_start_from(text, settled, newline + 1)
 }
 
 fn is_blank(line: &Line<'_>) -> bool {
@@ -213,6 +219,13 @@ mod tests {
         format!("intro\n```rust\n{}", "let a = 1;\n".repeat(MANY))
     }
 
+    fn quote_with_lazy_lines() -> String {
+        (1..=MANY)
+            .map(|n| format!("> line {n:02}\nlazy {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Rendering only the end of the text must match the bottom of the full
     /// render, or the rows would change when the reader expands them. A live
     /// tail fed in chunks carries highlighter state between frames, so it has
@@ -222,6 +235,8 @@ mod tests {
     #[test_case(steps(MANY) ; "many_short_lines")]
     #[test_case(fenced_code() ; "ends_after_a_code_block")]
     #[test_case(open_fence() ; "ends_inside_a_code_block")]
+    #[test_case("1. step\n".repeat(MANY) ; "list_numbered_one_throughout")]
+    #[test_case(quote_with_lazy_lines() ; "quote_with_lazy_lines")]
     fn render_tail_matches_the_bottom_of_the_full_render(text: String) {
         let full = paint_semantic(
             &Renderer::new().render(&text, WIDTH),
