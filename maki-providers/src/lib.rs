@@ -15,6 +15,8 @@ pub mod spec;
 /// Tests only, here and in other crates. Always built because a cargo feature
 /// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
+#[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
+mod tls;
 pub mod tokens;
 pub(crate) mod types;
 

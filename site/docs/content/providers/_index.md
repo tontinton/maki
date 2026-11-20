@@ -50,6 +50,10 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API.
 
+### Self-signed certificates
+
+Maki checks provider certificates against the operating system's trust store. To use an endpoint with a self-signed certificate, add that certificate to the store. On Linux, you can instead point `SSL_CERT_FILE` at a bundle that holds it and the public CAs. Maki accepts a self-signed certificate from the store when the server presents that exact certificate, even if it has the CA flag set, as `openssl req -x509` makes by default. The certificate must name the host in the base URL, and it must be in date.
+
 ## Built-in Providers
 
 `deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
