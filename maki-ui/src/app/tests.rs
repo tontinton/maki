@@ -7684,6 +7684,32 @@ fn permission_waits_for_a_focused_window(focused: bool) {
     assert!(!app.permission_prompt.is_open());
 }
 
+#[test]
+fn focused_window_yields_to_permission_before_plan_form() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    open_plan_form(&mut app);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_permission_prompt(&mut app);
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedWindow);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(took_a_key(&mut events));
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert!(app.permission_prompt.is_open());
+
+    app.float_mgr.close_all();
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+    assert!(actions.is_empty());
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+}
+
 fn open_alert(app: &mut App) {
     app.open_alert("alert".into());
 }
@@ -13440,14 +13466,14 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
     assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
 }
 
-#[test_case(KeyboardOwner::Alert, KeyboardOwner::Permission ; "alert_over_permission")]
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::FocusedWindow ; "alert_over_focused_window")]
+#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Permission ; "focused_window_over_permission")]
 #[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
 #[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
 #[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
 #[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
 #[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
-#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
-#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::Search ; "btw_over_search")]
 #[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
 #[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
 #[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
