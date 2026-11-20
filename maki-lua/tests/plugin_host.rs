@@ -9377,3 +9377,48 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
 }
+
+#[test]
+fn a_plugin_can_read_a_providers_usage() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-usage",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+  fetch_usage = function(ctx)
+    return {
+      plan = "lite",
+      limits = { { label = "5-hour", percentage = 42, reset_at = 1800000000000 } },
+    }
+  end,
+})
+maki.api.register_tool({
+  name = "read_usage",
+  description = "reads provider usage",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-usage")
+    if not usage then return { llm_output = "err: " .. tostring(err), is_error = true } end
+    return { llm_output = usage.plan .. " " .. usage.limits[1].label .. " " .. tostring(usage.limits[1].percentage) }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    assert!(
+        maki_providers::plugin::is_registered("acme-usage"),
+        "provider not registered"
+    );
+    let out = exec_tool(&reg, "read_usage", json!({})).unwrap();
+    assert_eq!(out, "lite 5-hour 42");
+}

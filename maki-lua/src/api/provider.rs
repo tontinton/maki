@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
 use crate::runtime::{DeferredCallback, Request, host_senders};
 
@@ -650,6 +650,50 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
     Ok(owner.granted_providers.contains(&slug))
 }
 
+/// The provider's own usage limits, the data behind `/usage`. A limit carries
+/// a provider label, a used percentage, its reset time in epoch milliseconds
+/// and a free-form detail. `plan` and `by_model_today` come back when the
+/// provider reports them.
+///
+/// A provider with no usage endpoint answers nil and an error, as does a
+/// failed fetch. The call fetches live data, so a plugin that polls should
+/// space its calls out.
+///
+/// @param slug string Provider name, such as `"zai"`.
+/// @return (table|nil, string|nil) Usage, or nil and an error string.
+/// @example
+/// local usage, err = maki.provider.usage("zai")
+/// if usage then
+///   for _, limit in ipairs(usage.limits or {}) do
+///     maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+///   end
+/// end
+#[lua_fn]
+async fn usage(lua: Lua, slug: String) -> LuaResult<Pair<LuaValue>> {
+    let lookup = slug.clone();
+    let provider = try_pair!(
+        maki_storage::blocking(move || {
+            maki_providers::provider::provider_for_slug(
+                &lookup,
+                maki_providers::Timeouts::default(),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+    );
+    let usage = try_pair!(provider.fetch_usage().await);
+    let Some(usage) = usage else {
+        return Ok(err_pair(format!("{slug} does not report usage")));
+    };
+    let value = try_pair!(usage_to_lua(&lua, &usage));
+    Ok((Some(value), None))
+}
+
+fn usage_to_lua(lua: &Lua, usage: &maki_providers::ProviderUsage) -> LuaResult<LuaValue> {
+    let json = serde_json::to_value(usage).map_err(mlua::Error::external)?;
+    json_to_lua(lua, &json)
+}
+
 /// Register a provider this plugin implements. Its models are addressed as
 /// `<slug>/<model>` and appear in the model picker and in `/model`.
 ///
@@ -1111,6 +1155,7 @@ lua_table! {
     "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
         register(perms, owner, egress, grants),
         is_selected(owner),
+        usage,
         http_error,
     ]
 }
@@ -1201,6 +1246,51 @@ mod tests {
         for slot in HookSlot::ALL {
             assert_eq!(hook_slot(slot.spec().name), Some(slot));
         }
+    }
+
+    #[test]
+    fn usage_table_carries_the_limits_and_plan() {
+        let lua = Lua::new();
+        let usage = maki_providers::ProviderUsage {
+            plan: Some("lite".into()),
+            by_model_today: vec![maki_providers::ModelUsageRow {
+                model: "glm-5".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                spend_microdollars: 250_000,
+            }],
+            limits: vec![maki_providers::UsageLimit {
+                label: "5-hour".into(),
+                percentage: Some(42),
+                reset_at: Some(1_800_000_000_000),
+                detail: None,
+            }],
+        };
+
+        let value = usage_to_lua(&lua, &usage).unwrap();
+        let json = lua_to_json(&lua, &value).unwrap();
+        assert_eq!(json["plan"], json!("lite"));
+        assert_eq!(json["by_model_today"][0]["model"], json!("glm-5"));
+        assert_eq!(
+            json["by_model_today"][0]["spend_microdollars"],
+            json!(250_000)
+        );
+        assert_eq!(json["limits"][0]["label"], json!("5-hour"));
+        assert_eq!(json["limits"][0]["percentage"], json!(42));
+        assert_eq!(json["limits"][0]["reset_at"], json!(1_800_000_000_000u64));
+    }
+
+    #[tokio::test]
+    async fn usage_of_an_unknown_provider_returns_an_error_pair() {
+        let lua = provider_lua(true);
+        let (value, error): (LuaValue, Option<String>) = lua
+            .load("return provider.usage('no-such-provider-xyz')")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(value.is_nil());
+        assert!(error.is_some(), "an unknown slug must say why");
     }
 
     /// `build_body(ctx, body, model, opts)`: the fields the signature names
