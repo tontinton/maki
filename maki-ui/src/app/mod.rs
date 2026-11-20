@@ -214,7 +214,7 @@ pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 /// compiler points at every `match` that has to place it.
 ///
 /// This is not the paint order: the permission prompt is drawn under every
-/// picker and float, yet answers first.
+/// picker and float, but defers to a focused Lua window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
@@ -795,6 +795,9 @@ impl App {
 
     fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
         match owner {
+            KeyboardOwner::Permission => {
+                self.permission_prompt.is_open() && self.float_mgr.focused_id().is_none()
+            }
             KeyboardOwner::PlanForm => self.plan_form_active(),
             KeyboardOwner::Queue => self.queue_focused(),
             KeyboardOwner::Chat => true,
