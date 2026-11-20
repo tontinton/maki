@@ -38,11 +38,20 @@ const ENV_VAR: &str = "OPENCODE_API_KEY";
 const ZEN_API_URL: &str = "https://opencode.ai/zen/v1";
 const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
-const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
+const GO_FEATURES: &str = "Models discovered from the Opencode Go API, with metadata from [models.dev](https://models.dev/)";
 const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
 const CATALOG_UNAVAILABLE: &str = "the models.dev catalog is unavailable";
 
 const FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`."#;
+
+const GO_FREE_MODELS_NOTE: &str = r#"Free models are hidden by default, like on Opencode Zen. To list them, add this to `~/.config/maki/providers.toml` under `[opencode]`, not `[opencode-go]`:
 
 ```toml
 [opencode]
@@ -106,7 +115,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
         features: Some(GO_FEATURES),
         auth: AuthDoc::EnvVar,
         catalog: CatalogDoc::Discovered(GO_DISCOVERY_NOTE),
-        trailing_notes: &[],
+        trailing_notes: &[GO_FREE_MODELS_NOTE],
     },
 };
 
@@ -156,12 +165,14 @@ pub(crate) const ZEN_QUIRKS: ProviderQuirks = ProviderQuirks {
     free_tier: FREE_TIER,
     session_id: SESSION_CARRIER,
     usage: None,
+    lists_models: false,
 };
 
 pub(crate) const GO_QUIRKS: ProviderQuirks = ProviderQuirks {
     free_tier: FREE_TIER,
     session_id: SESSION_CARRIER,
     usage: Some(GO_USAGE),
+    lists_models: true,
 };
 
 const GO_USAGE: UsageEndpoint = UsageEndpoint {
