@@ -28,6 +28,8 @@ pub const UNTRUSTED_PROJECT_WRITE: &str =
 /// the last write dropping the others.
 static PERMISSION_WRITE: Mutex<()> = Mutex::new(());
 
+pub mod codex;
+
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
 
