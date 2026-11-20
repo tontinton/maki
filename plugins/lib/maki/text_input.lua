@@ -371,6 +371,7 @@ local KEYMAP = {
   ["<M-b>"] = "move_word_left",
   ["<M-f>"] = "move_word_right",
   ["<C-a>"] = "move_home",
+  ["<C-e>"] = "move_end",
   ["<BS>"] = "remove_char",
   ["<S-BS>"] = "remove_char",
   ["<Del>"] = "delete_char",
