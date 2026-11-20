@@ -7663,6 +7663,27 @@ fn open_permission_prompt(app: &mut App) {
     );
 }
 
+#[test_case(true ; "focused")]
+#[test_case(false ; "unfocused")]
+fn permission_waits_for_a_focused_window(focused: bool) {
+    let mut app = test_app();
+    let (mut events, _cmd_tx) =
+        open_window(&mut app, &Arc::new(SharedBuf::new()), focused, WINDOW_Z);
+    open_permission_prompt(&mut app);
+
+    if focused {
+        assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedWindow);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(took_a_key(&mut events));
+        assert!(app.permission_prompt.is_open());
+        app.float_mgr.close_all();
+    }
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!app.permission_prompt.is_open());
+}
+
 fn open_alert(app: &mut App) {
     app.open_alert("alert".into());
 }
