@@ -4,6 +4,7 @@ use std::sync::Arc;
 use maki_config::ModelPolicy;
 use maki_providers::provider::{Provider, from_model, from_model_async};
 use maki_providers::{AgentError, Model, Timeouts};
+use tokio::task::{Id, JoinError, JoinSet};
 use tracing::warn;
 
 use super::ModelSlot;
@@ -11,6 +12,7 @@ use super::ModelSlot;
 pub(crate) const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
+const BUILD_PANICKED_ERR: &str = "Building the provider failed unexpectedly";
 
 /// Every model and provider this process has built, keyed by spec.
 ///
@@ -24,50 +26,27 @@ pub(crate) struct ModelSlots {
     /// What the process started on. Opening a session leans on it so it always
     /// ends up with a model that works.
     fallback: Arc<ModelSlot>,
-    builder: SlotBuilder,
-}
-
-/// Builds a slot off the event loop, for [`ModelSlots::adopt`] to take in.
-#[derive(Clone)]
-pub(crate) struct SlotBuilder {
     policy: Arc<ModelPolicy>,
     timeouts: Timeouts,
-    /// How many invalidates came before this builder was handed out.
+    /// How many invalidates there were. A build stamped with an older one ran
+    /// on credentials or a catalog that are gone.
     epoch: u64,
+    /// The builds running off the event loop, one per spec, whoever asked.
+    building: JoinSet<Built>,
+    /// The spec each one builds and the epoch it started in.
+    in_flight: HashMap<Id, (String, u64)>,
 }
 
-impl SlotBuilder {
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch
-    }
+type Built = Result<Arc<ModelSlot>, String>;
 
-    fn model(&self, spec: &str) -> Result<Model, String> {
-        if !self.policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))
-    }
+/// What [`ModelSlots::next_built`] hands to [`ModelSlots::land`].
+pub(crate) type Landed = Result<(Id, Built), JoinError>;
 
-    pub(crate) async fn build(&self, spec: &str) -> Result<Arc<ModelSlot>, String> {
-        let mut model = self.model(spec)?;
-        let provider = from_model_async(&mut model, self.timeouts).await;
-        into_slot(model, provider)
+fn model(policy: &ModelPolicy, spec: &str) -> Result<Model, String> {
+    if !policy.allows(spec) {
+        return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
     }
-
-    pub(crate) async fn build_stamped(self, spec: &str) -> StampedBuild {
-        let built = self.build(spec).await;
-        StampedBuild {
-            epoch: self.epoch,
-            built,
-        }
-    }
-}
-
-/// A build off the loop, stamped with the epoch it started in, for
-/// [`ModelSlots::settle`] to take in.
-pub(crate) struct StampedBuild {
-    epoch: u64,
-    built: Result<Arc<ModelSlot>, String>,
+    Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))
 }
 
 fn into_slot(
@@ -91,30 +70,26 @@ impl ModelSlots {
         Self {
             built: HashMap::from([(spec, Arc::clone(&startup))]),
             fallback: startup,
-            builder: SlotBuilder {
-                policy,
-                timeouts,
-                epoch: 0,
-            },
+            policy,
+            timeouts,
+            epoch: 0,
+            building: JoinSet::new(),
+            in_flight: HashMap::new(),
         }
     }
 
-    pub(crate) fn builder(&self) -> SlotBuilder {
-        self.builder.clone()
-    }
-
-    /// What a pick applies right away. Without one it builds with
-    /// [`Self::builder`] off the loop.
     pub(crate) fn get(&self, spec: &str) -> Option<Arc<ModelSlot>> {
         self.built.get(spec).map(Arc::clone)
     }
 
+    /// Building reads credentials and `providers.toml` and can run a child
+    /// process, so only startup, which has nothing to draw yet, builds here.
     fn try_get(&mut self, spec: &str) -> Result<Arc<ModelSlot>, String> {
         if let Some(slot) = self.get(spec) {
             return Ok(slot);
         }
-        let mut model = self.builder.model(spec)?;
-        let provider = from_model(&mut model, self.builder.timeouts);
+        let mut model = model(&self.policy, spec)?;
+        let provider = from_model(&mut model, self.timeouts);
         let slot = into_slot(model, provider)?;
         // Keyed by the requested spec, not the built model's. `from_model`
         // adjusts the model, and later lookups only have the request in hand.
@@ -131,62 +106,65 @@ impl ModelSlots {
         }
     }
 
-    /// [`Self::get_or_fallback`] without building on the loop: the slot
-    /// cached or `built` for `spec`, or the fallback when that build failed.
-    /// `None` while there is no build since the last invalidate.
-    pub(crate) fn for_session(
-        &mut self,
-        spec: &str,
-        built: Option<StampedBuild>,
-    ) -> Option<(Arc<ModelSlot>, Option<String>)> {
-        let settled = built
-            .and_then(|built| self.settle(spec, built))
-            .or_else(|| self.get(spec).map(Ok))?;
-        Some(match settled {
-            Ok(slot) => (slot, None),
-            Err(reason) => self.fall_back(spec, reason),
-        })
-    }
-
-    /// Takes in a build off the loop, preferring a slot cached for `spec` in
-    /// the meantime. `None` for one that started before the last invalidate,
-    /// whose slot or error came from credentials or a catalog that are gone.
-    pub(crate) fn settle(
-        &mut self,
-        spec: &str,
-        StampedBuild { epoch, built }: StampedBuild,
-    ) -> Option<Result<Arc<ModelSlot>, String>> {
-        match built {
-            Ok(slot) => self.adopt(epoch, spec.to_owned(), &slot).map(Ok),
-            Err(reason) => (epoch == self.builder.epoch).then(|| self.get(spec).ok_or(reason)),
-        }
-    }
-
-    fn fall_back(&self, spec: &str, reason: String) -> (Arc<ModelSlot>, Option<String>) {
+    pub(crate) fn fall_back(&self, spec: &str, reason: String) -> (Arc<ModelSlot>, Option<String>) {
         let chosen = self.fallback.model.spec();
         warn!(requested = spec, %chosen, %reason, "session opened on a fallback model");
         (Arc::clone(&self.fallback), Some(reason))
     }
 
-    /// Discovery landed or a provider was re-authenticated. The next `try_get`
-    /// builds again, and only for specs somebody is actually on.
-    pub(crate) fn invalidate(&mut self) {
-        self.built.clear();
-        self.builder.epoch += 1;
+    /// Starts a build of `spec` off the loop unless it has a slot or a build
+    /// already. [`Self::next_built`] says when it is done.
+    pub(crate) fn request(&mut self, spec: &str) {
+        if self.built.contains_key(spec)
+            || self
+                .in_flight
+                .values()
+                .any(|(building, _)| building == spec)
+        {
+            return;
+        }
+        let (policy, timeouts) = (Arc::clone(&self.policy), self.timeouts);
+        let requested = spec.to_owned();
+        let task = self.building.spawn(async move {
+            let mut model = model(&policy, &requested)?;
+            let provider = from_model_async(&mut model, timeouts).await;
+            into_slot(model, provider)
+        });
+        self.in_flight
+            .insert(task.id(), (spec.to_owned(), self.epoch));
     }
 
-    /// A slot built for `spec` since the last invalidate, unless a pick or a
-    /// session open built one in the meantime, which is just as new and may
-    /// already be on a tab. `None` for one built before it, on credentials or
-    /// a catalog that are gone.
-    pub(crate) fn adopt(
-        &mut self,
-        epoch: u64,
-        spec: String,
-        slot: &Arc<ModelSlot>,
-    ) -> Option<Arc<ModelSlot>> {
-        (epoch == self.builder.epoch)
-            .then(|| Arc::clone(self.built.entry(spec).or_insert_with(|| Arc::clone(slot))))
+    /// The next build to finish, `None` while none is running.
+    pub(crate) async fn next_built(&mut self) -> Option<Landed> {
+        self.building.join_next_with_id().await
+    }
+
+    /// Takes in a finished build: the spec it was for and its slot, kept for
+    /// the next caller, or why there is none. `None` for a build from before
+    /// the last invalidate, which runs again.
+    pub(crate) fn land(&mut self, landed: Landed) -> Option<(String, Built)> {
+        let (id, built) = match landed {
+            Ok((id, built)) => (id, Ok(built)),
+            Err(panicked) => (panicked.id(), Err(panicked)),
+        };
+        let (spec, epoch) = self.in_flight.remove(&id)?;
+        if epoch != self.epoch {
+            self.request(&spec);
+            return None;
+        }
+        let built = built.unwrap_or_else(|panicked| {
+            warn!(%spec, error = %panicked, "slot build panicked");
+            Err(format!("{BUILD_PANICKED_ERR}: {spec}"))
+        });
+        let built = built.map(|slot| Arc::clone(self.built.entry(spec.clone()).or_insert(slot)));
+        Some((spec, built))
+    }
+
+    /// Discovery landed or a provider was re-authenticated, so every spec
+    /// builds again the next time somebody asks for it.
+    pub(crate) fn invalidate(&mut self) {
+        self.built.clear();
+        self.epoch += 1;
     }
 }
 
@@ -217,12 +195,9 @@ pub(crate) mod tests {
     const FELL_BACK: &str = "an allowed, buildable spec must not fall back";
     const NO_FLOOR: &str = "invalidate must keep the fallback floor";
     const POISONED: &str = "a failed lookup must not leave a cache entry";
-    const NOT_KEPT: &str = "adopt must keep the slot cached first";
-    const STALE_KEPT: &str = "adopt must take only a slot built since the last invalidate";
+    const STALE_KEPT: &str = "only a slot built since the last invalidate may be kept";
+    const NOT_RUNNING: &str = "a requested spec with no slot has a build running";
     const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
-    const BUILDS: &str = "a session must build only a slot nobody has, and again once it is stale";
-    const FALLBACK_REASON: &str = "only a failed build may fall back, and it must say why";
-    const NOT_ADOPTED: &str = "a slot built for a session must be cached for the next one";
 
     fn startup_slot() -> Arc<super::ModelSlot> {
         let mut model = Model::from_spec(STARTUP_SPEC).unwrap();
@@ -308,88 +283,48 @@ pub(crate) mod tests {
         assert!(reason.is_some(), "{NO_FLOOR}");
     }
 
-    #[test_case(false ; "nothing_built_in_between")]
-    #[test_case(true ; "a_pick_built_it_in_between")]
-    #[tokio::test]
-    async fn adopt_keeps_the_slot_cached_first(picked_in_between: bool) {
-        let mut slots = slots(ModelPolicy::default());
-        let builder = slots.builder();
-        let rebuilt = builder.build(OTHER_SPEC).await.unwrap();
-        let first = if picked_in_between {
-            slots.try_get(OTHER_SPEC).unwrap()
-        } else {
-            Arc::clone(&rebuilt)
-        };
+    async fn build(
+        slots: &mut ModelSlots,
+        spec: &str,
+    ) -> Option<Result<Arc<super::ModelSlot>, String>> {
+        slots.request(spec);
+        let landed = slots.next_built().await.expect(NOT_RUNNING);
+        slots.land(landed).map(|(landed_spec, built)| {
+            assert_eq!(landed_spec, spec);
+            built
+        })
+    }
 
-        let adopted = slots.adopt(builder.epoch(), OTHER_SPEC.to_owned(), &rebuilt);
-        assert!(Arc::ptr_eq(&adopted.unwrap(), &first), "{NOT_KEPT}");
+    #[tokio::test]
+    async fn a_spec_has_one_build_however_many_ask() {
+        let mut slots = slots(ModelPolicy::default());
+        slots.request(OTHER_SPEC);
+        let built = build(&mut slots, OTHER_SPEC).await.unwrap().unwrap();
+
         assert!(
-            Arc::ptr_eq(&slots.try_get(OTHER_SPEC).unwrap(), &first),
+            Arc::ptr_eq(&slots.get(OTHER_SPEC).unwrap(), &built),
             "{CACHED}"
         );
+        slots.request(OTHER_SPEC);
+        assert!(slots.next_built().await.is_none(), "{CACHED}");
     }
 
-    #[test_case(true, false ; "built_before_an_invalidate")]
-    #[test_case(false, true ; "built_after_it")]
+    #[test_case(ModelPolicy::default(), true ; "a_slot")]
+    #[test_case(strict_policy(), false ; "a_refusal")]
     #[tokio::test]
-    async fn adopt_takes_only_a_slot_built_since_the_last_invalidate(
-        built_before: bool,
-        adopted: bool,
-    ) {
-        let mut slots = slots(ModelPolicy::default());
-        let before = slots.builder();
-        slots.invalidate();
-        let builder = if built_before {
-            before
-        } else {
-            slots.builder()
-        };
-        let slot = builder.build(OTHER_SPEC).await.unwrap();
-
-        let kept = slots.adopt(builder.epoch(), OTHER_SPEC.to_owned(), &slot);
-        assert_eq!(kept.is_some(), adopted, "{STALE_KEPT}");
-        assert_eq!(slots.get(OTHER_SPEC).is_some(), adopted, "{STALE_KEPT}");
-    }
-
-    #[test_case(ModelPolicy::default(), STARTUP_SPEC, false, 0, false ; "a_cached_spec_opens_without_a_build")]
-    #[test_case(ModelPolicy::default(), OTHER_SPEC, false, 1, false ; "an_unbuilt_spec_builds_once_and_is_adopted")]
-    #[test_case(ModelPolicy::default(), OTHER_SPEC, true, 2, false ; "a_build_from_before_an_invalidate_builds_again")]
-    #[test_case(strict_policy(), OTHER_SPEC, false, 1, true ; "a_failed_build_falls_back_with_its_reason")]
-    #[test_case(strict_policy(), OTHER_SPEC, true, 2, true ; "a_failure_from_before_an_invalidate_builds_again")]
-    #[tokio::test]
-    async fn a_session_gets_its_slot_built_off_the_loop(
-        policy: ModelPolicy,
-        spec: &str,
-        invalidate_mid_build: bool,
-        builds: usize,
-        fell_back: bool,
-    ) {
+    async fn a_build_from_before_an_invalidate_runs_again(policy: ModelPolicy, builds: bool) {
         let mut slots = slots(policy);
-        let mut built = None;
-        let mut ran = 0;
-        let (slot, reason) = loop {
-            if let Some(settled) = slots.for_session(spec, built.take()) {
-                break settled;
-            }
-            assert!(ran < builds, "{BUILDS}");
-            let builder = slots.builder();
-            if invalidate_mid_build && ran == 0 {
-                slots.invalidate();
-            }
-            built = Some(builder.build_stamped(spec).await);
-            ran += 1;
-        };
+        slots.request(OTHER_SPEC);
+        slots.invalidate();
 
-        assert_eq!(ran, builds, "{BUILDS}");
-        assert_eq!(reason.is_some(), fell_back, "{FALLBACK_REASON}");
         assert!(
-            reason.is_none_or(|reason| reason.starts_with(MODEL_POLICY_ERR)),
-            "{FALLBACK_REASON}"
+            build(&mut slots, OTHER_SPEC).await.is_none(),
+            "{STALE_KEPT}"
         );
-        let cached = slots
-            .get(spec)
-            .is_some_and(|cached| Arc::ptr_eq(&cached, &slot));
-        assert_eq!(cached, !fell_back, "{NOT_ADOPTED}");
+        assert!(slots.get(OTHER_SPEC).is_none(), "{STALE_KEPT}");
+        let rebuilt = build(&mut slots, OTHER_SPEC).await.expect(STALE_KEPT);
+        assert_eq!(rebuilt.is_ok(), builds);
+        assert_eq!(slots.get(OTHER_SPEC).is_some(), builds, "{CACHED}");
     }
 
     /// A cache hit skips both the policy check and the build, so a refusal must
@@ -413,8 +348,9 @@ pub(crate) mod tests {
         let err = slots.try_get(spec).err().unwrap();
         assert!(err.starts_with(expected), "{err}");
         assert!(slots.try_get(spec).is_err(), "{POISONED}");
-        let off_loop = slots.builder().build(spec).await.err();
+        let off_loop = build(&mut slots, spec).await.unwrap().err();
         assert_eq!(off_loop.as_ref(), Some(&err), "{OFF_LOOP_DIFFERS}");
+        assert!(slots.get(spec).is_none(), "{POISONED}");
 
         let (slot, reason) = slots.get_or_fallback(spec);
         assert_eq!(slot.model.spec(), STARTUP_SPEC, "{POISONED}");
