@@ -56,7 +56,7 @@ use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::coop::unconstrained;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
@@ -595,6 +595,9 @@ pub(crate) struct EventLoop<'t> {
     /// replaces a pending one, whose slots would be stale anyway.
     rebuilding: Option<AbortOnDropHandle<RebuiltSlots>>,
     picks: Picks,
+    /// Sessions a plugin created on a model with no slot yet, each waiting for
+    /// its build.
+    creating: JoinSet<Box<(CreatedSession, StampedBuild)>>,
     /// Writes to sessions no tab has open, which shutdown waits for like it
     /// waits for the storage writer.
     stored_writes: TaskTracker,
@@ -643,6 +646,14 @@ enum PickOrigin {
         fast: Option<bool>,
         reply_tx: oneshot::Sender<UiReply>,
     },
+}
+
+/// A session `maki.session.new` opens in a tab, which answers with its id.
+struct CreatedSession {
+    open: OpenSession,
+    prompt: Option<String>,
+    focus: bool,
+    reply_tx: oneshot::Sender<UiReply>,
 }
 
 /// A slot built off the loop for a pick that had none.
@@ -735,6 +746,8 @@ enum Wake {
     SlotsRebuilt(Option<RebuiltSlots>),
     /// `None` when the build panicked, which dropped its pick.
     SlotBuilt(Option<Box<SlotBuilt>>),
+    /// `None` when the build panicked, which dropped its reply.
+    SessionCreated(Option<Box<(CreatedSession, StampedBuild)>>),
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -1015,6 +1028,7 @@ impl<'t> EventLoop<'t> {
             queued_focus: VecDeque::new(),
             rebuilding: None,
             picks: Picks::default(),
+            creating: JoinSet::new(),
             stored_writes: TaskTracker::new(),
             cwd_lost: false,
             _model_fetch_task: bg.task,
@@ -1144,6 +1158,7 @@ impl<'t> EventLoop<'t> {
             answer = answered(&mut self.opening) => Wake::SessionOpened(answer),
             rebuilt = answered(&mut self.rebuilding) => Wake::SlotsRebuilt(rebuilt),
             built = answered(&mut self.picks.building) => Wake::SlotBuilt(built),
+            Some(created) = self.creating.join_next() => Wake::SessionCreated(created.ok()),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -1164,6 +1179,11 @@ impl<'t> EventLoop<'t> {
             Wake::SlotsRebuilt(Some(rebuilt)) => self.finish_rebuild(rebuilt),
             Wake::SlotsRebuilt(None) => {}
             Wake::SlotBuilt(built) => self.advance_picks(built),
+            Wake::SessionCreated(Some(created)) => {
+                let (created, built) = *created;
+                self.open_created(created, Some(built));
+            }
+            Wake::SessionCreated(None) => {}
         }
         Ok(())
     }
@@ -1917,12 +1937,48 @@ impl<'t> EventLoop<'t> {
             });
             return;
         }
-        // An inherited model's slot is already built and sitting right here.
-        let (slot, fallback) = if inherits_model {
-            (self.sessions[self.focused].slot.load_full(), None)
-        } else {
-            self.slots.get_or_fallback(&open.session.model)
+        let created = CreatedSession {
+            open,
+            prompt,
+            focus,
+            reply_tx,
         };
+        // An inherited model's slot is already built and sitting right here.
+        if inherits_model {
+            let slot = self.sessions[self.focused].slot.load_full();
+            self.show_created(created, slot, None);
+        } else {
+            self.open_created(created, None);
+        }
+    }
+
+    /// A model with no slot since the last invalidate builds one off the loop
+    /// first, and a build from before it runs again.
+    fn open_created(&mut self, created: CreatedSession, built: Option<StampedBuild>) {
+        let spec = &created.open.session.model;
+        let Some((slot, fallback)) = self.slots.for_session(spec, built) else {
+            let builder = self.slots.builder();
+            self.creating.spawn(async move {
+                let built = builder.build_stamped(&created.open.session.model).await;
+                Box::new((created, built))
+            });
+            return;
+        };
+        self.show_created(created, slot, fallback);
+    }
+
+    fn show_created(
+        &mut self,
+        created: CreatedSession,
+        slot: Arc<ModelSlot>,
+        fallback: Option<String>,
+    ) {
+        let CreatedSession {
+            open,
+            prompt,
+            focus,
+            reply_tx,
+        } = created;
         let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         let id = self.sessions[idx].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
