@@ -156,6 +156,9 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 http = "1"
 percent-encoding = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }

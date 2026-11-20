@@ -471,14 +471,13 @@ pub fn client_builder() -> ClientBuilder {
         .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
 }
 
-/// Trust comes from the platform verifier, which on Linux reads
-/// `SSL_CERT_FILE` the way curl did. A store it cannot load (a stale
+/// Trust comes from the system store, which on Linux reads `SSL_CERT_FILE`
+/// the way curl did (see `crate::tls` for how it is checked there). A store it cannot load (a stale
 /// `SSL_CERT_FILE`, a container without CA roots) must not take maki down at
 /// startup, so the client is built without roots instead and every TLS connect
 /// fails with the reason, as under curl.
 pub(crate) fn http_client(timeouts: Timeouts) -> Client {
-    timeouts
-        .bound(client_builder())
+    with_system_trust(timeouts.bound(client_builder()))
         .build()
         .unwrap_or_else(|error| {
             warn!(%error, "no trust roots could be loaded, TLS connections will fail");
@@ -488,6 +487,21 @@ pub(crate) fn http_client(timeouts: Timeouts) -> Client {
                 .build()
                 .expect("an HTTP client without trust roots always builds")
         })
+}
+
+#[cfg(not(all(unix, not(target_os = "android"), not(target_vendor = "apple"))))]
+fn with_system_trust(builder: ClientBuilder) -> ClientBuilder {
+    builder
+}
+
+/// A store with no usable certificate leaves the builder as it is, so the
+/// build fails the same way and [`http_client`] reports why.
+#[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
+fn with_system_trust(builder: ClientBuilder) -> ClientBuilder {
+    match crate::tls::system_store_config() {
+        Ok(config) => builder.tls_backend_preconfigured(config),
+        Err(_) => builder,
+    }
 }
 
 /// `Client::execute` arms the timeouts as it is called, so the send and the
