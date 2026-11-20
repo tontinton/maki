@@ -8,7 +8,7 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::{pending, ready};
 use std::mem;
 use std::sync::{Arc, Weak};
@@ -21,7 +21,7 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use futures::future::{LocalBoxFuture, join_all, select_all};
+use futures::future::{LocalBoxFuture, select_all};
 use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
@@ -56,12 +56,12 @@ use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::coop::unconstrained;
-use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
 
-use crate::agent::model_slots::StampedBuild;
+use crate::agent::model_slots::Landed;
 use crate::agent::{
     AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
@@ -586,18 +586,14 @@ pub(crate) struct EventLoop<'t> {
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
     pack: Option<JoinHandle<PackPreparation>>,
-    /// The stored session a focus is reading or building a slot for. One at a
-    /// time, with later requests in `queued_focus`, so they land in the order
-    /// they were made, as they did when each one read inline.
+    /// The stored session a focus is reading. One at a time, and none while
+    /// an earlier one waits for its slot, with later requests in
+    /// `queued_focus`, so they land in the order they were made, as they did
+    /// when each one read inline.
     opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
     queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
-    /// The slots [`Self::rebuild_models`] builds off the loop. A newer rebuild
-    /// replaces a pending one, whose slots would be stale anyway.
-    rebuilding: Option<AbortOnDropHandle<RebuiltSlots>>,
-    picks: Picks,
-    /// Sessions a plugin created on a model with no slot yet, each waiting for
-    /// its build.
-    creating: JoinSet<Box<(CreatedSession, StampedBuild)>>,
+    /// Picks and sessions waiting for a slot [`ModelSlots`] is building.
+    waiting: SlotWaiters,
     /// Writes to sessions no tab has open, which shutdown waits for like it
     /// waits for the storage writer.
     stored_writes: TaskTracker,
@@ -615,20 +611,10 @@ struct PendingFocus {
 
 /// A stored session a focus read off the loop, for the loop to bring up once
 /// it has a slot for its model.
-enum OpenedSession {
-    Read(PendingFocus, Result<OpenSession, String>),
-    Built(PendingFocus, OpenSession, StampedBuild),
-}
-
-/// One build per spec the tabs were on when the rebuild started.
-struct RebuiltSlots {
-    epoch: u64,
-    built: HashMap<String, Result<Arc<ModelSlot>, String>>,
-}
+struct OpenedSession(PendingFocus, Result<OpenSession, String>);
 
 /// A model picked for the tab focused at the time.
 struct Pick {
-    spec: String,
     /// The tab's slot cell, which stays the same when `/new` gives the tab
     /// another session while the build is out.
     tab: Weak<ArcSwap<ModelSlot>>,
@@ -656,70 +642,83 @@ struct CreatedSession {
     reply_tx: oneshot::Sender<UiReply>,
 }
 
-/// A slot built off the loop for a pick that had none.
-struct SlotBuilt {
-    pick: Pick,
-    built: StampedBuild,
+/// What a slot is wanted for.
+enum Wanted {
+    Pick(Pick),
+    Open(PendingFocus, OpenSession),
+    Create(CreatedSession),
 }
 
-/// One pick builds off the loop at a time, with later ones queued behind it,
-/// so they apply in the order they were made and the last one wins.
+struct Waiter {
+    spec: String,
+    built: Option<Result<Arc<ModelSlot>, String>>,
+    wanted: Wanted,
+}
+
+/// Everything waiting for a slot, in the order it asked. A session comes up
+/// as soon as its slot is there. A pick also waits for the picks made before
+/// it, so they apply in order and the last one wins.
 #[derive(Default)]
-struct Picks {
-    building: Option<AbortOnDropHandle<Box<SlotBuilt>>>,
-    /// The tab and spec of the pick `building` holds.
-    building_for: Option<(Weak<ArcSwap<ModelSlot>>, String)>,
-    queued: VecDeque<Pick>,
-}
+struct SlotWaiters(VecDeque<Waiter>);
 
-impl Picks {
-    /// Takes in a build that landed, `None` when it panicked or nothing did,
-    /// and returns the picks settled by now, in order. A build from before the
-    /// last invalidate is stale, so its pick builds again ahead of the queue.
-    fn advance(
-        &mut self,
-        slots: &mut ModelSlots,
-        landed: Option<Box<SlotBuilt>>,
-    ) -> Vec<(Pick, Result<Arc<ModelSlot>, String>)> {
-        let mut settled = Vec::new();
-        if self.building.is_none() {
-            self.building_for = None;
+impl SlotWaiters {
+    fn push(&mut self, slots: &mut ModelSlots, spec: String, wanted: Wanted) {
+        let built = slots.get(&spec).map(Ok);
+        if built.is_none() {
+            slots.request(&spec);
         }
-        if let Some(landed) = landed {
-            let SlotBuilt { pick, built } = *landed;
-            match slots.settle(&pick.spec, built) {
-                Some(built) => settled.push((pick, built)),
-                None => self.queued.push_front(pick),
-            }
+        self.0.push_back(Waiter {
+            spec,
+            built,
+            wanted,
+        });
+    }
+
+    fn landed(&mut self, spec: &str, built: &Result<Arc<ModelSlot>, String>) {
+        for waiter in self.0.iter_mut().filter(|waiter| waiter.spec == spec) {
+            waiter.built.get_or_insert_with(|| built.clone());
         }
-        while self.building.is_none()
-            && let Some(pick) = self.queued.pop_front()
-        {
-            match slots.get(&pick.spec) {
-                Some(slot) => settled.push((pick, Ok(slot))),
+    }
+
+    /// After an invalidate nothing a waiter holds is current, so each asks
+    /// again.
+    fn restart(&mut self, slots: &mut ModelSlots) {
+        for waiter in &mut self.0 {
+            waiter.built = None;
+            slots.request(&waiter.spec);
+        }
+    }
+
+    fn take_ready(&mut self) -> Vec<(Waiter, Result<Arc<ModelSlot>, String>)> {
+        let mut ready = Vec::new();
+        let mut pick_ahead = false;
+        for mut waiter in mem::take(&mut self.0) {
+            let is_pick = matches!(waiter.wanted, Wanted::Pick(_));
+            match waiter.built.take_if(|_| !(is_pick && pick_ahead)) {
+                Some(built) => ready.push((waiter, built)),
                 None => {
-                    let builder = slots.builder();
-                    self.building_for = Some((pick.tab.clone(), pick.spec.clone()));
-                    self.building = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                        let built = builder.build_stamped(&pick.spec).await;
-                        Box::new(SlotBuilt { pick, built })
-                    })));
+                    pick_ahead |= is_pick;
+                    self.0.push_back(waiter);
                 }
             }
         }
-        settled
+        ready
     }
 
     /// The spec `tab` ends up on once its picks have settled: the last one
     /// made for it.
-    fn pending_for(&self, tab: &Arc<ArcSwap<ModelSlot>>) -> Option<&str> {
+    fn pending_pick(&self, tab: &Arc<ArcSwap<ModelSlot>>) -> Option<&str> {
         let tab = Arc::downgrade(tab);
-        self.building_for
+        self.0
             .iter()
-            .map(|(tab, spec)| (tab, spec))
-            .chain(self.queued.iter().map(|pick| (&pick.tab, &pick.spec)))
-            .rfind(|(of, _)| Weak::ptr_eq(of, &tab))
-            .map(|(_, spec)| spec.as_str())
+            .rfind(|waiter| matches!(&waiter.wanted, Wanted::Pick(pick) if Weak::ptr_eq(&pick.tab, &tab)))
+            .map(|waiter| waiter.spec.as_str())
+    }
+
+    fn opens_a_session(&self) -> bool {
+        self.0
+            .iter()
+            .any(|waiter| matches!(waiter.wanted, Wanted::Open(..)))
     }
 }
 
@@ -739,15 +738,10 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
-    /// `None` when the read or the build panicked, which dropped its reply.
+    /// `None` when the read panicked, which dropped its reply.
     SessionOpened(Option<Box<OpenedSession>>),
     ModelsDiscovered,
-    /// `None` when the rebuild panicked.
-    SlotsRebuilt(Option<RebuiltSlots>),
-    /// `None` when the build panicked, which dropped its pick.
-    SlotBuilt(Option<Box<SlotBuilt>>),
-    /// `None` when the build panicked, which dropped its reply.
-    SessionCreated(Option<Box<(CreatedSession, StampedBuild)>>),
+    SlotBuilt(Landed),
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -1026,9 +1020,7 @@ impl<'t> EventLoop<'t> {
             pack: None,
             opening: None,
             queued_focus: VecDeque::new(),
-            rebuilding: None,
-            picks: Picks::default(),
-            creating: JoinSet::new(),
+            waiting: SlotWaiters::default(),
             stored_writes: TaskTracker::new(),
             cwd_lost: false,
             _model_fetch_task: bg.task,
@@ -1156,9 +1148,7 @@ impl<'t> EventLoop<'t> {
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
             answer = answered(&mut self.opening) => Wake::SessionOpened(answer),
-            rebuilt = answered(&mut self.rebuilding) => Wake::SlotsRebuilt(rebuilt),
-            built = answered(&mut self.picks.building) => Wake::SlotBuilt(built),
-            Some(created) = self.creating.join_next() => Wake::SessionCreated(created.ok()),
+            Some(landed) = self.slots.next_built() => Wake::SlotBuilt(landed),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -1176,14 +1166,7 @@ impl<'t> EventLoop<'t> {
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::SessionOpened(answer) => self.finish_open(answer),
             Wake::ModelsDiscovered => self.rebuild_models(),
-            Wake::SlotsRebuilt(Some(rebuilt)) => self.finish_rebuild(rebuilt),
-            Wake::SlotsRebuilt(None) => {}
-            Wake::SlotBuilt(built) => self.advance_picks(built),
-            Wake::SessionCreated(Some(created)) => {
-                let (created, built) = *created;
-                self.open_created(created, Some(built));
-            }
-            Wake::SessionCreated(None) => {}
+            Wake::SlotBuilt(landed) => self.land_slot(landed),
         }
         Ok(())
     }
@@ -1948,23 +1931,9 @@ impl<'t> EventLoop<'t> {
             let slot = self.sessions[self.focused].slot.load_full();
             self.show_created(created, slot, None);
         } else {
-            self.open_created(created, None);
+            let spec = created.open.session.model.clone();
+            self.wait_for_slot(spec, Wanted::Create(created));
         }
-    }
-
-    /// A model with no slot since the last invalidate builds one off the loop
-    /// first, and a build from before it runs again.
-    fn open_created(&mut self, created: CreatedSession, built: Option<StampedBuild>) {
-        let spec = &created.open.session.model;
-        let Some((slot, fallback)) = self.slots.for_session(spec, built) else {
-            let builder = self.slots.builder();
-            self.creating.spawn(async move {
-                let built = builder.build_stamped(&created.open.session.model).await;
-                Box::new((created, built))
-            });
-            return;
-        };
-        self.show_created(created, slot, fallback);
     }
 
     fn show_created(
@@ -2097,7 +2066,7 @@ impl<'t> EventLoop<'t> {
     /// Focus a live session, or read a stored one off the loop and bring it up
     /// once [`Wake::SessionOpened`] lands, see [`Self::show_opened`].
     fn focus_session(&mut self, id: MakiId, reply_tx: oneshot::Sender<UiReply>) {
-        if self.opening.is_some() {
+        if self.opening.is_some() || self.waiting.opens_a_session() {
             self.queued_focus.push_back((id, reply_tx));
             return;
         }
@@ -2117,45 +2086,111 @@ impl<'t> EventLoop<'t> {
             let opened = OpenSession::load_async(id, storage)
                 .await
                 .map_err(|e| format!("Failed to load session: {e}"));
-            Box::new(OpenedSession::Read(focus, opened))
+            Box::new(OpenedSession(focus, opened))
         })));
+    }
+
+    fn finish_open(&mut self, answer: Option<Box<OpenedSession>>) {
+        match answer.map(|answer| *answer) {
+            Some(OpenedSession(focus, Ok(open))) => {
+                let spec = open.session.model.clone();
+                return self.wait_for_slot(spec, Wanted::Open(focus, open));
+            }
+            Some(OpenedSession(focus, Err(e))) => {
+                let _ = focus.reply_tx.send(Err(e));
+            }
+            None => {}
+        }
+        self.next_focus();
     }
 
     /// The focus requests that queued behind a read or a build go next, up to
     /// the next one that has to wait for one too.
-    fn finish_open(&mut self, answer: Option<Box<OpenedSession>>) {
-        if let Some(answer) = answer {
-            match *answer {
-                OpenedSession::Read(focus, Ok(open)) => self.show_opened(open, focus, None),
-                OpenedSession::Read(focus, Err(e)) => {
-                    let _ = focus.reply_tx.send(Err(e));
-                }
-                OpenedSession::Built(focus, open, built) => {
-                    self.show_opened(open, focus, Some(built))
-                }
-            }
-        }
+    fn next_focus(&mut self) {
         while self.opening.is_none()
+            && !self.waiting.opens_a_session()
             && let Some((id, reply_tx)) = self.queued_focus.pop_front()
         {
             self.focus_session(id, reply_tx);
         }
     }
 
+    fn wait_for_slot(&mut self, spec: String, wanted: Wanted) {
+        self.waiting.push(&mut self.slots, spec, wanted);
+        self.settle_waiters();
+    }
+
+    /// A slot that landed goes to whoever waits for it and to every tab on
+    /// its spec, which is how a rebuild reaches them. A tab that picked
+    /// another model in the meantime is on another spec and stays.
+    fn land_slot(&mut self, landed: Landed) {
+        let Some((spec, built)) = self.slots.land(landed) else {
+            return;
+        };
+        let on_spec = |rt: &SessionRuntime| rt.app.state.model.spec() == spec;
+        match &built {
+            Ok(slot) => {
+                for idx in 0..self.sessions.len() {
+                    let rt = &self.sessions[idx];
+                    if on_spec(rt) && !Arc::ptr_eq(&rt.slot.load(), slot) {
+                        self.apply_model(idx, Arc::clone(slot));
+                    }
+                }
+            }
+            Err(error) if self.sessions.iter().any(on_spec) => {
+                warn!(%spec, %error, "keeping the previous model");
+            }
+            Err(_) => {}
+        }
+        self.waiting.landed(&spec, &built);
+        self.settle_waiters();
+    }
+
+    fn settle_waiters(&mut self) {
+        for (Waiter { spec, wanted, .. }, built) in self.waiting.take_ready() {
+            match (wanted, built) {
+                (Wanted::Pick(pick), Ok(slot)) => self.apply_pick(pick, spec, slot),
+                (Wanted::Pick(pick), Err(error)) => self.refuse_pick(pick.origin, error),
+                (Wanted::Open(focus, open), built) => {
+                    let (slot, fallback) = self.session_slot(&spec, built);
+                    self.show_opened(open, focus, slot, fallback);
+                }
+                (Wanted::Create(created), built) => {
+                    let (slot, fallback) = self.session_slot(&spec, built);
+                    self.show_created(created, slot, fallback);
+                }
+            }
+        }
+        for rt in &mut self.sessions {
+            rt.app.picking = self.waiting.pending_pick(&rt.slot).map(str::to_owned);
+        }
+        self.next_focus();
+    }
+
+    /// A session always comes up, on the model the process started on when
+    /// its own would not build.
+    fn session_slot(
+        &self,
+        spec: &str,
+        built: Result<Arc<ModelSlot>, String>,
+    ) -> (Arc<ModelSlot>, Option<String>) {
+        built.map_or_else(
+            |reason| self.slots.fall_back(spec, reason),
+            |slot| (slot, None),
+        )
+    }
+
     /// In place of the tab the focus was asked from, while it is still focused
     /// and a blank idle one (nothing worth keeping), otherwise as a new runtime
     /// so the session you came from stays live. Decided now rather than at the
-    /// request, since the read may have taken a while. A model with no slot
-    /// since the last invalidate builds one off the loop first.
-    fn show_opened(&mut self, open: OpenSession, focus: PendingFocus, built: Option<StampedBuild>) {
-        let Some((slot, fallback)) = self.slots.for_session(&open.session.model, built) else {
-            let builder = self.slots.builder();
-            self.opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                let built = builder.build_stamped(&open.session.model).await;
-                Box::new(OpenedSession::Built(focus, open, built))
-            })));
-            return;
-        };
+    /// request, since the read and the build may have taken a while.
+    fn show_opened(
+        &mut self,
+        open: OpenSession,
+        focus: PendingFocus,
+        slot: Arc<ModelSlot>,
+        fallback: Option<String>,
+    ) {
         let focused = &self.sessions[self.focused];
         if focused.id() == focus.from
             && SessionStatus::of(&focused.app) == SessionStatus::Idle
@@ -2320,45 +2355,14 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Discovery landed or a provider was re-authenticated. Invalidating alone
-    /// would leave the tabs on stale providers, so dropping the built slots and
-    /// building every session's spec again is a single step, one build per
-    /// spec. Building reads credentials and `providers.toml`, so it runs off
-    /// the loop and lands in [`Self::finish_rebuild`].
+    /// would leave the tabs on stale providers, so every session's spec builds
+    /// again, one build per spec, and [`Self::land_slot`] moves the tabs over.
     fn rebuild_models(&mut self) {
         self.slots.invalidate();
-        let builder = self.slots.builder();
-        let epoch = builder.epoch();
-        let specs: HashSet<String> = self
-            .sessions
-            .iter()
-            .map(|rt| rt.app.state.model.spec())
-            .collect();
-        self.rebuilding = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-            let builder = &builder;
-            let builds = specs.into_iter().map(|spec| async move {
-                let built = builder.build(&spec).await;
-                (spec, built)
-            });
-            let built = join_all(builds).await.into_iter().collect();
-            RebuiltSlots { epoch, built }
-        })));
-    }
-
-    /// Only tabs still on the spec they were rebuilt for move, so a model
-    /// picked in the meantime stays.
-    fn finish_rebuild(&mut self, rebuilt: RebuiltSlots) {
-        for idx in 0..self.sessions.len() {
-            let spec = self.sessions[idx].app.state.model.spec();
-            match rebuilt.built.get(&spec) {
-                Some(Ok(slot)) => {
-                    if let Some(slot) = self.slots.adopt(rebuilt.epoch, spec, slot) {
-                        self.apply_model(idx, slot);
-                    }
-                }
-                Some(Err(error)) => warn!(%spec, %error, "keeping the previous model"),
-                None => {}
-            }
+        for rt in &self.sessions {
+            self.slots.request(&rt.app.state.model.spec());
         }
+        self.waiting.restart(&mut self.slots);
     }
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
@@ -2498,25 +2502,12 @@ impl<'t> EventLoop<'t> {
 
     fn change_model(&mut self, spec: String, origin: PickOrigin) {
         let tab = Arc::downgrade(&self.sessions[self.focused].slot);
-        self.picks.queued.push_back(Pick { spec, tab, origin });
-        self.advance_picks(None);
-    }
-
-    fn advance_picks(&mut self, landed: Option<Box<SlotBuilt>>) {
-        for (pick, built) in self.picks.advance(&mut self.slots, landed) {
-            match built {
-                Ok(slot) => self.apply_pick(pick, slot),
-                Err(error) => self.refuse_pick(pick.origin, error),
-            }
-        }
-        for rt in &mut self.sessions {
-            rt.app.picking = self.picks.pending_for(&rt.slot).map(str::to_owned);
-        }
+        self.wait_for_slot(spec, Wanted::Pick(Pick { tab, origin }));
     }
 
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
-    fn apply_pick(&mut self, pick: Pick, slot: Arc<ModelSlot>) {
+    fn apply_pick(&mut self, pick: Pick, spec: String, slot: Arc<ModelSlot>) {
         let Some(idx) = self
             .sessions
             .iter()
@@ -2528,11 +2519,10 @@ impl<'t> EventLoop<'t> {
         self.apply_model(idx, slot);
         self.ctx
             .picker_memory
-            .record_recent(&pick.spec, &self.ctx.model_policy);
-        let recent = pick.spec;
+            .record_recent(&spec, &self.ctx.model_policy);
         self.ctx.storage_writer.persist(move |dir| {
             persist_model(dir, &picked);
-            push_recent(dir, &recent);
+            push_recent(dir, &spec);
         });
         if let PickOrigin::Lua {
             thinking,
@@ -2733,12 +2723,12 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::model_slots::MODEL_POLICY_ERR;
     use crate::agent::model_slots::tests::{OTHER_SPEC, STARTUP_SPEC, slots, strict_policy};
     use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
+    use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::oneshot;
 
@@ -2984,7 +2974,7 @@ mod tests {
         let (reply_tx, _reply_rx) = oneshot::channel();
         let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             go_rx.await.unwrap();
-            Box::new(OpenedSession::Read(
+            Box::new(OpenedSession(
                 PendingFocus {
                     reply_tx,
                     from: MakiId::generate(),
@@ -3001,77 +2991,153 @@ mod tests {
 
         go_tx.send(()).unwrap();
         let answer = answered(&mut opening).await.unwrap();
-        assert!(matches!(&*answer, OpenedSession::Read(_, Err(e)) if e == OPEN_ERROR));
+        assert!(matches!(&*answer, OpenedSession(_, Err(e)) if e == OPEN_ERROR));
         assert!(opening.is_none());
     }
 
     const THIRD_SPEC: &str = "opencode/third";
-    const OUT_OF_ORDER: &str = "every pick must settle once, in the order it was made";
+    const OUT_OF_ORDER: &str = "a pick must wait for the picks made before it";
+    const SESSION_HELD: &str = "a session must not wait for a pick";
     const NO_STARTUP_SLOT: &str = "the startup spec has a slot from the start";
+    const CREATED_CWD: &str = "/tmp";
+    const NOT_BUILDING: &str = "a waiter with no slot has a build running";
+    const NO_SLOT: &str = "every waiter here gets a slot";
+    const STALE_HELD: &str = "a slot from before an invalidate must not reach a waiter";
 
-    fn pick(spec: &str) -> Pick {
-        Pick {
-            spec: spec.to_owned(),
-            tab: Weak::new(),
+    fn pick_for(tab: &Arc<ArcSwap<ModelSlot>>) -> Wanted {
+        Wanted::Pick(Pick {
+            tab: Arc::downgrade(tab),
             origin: PickOrigin::Picker,
+        })
+    }
+
+    fn created(dir: &TempDir) -> Wanted {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        Wanted::Create(CreatedSession {
+            open: OpenSession::fresh(STARTUP_SPEC, CREATED_CWD, &storage),
+            prompt: None,
+            focus: false,
+            reply_tx,
+        })
+    }
+
+    async fn land_next(slots: &mut ModelSlots, waiting: &mut SlotWaiters) {
+        let landed = slots.next_built().await.expect(NOT_BUILDING);
+        if let Some((spec, built)) = slots.land(landed) {
+            waiting.landed(&spec, &built);
         }
     }
 
-    #[tokio::test]
-    async fn a_tab_shows_its_last_pick_as_pending_until_it_settles() {
-        let mut slots = slots(ModelPolicy::default());
-        let startup = slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT);
-        let tab = Arc::new(ArcSwap::from(startup));
-        let mut picks = Picks::default();
-        picks
-            .queued
-            .extend([OTHER_SPEC, THIRD_SPEC].map(|spec| Pick {
-                tab: Arc::downgrade(&tab),
-                ..pick(spec)
-            }));
-
-        picks.advance(&mut slots, None);
-        assert_eq!(picks.pending_for(&tab), Some(THIRD_SPEC));
-        let landed = answered(&mut picks.building).await;
-        picks.advance(&mut slots, landed);
-        assert_eq!(picks.pending_for(&tab), Some(THIRD_SPEC));
-        let landed = answered(&mut picks.building).await;
-        picks.advance(&mut slots, landed);
-        assert_eq!(picks.pending_for(&tab), None);
+    fn ready_specs(waiting: &mut SlotWaiters) -> Vec<(String, bool)> {
+        waiting
+            .take_ready()
+            .into_iter()
+            .map(|(waiter, built)| (waiter.spec, built.is_ok()))
+            .collect()
     }
 
     #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (THIRD_SPEC, true)] ; "two_builds_apply_in_order")]
     #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_built_spec_waits_behind_a_build")]
-    #[test_case(ModelPolicy::default(), true, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_stale_build_runs_again_ahead_of_the_queue")]
+    #[test_case(ModelPolicy::default(), true, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_build_from_before_an_invalidate_runs_again")]
     #[test_case(strict_policy(), false, &[(OTHER_SPEC, false), (STARTUP_SPEC, true)] ; "a_refused_pick_does_not_hold_up_the_queue")]
     #[tokio::test]
-    async fn picks_settle_once_each_in_the_order_they_were_made(
+    async fn picks_settle_in_the_order_they_were_made(
         policy: ModelPolicy,
         invalidate_mid_build: bool,
         expected: &[(&str, bool)],
     ) {
         let mut slots = slots(policy);
-        let mut picks = Picks::default();
-        picks
-            .queued
-            .extend(expected.iter().map(|(spec, _)| pick(spec)));
-
-        let mut settled = picks.advance(&mut slots, None);
+        let tab = Arc::new(ArcSwap::from(
+            slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT),
+        ));
+        let mut waiting = SlotWaiters::default();
+        for (spec, _) in expected {
+            waiting.push(&mut slots, (*spec).to_owned(), pick_for(&tab));
+        }
+        assert!(ready_specs(&mut waiting).is_empty(), "{OUT_OF_ORDER}");
+        assert_eq!(
+            waiting.pending_pick(&tab),
+            expected.last().map(|(spec, _)| *spec)
+        );
         if invalidate_mid_build {
             slots.invalidate();
-        }
-        while picks.building.is_some() {
-            let landed = answered(&mut picks.building).await;
-            settled.extend(picks.advance(&mut slots, landed));
+            waiting.restart(&mut slots);
         }
 
-        let order: Vec<(&str, bool)> = settled
-            .iter()
-            .map(|(pick, built)| (pick.spec.as_str(), built.is_ok()))
-            .collect();
-        assert_eq!(order, expected, "{OUT_OF_ORDER}");
-        for error in settled.iter().filter_map(|(_, built)| built.as_ref().err()) {
-            assert!(error.starts_with(MODEL_POLICY_ERR), "{error}");
+        let mut settled = Vec::new();
+        while settled.len() < expected.len() {
+            land_next(&mut slots, &mut waiting).await;
+            settled.extend(ready_specs(&mut waiting));
         }
+
+        let expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|(spec, built)| ((*spec).to_owned(), *built))
+            .collect();
+        assert_eq!(settled, expected, "{OUT_OF_ORDER}");
+        assert_eq!(waiting.pending_pick(&tab), None);
+    }
+
+    #[tokio::test]
+    async fn a_pick_held_through_an_invalidate_gets_a_slot_built_after_it() {
+        let mut slots = slots(ModelPolicy::default());
+        let before = slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT);
+        let tab = Arc::new(ArcSwap::from(Arc::clone(&before)));
+        let mut waiting = SlotWaiters::default();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), pick_for(&tab));
+        waiting.push(&mut slots, STARTUP_SPEC.to_owned(), pick_for(&tab));
+        slots.invalidate();
+        waiting.restart(&mut slots);
+
+        let mut settled = Vec::new();
+        while settled.len() < 2 {
+            land_next(&mut slots, &mut waiting).await;
+            settled.extend(waiting.take_ready());
+        }
+        let Some((_, Ok(startup))) = settled.last() else {
+            panic!("{NO_SLOT}");
+        };
+        assert!(!Arc::ptr_eq(startup, &before), "{STALE_HELD}");
+    }
+
+    #[tokio::test]
+    async fn a_session_comes_up_while_an_earlier_pick_still_builds() {
+        let mut slots = slots(ModelPolicy::default());
+        let tab = Arc::new(ArcSwap::from(
+            slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT),
+        ));
+        let mut waiting = SlotWaiters::default();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), pick_for(&tab));
+        let dir = TempDir::new().unwrap();
+        waiting.push(&mut slots, STARTUP_SPEC.to_owned(), created(&dir));
+
+        assert_eq!(
+            ready_specs(&mut waiting),
+            [(STARTUP_SPEC.to_owned(), true)],
+            "{SESSION_HELD}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_waiters_on_one_spec_share_its_build() {
+        let mut slots = slots(ModelPolicy::default());
+        let mut waiting = SlotWaiters::default();
+        let dir = TempDir::new().unwrap();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), created(&dir));
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), created(&dir));
+
+        land_next(&mut slots, &mut waiting).await;
+        let ready = waiting.take_ready();
+        assert_eq!(ready.len(), 2);
+        let [(_, Ok(first)), (_, Ok(second))] = &ready[..] else {
+            panic!("{NO_SLOT}");
+        };
+        assert!(Arc::ptr_eq(first, second));
+        assert!(
+            timeout(Duration::ZERO, slots.next_built())
+                .await
+                .is_ok_and(|next| next.is_none())
+        );
     }
 }
