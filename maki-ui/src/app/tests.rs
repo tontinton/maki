@@ -7672,7 +7672,7 @@ fn permission_waits_for_a_focused_window(focused: bool) {
     open_permission_prompt(&mut app);
 
     if focused {
-        assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedWindow);
+        assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
         press(&mut app, KeyCode::Char('y'));
         assert!(took_a_key(&mut events));
         assert!(app.permission_prompt.is_open());
@@ -7692,7 +7692,7 @@ fn focused_window_yields_to_permission_before_plan_form() {
     let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
     open_permission_prompt(&mut app);
 
-    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedWindow);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(took_a_key(&mut events));
     assert!(actions.is_empty());
@@ -7708,6 +7708,23 @@ fn focused_window_yields_to_permission_before_plan_form() {
     assert!(actions.is_empty());
     assert!(app.plan_form.is_visible());
     assert_eq!(app.state.mode, Mode::Plan);
+}
+
+/// A focused `below` split, like the question form, sits beside the prompt
+/// rather than over it, so the prompt still answers `y`.
+#[test]
+fn a_focused_split_does_not_take_keys_from_the_permission_prompt() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    open_split_window(&mut app, Split::Below);
+    open_permission_prompt(&mut app);
+
+    assert!(app.holds_keyboard(KeyboardOwner::FocusedSplit));
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedSplit);
 }
 
 fn open_alert(app: &mut App) {
@@ -13412,7 +13429,8 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::Help => open_help(app),
         KeyboardOwner::Usage => open_usage(app),
         KeyboardOwner::Btw => open_btw(app),
-        KeyboardOwner::FocusedWindow => open_cursor_float(app),
+        KeyboardOwner::FocusedFloat => open_cursor_float(app),
+        KeyboardOwner::FocusedSplit => open_split_window(app, Split::Below),
         KeyboardOwner::Search => open_search(app),
         KeyboardOwner::FilePicker => open_file_picker(app),
         KeyboardOwner::Queue => focus_queue(app),
@@ -13426,13 +13444,14 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
 }
 
 #[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::FocusedFloat ; "focused_float")]
 #[test_case(KeyboardOwner::Permission ; "permission")]
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
 #[test_case(KeyboardOwner::Help ; "help")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
-#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::FocusedSplit ; "focused_split")]
 #[test_case(KeyboardOwner::Search ; "search")]
 #[test_case(KeyboardOwner::FilePicker ; "file_picker")]
 #[test_case(KeyboardOwner::Queue ; "queue")]
@@ -13466,14 +13485,15 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
     assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
 }
 
-#[test_case(KeyboardOwner::Alert, KeyboardOwner::FocusedWindow ; "alert_over_focused_window")]
-#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Permission ; "focused_window_over_permission")]
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::FocusedFloat ; "alert_over_focused_float")]
+#[test_case(KeyboardOwner::FocusedFloat, KeyboardOwner::Permission ; "focused_float_over_permission")]
 #[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
 #[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
 #[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
 #[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
 #[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
-#[test_case(KeyboardOwner::Btw, KeyboardOwner::Search ; "btw_over_search")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedSplit ; "btw_over_focused_split")]
+#[test_case(KeyboardOwner::FocusedSplit, KeyboardOwner::Search ; "focused_split_over_search")]
 #[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
 #[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
 #[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
@@ -13522,12 +13542,13 @@ const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must 
 /// lets the help open. Left out is the help itself, which closes on `<C-h>`,
 /// so a leak would look the same.
 #[test_case(KeyboardOwner::Alert ; "alert")]
+#[test_case(KeyboardOwner::FocusedFloat ; "focused_float")]
 #[test_case(KeyboardOwner::Permission ; "permission")]
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
-#[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
+#[test_case(KeyboardOwner::FocusedSplit ; "focused_split")]
 #[test_case(KeyboardOwner::Search ; "search")]
 #[test_case(KeyboardOwner::FilePicker ; "file_picker")]
 #[test_case(KeyboardOwner::Queue ; "queue")]
