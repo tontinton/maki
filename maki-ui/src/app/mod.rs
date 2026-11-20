@@ -216,18 +216,18 @@ pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 ///
 /// This is not the paint order: the permission prompt, pack review and plan
 /// form sit in the bottom panel under every modal, picker and float, yet
-/// answer before the modals and pickers once no alert or focused Lua window
-/// holds the keyboard.
+/// answer before the modals and pickers once no alert or focused floating Lua
+/// window holds the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
     Alert,
-    /// Drawn under only [`Self::Alert`], so a focused Lua window answers
-    /// before the permission prompt, pack review and plan form. An unfocused
-    /// popup never holds the keyboard.
-    FocusedWindow,
+    /// A focused floating Lua window, drawn under only [`Self::Alert`], so it
+    /// answers before the permission prompt, pack review and plan form. An
+    /// unfocused popup never holds the keyboard.
+    FocusedFloat,
     /// A tool is blocked on it and it owns the bottom panel, hiding the pack
-    /// review and plan form, so after [`Self::FocusedWindow`] it goes before
+    /// review and plan form, so after [`Self::FocusedFloat`] it goes before
     /// both. The pack review waits on nothing.
     Permission,
     PackReview,
@@ -236,6 +236,10 @@ enum KeyboardOwner {
     Help,
     Usage,
     Btw,
+    /// A focused Lua split. It sits beside the bottom panel, not over it, so
+    /// the prompts there answer first. An unfocused split never holds the
+    /// keyboard.
+    FocusedSplit,
     Search,
     FilePicker,
     Queue,
@@ -795,6 +799,10 @@ impl App {
 
     fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
         match owner {
+            KeyboardOwner::FocusedFloat => {
+                Overlay::is_open(&self.float_mgr) && Overlay::is_modal(&self.float_mgr)
+            }
+            KeyboardOwner::FocusedSplit => Overlay::is_open(&self.float_mgr),
             KeyboardOwner::PlanForm => self.plan_form_active(),
             KeyboardOwner::Queue => self.queue_focused(),
             KeyboardOwner::Chat => true,
@@ -1505,7 +1513,7 @@ impl App {
                 self.btw_modal.handle_key(key);
                 Some(vec![])
             }
-            KeyboardOwner::FocusedWindow => {
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
                 self.dispatch_focused_window(&Pressed::Key(key, sight), turn);
                 Some(vec![])
             }
@@ -2498,7 +2506,9 @@ impl App {
     }
 
     /// `None` means the owner has no [`Overlay`] of its own, as for the plan
-    /// form, the queue focus and the chat.
+    /// form, the queue focus and the chat. A focused split shares the window
+    /// manager with [`KeyboardOwner::FocusedFloat`], which alone lists it so
+    /// it is closed and asked once.
     fn overlay(&self, owner: KeyboardOwner) -> Option<&dyn Overlay> {
         Some(match owner {
             KeyboardOwner::Alert => &self.alert_modal,
@@ -2507,7 +2517,7 @@ impl App {
             KeyboardOwner::Help => &self.help_modal,
             KeyboardOwner::Usage => &self.usage_modal,
             KeyboardOwner::Btw => &self.btw_modal,
-            KeyboardOwner::FocusedWindow => &self.float_mgr,
+            KeyboardOwner::FocusedFloat => &self.float_mgr,
             KeyboardOwner::Search => &self.search_modal,
             KeyboardOwner::FilePicker => &self.file_picker,
             KeyboardOwner::RewindPicker => &self.rewind_picker,
@@ -2515,7 +2525,10 @@ impl App {
             KeyboardOwner::ModelPicker => &self.model_picker,
             KeyboardOwner::LoginPicker => &self.login_picker,
             KeyboardOwner::McpPicker => &self.mcp_picker,
-            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+            KeyboardOwner::PlanForm
+            | KeyboardOwner::FocusedSplit
+            | KeyboardOwner::Queue
+            | KeyboardOwner::Chat => return None,
         })
     }
 
@@ -2527,7 +2540,7 @@ impl App {
             KeyboardOwner::Help => &mut self.help_modal,
             KeyboardOwner::Usage => &mut self.usage_modal,
             KeyboardOwner::Btw => &mut self.btw_modal,
-            KeyboardOwner::FocusedWindow => &mut self.float_mgr,
+            KeyboardOwner::FocusedFloat => &mut self.float_mgr,
             KeyboardOwner::Search => &mut self.search_modal,
             KeyboardOwner::FilePicker => &mut self.file_picker,
             KeyboardOwner::RewindPicker => &mut self.rewind_picker,
@@ -2535,7 +2548,10 @@ impl App {
             KeyboardOwner::ModelPicker => &mut self.model_picker,
             KeyboardOwner::LoginPicker => &mut self.login_picker,
             KeyboardOwner::McpPicker => &mut self.mcp_picker,
-            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+            KeyboardOwner::PlanForm
+            | KeyboardOwner::FocusedSplit
+            | KeyboardOwner::Queue
+            | KeyboardOwner::Chat => return None,
         })
     }
 
@@ -2749,7 +2765,7 @@ impl App {
             | KeyboardOwner::Btw
             | KeyboardOwner::Queue => {}
             KeyboardOwner::Permission => self.permission_prompt.handle_paste(text),
-            KeyboardOwner::FocusedWindow => {
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
                 self.dispatch_focused_window(&Pressed::Paste(text.to_owned()), turn);
             }
             KeyboardOwner::Search => {
