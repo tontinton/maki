@@ -91,6 +91,10 @@ struct FloatWindow {
     /// a window nobody can see is a key taken from the user with no footer to
     /// tell them where it went.
     on_screen: bool,
+    /// Whether a frame has ended since the window opened or was last shown.
+    /// Until one has, `on_screen` has had no chance to be set, so a window a
+    /// handler just opened still takes the keys typed after it.
+    framed: bool,
     event_tx: UnboundedSender<WinEvent>,
     cmd_rx: UnboundedReceiver<WinCommand>,
 }
@@ -286,6 +290,7 @@ impl FloatManager {
             opened_focused: focus,
             painting: false,
             on_screen: false,
+            framed: false,
             event_tx,
             cmd_rx,
         };
@@ -346,6 +351,10 @@ impl FloatManager {
                         win.set_cursor(row);
                     }
                     Ok(WinCommand::SetVisible(v)) => {
+                        // A window shown again gets one frame to paint.
+                        if v && !win.visible {
+                            win.framed = false;
+                        }
                         win.visible = v;
                     }
                     Ok(WinCommand::Close) | Err(TryRecvError::Disconnected) => {
@@ -383,8 +392,11 @@ impl FloatManager {
         self.windows.iter().any(FloatWindow::needs_input)
     }
 
-    /// The focused window is handed every key, ahead of every overlay the host
-    /// owns: it is the thing the user is looking at and typing into.
+    /// The focused window is handed every key the app routes to it: it is the
+    /// thing the user is looking at and typing into. The app decides which
+    /// overlays answer first: an alert always does, the bottom panel prompts
+    /// do for a focused split, and a permission prompt keeps `<C-c>` even
+    /// under a focused float.
     ///
     /// A press no notation names, like `Super+Enter`, is still spent here with
     /// nothing sent. Letting it through would run a built-in binding on the
@@ -402,6 +414,15 @@ impl FloatManager {
     fn focused(&self) -> Option<&FloatWindow> {
         let fid = self.focused_id?;
         self.windows.iter().find(|w| w.id == fid)
+    }
+
+    /// Whether the focused window is visible and the last frame painted it,
+    /// or no frame has had the chance to yet. `win:hide()` and
+    /// `visible = false` keep the focus, so focus alone would let a window
+    /// nobody can see eat the keys meant for a prompt on screen.
+    pub fn focused_on_screen(&self) -> bool {
+        self.focused()
+            .is_some_and(|w| w.visible && (w.on_screen || !w.framed))
     }
 
     pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {
@@ -513,6 +534,7 @@ impl FloatManager {
 
         for win in &mut self.windows {
             win.on_screen = std::mem::take(&mut win.painting);
+            win.framed = true;
         }
         self.focused_caret = std::mem::take(&mut self.painting_caret);
 
@@ -2670,6 +2692,7 @@ mod tests {
             opened_focused: true,
             painting: false,
             on_screen: false,
+            framed: false,
             event_tx,
             cmd_rx,
         }

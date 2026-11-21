@@ -987,11 +987,14 @@ lua_table! {
     /// current mode.
     ///
     /// 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
-    ///    here, and `<C-c>` still goes to step 2 first.
-    /// 2. Maki's modals and prompts, then the focused window, then Maki's
-    ///    pickers. They take every key, except the plan form and the `/`
-    ///    command list, which pass on the keys they do not use. The focused
-    ///    window runs its buffer's bindings, then its `win:recv`.
+    ///    here, and `<C-c>` still goes to step 2 first. An open permission
+    ///    prompt takes `<C-c>` even under the focused floating window, so it
+    ///    can always be denied.
+    /// 2. Maki's alerts, then the focused floating window, then Maki's
+    ///    prompts and modals, then the focused split, then Maki's pickers.
+    ///    They take every key, except the plan form and the `/` command list,
+    ///    which pass on the keys they do not use. The focused window runs its
+    ///    buffer's bindings, then its `win:recv`.
     /// 3. Windows on screen, front first: each one's buffer bindings, then
     ///    the keys it claimed with the `keys` option of `maki.ui.open_win`.
     /// 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
