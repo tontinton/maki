@@ -222,8 +222,10 @@ enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
     Alert,
     /// A focused floating Lua window, drawn under only [`Self::Alert`], so it
-    /// answers before the permission prompt, pack review and plan form. An
-    /// unfocused popup never holds the keyboard.
+    /// answers before the permission prompt, pack review and plan form. The
+    /// one exception is `<C-c>`, which still denies a permission prompt under
+    /// it, so a plugin that stopped reading keys cannot hang the tool call.
+    /// An unfocused popup never holds the keyboard.
     FocusedFloat,
     /// A tool is blocked on it and it owns the bottom panel, hiding the pack
     /// review and plan form, so after [`Self::FocusedFloat`] it goes before
@@ -1523,6 +1525,11 @@ impl App {
                 self.btw_modal.handle_key(key);
                 Some(vec![])
             }
+            KeyboardOwner::FocusedFloat
+                if key::QUIT.matches(key) && self.holds_keyboard(KeyboardOwner::Permission) =>
+            {
+                self.dispatch_to_owner(KeyboardOwner::Permission, key, sight, turn)
+            }
             KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
                 self.dispatch_focused_window(&Pressed::Key(key, sight), turn);
                 Some(vec![])
@@ -1862,7 +1869,8 @@ impl App {
     ///    [`Self::update`]. `Ctrl+Z` suspends right here. `Ctrl+C` is not
     ///    answered here: no binding can take it and [`Self::reserved_by_host`]
     ///    skips the global bindings for it, but the modals and a focused
-    ///    window still see it.
+    ///    window still see it. A permission prompt takes it from a focused
+    ///    float over it, so the prompt can always be denied.
     /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
     ///    [`KeyboardOwner`] order, which includes the focused window,
     ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
@@ -1873,9 +1881,10 @@ impl App {
     /// 5. Global bindings, [`Self::dispatch_binding`] without a buffer.
     /// 6. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
     ///
-    /// A focused window is above the overlays opened under it because it is
-    /// the window the user is in. An unfocused one is below them because it
-    /// is not: the popup is up while the user works underneath, so a modal
+    /// A focused float is above the overlays opened under it because it is
+    /// the window the user is in. A focused split sits beside the bottom
+    /// panel, so the prompts there answer first. An unfocused window is below
+    /// the overlays because it is not where the user is: the popup is up while the user works underneath, so a modal
     /// opened over it outranks it, and its keys come back the moment the
     /// modal closes. The command palette is one of those overlays, so a
     /// popup's `<Tab>` or `<CR>` leaves the `/` command being typed alone.

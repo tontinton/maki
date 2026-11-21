@@ -4121,7 +4121,9 @@ Each key runs one handler: the first match in this list, for the
 current mode.
 
 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
-   here, and `<C-c>` still goes to step 2 first.
+   here, and `<C-c>` still goes to step 2 first. An open permission
+   prompt takes `<C-c>` even under the focused floating window, so it
+   can always be denied.
 2. Maki's alerts, then the focused floating window, then Maki's
    prompts and modals, then the focused split, then Maki's pickers.
    They take every key, except the plan form and the `/` command list,
