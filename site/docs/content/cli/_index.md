@@ -31,11 +31,11 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | error | yes | yes |
+| `--max-turns`, `--max-budget-usd` | error | yes | yes |
 | `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
 
-`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--permission-mode` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
+`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--max-budget-usd`, `--permission-mode` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
 
 ### Shared flags (detail)
 
@@ -61,6 +61,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
+| `--max-budget-usd <USD>` | Stop the session once its spend, subagents included, reaches this many dollars (`--print` and SDK). The request that crosses the cap finishes; the next one does not start, and the SDK result is `error_max_budget_usd`. A model Maki has no price for never counts toward the cap, and Maki warns once when that happens |
 | `--system-prompt <TEXT>` | Replace the main agent's whole system prompt, so project instructions are dropped too. Subagents keep their own |
 | `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |

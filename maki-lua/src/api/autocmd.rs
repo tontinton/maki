@@ -281,7 +281,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   that never ran, like a cancelled one, has neither.
 /// - `"TurnStart"`: `data.text`, the message that started the turn.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+///   `"max_turns"`, `"max_budget"`, `"cancelled"`, or `"dropped"` when an
 ///   `agent.user_message` layer refused the message), `data.usage` (four
 ///   token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
 ///   `data.context_window`, and `data.num_turns` (model round-trips the

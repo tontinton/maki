@@ -109,6 +109,7 @@ pub async fn run_turns(
             | DoneReason::EndTurn
             | DoneReason::MaxTokens
             | DoneReason::MaxTurns
+            | DoneReason::MaxBudget
             | DoneReason::Compact => {}
         }
         match next_wake(control, mailbox, caller).await? {

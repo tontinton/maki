@@ -17,9 +17,12 @@ use serde::{Deserialize, Serialize};
 use strum::Display;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Notify, watch};
+use tracing::warn;
 
 use crate::SessionControl;
 pub const NO_FILES_FOUND: &str = "No files found";
+const UNPRICED_UNDER_CAP: &str =
+    "maki has no price for this model, so --max-budget-usd does not count its turns";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -614,6 +617,8 @@ pub enum DoneReason {
     EndTurn,
     MaxTokens,
     MaxTurns,
+    /// The session spent its `max_budget_usd`.
+    MaxBudget,
     Cancelled,
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
@@ -1291,9 +1296,32 @@ impl CostTally {
 pub struct RunLedger {
     totals: Mutex<RunTotals>,
     parent: Option<Arc<RunLedger>>,
+    /// The session's dollar cap. Only a root ledger has one: children pass
+    /// their spend up, so the root sees every run, subagent and compaction.
+    cap: Option<f64>,
+    warned_unpriced: AtomicBool,
 }
 
 impl RunLedger {
+    /// A root ledger that stops the session once `limit_usd` is spent.
+    pub fn capped(limit_usd: f64) -> Self {
+        Self {
+            cap: Some(limit_usd),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this ledger or one above it has spent its cap. Spend is booked
+    /// after the fact, so the check sits before each request.
+    pub fn exhausted(&self) -> bool {
+        self.cap
+            .is_some_and(|cap| self.totals().cost.is_some_and(|spent| spent >= cap))
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.exhausted())
+    }
+
     pub fn child(parent: &Arc<Self>) -> Arc<Self> {
         Self::carrying(parent, RunTotals::default())
     }
@@ -1304,6 +1332,7 @@ impl RunLedger {
         Arc::new(Self {
             totals: Mutex::new(carried),
             parent: Some(Arc::clone(parent)),
+            ..Self::default()
         })
     }
 
@@ -1313,6 +1342,13 @@ impl RunLedger {
             cost,
             list_cost,
         };
+        if self.first_unpriced_turn_under_cap(cost) {
+            warn!(
+                cap_usd = self.cap,
+                "unpriced turn, budget cap cannot count it"
+            );
+            eprintln!("warning: {UNPRICED_UNDER_CAP}");
+        }
         if let Some(parent) = &self.parent {
             parent.add(usage, cost, list_cost);
         }
@@ -1320,6 +1356,10 @@ impl RunLedger {
 
     pub fn totals(&self) -> RunTotals {
         *self.locked()
+    }
+
+    fn first_unpriced_turn_under_cap(&self, cost: Option<f64>) -> bool {
+        self.cap.is_some() && cost.is_none() && !self.warned_unpriced.swap(true, Ordering::Relaxed)
     }
 
     /// A poisoned lock only means another run panicked mid-update. The totals
@@ -2229,5 +2269,36 @@ mod tests {
             retained.send(AgentEvent::Nudge),
             Err(AgentError::Channel)
         ));
+    }
+
+    #[test]
+    fn capped_ledger_sees_spend_from_every_child() {
+        let root = Arc::new(RunLedger::capped(0.01));
+        let run = RunLedger::child(&root);
+        let subagent = RunLedger::child(&run);
+
+        subagent.add(TokenUsage::default(), Some(0.004), None);
+        assert!(!run.exhausted());
+        subagent.add(TokenUsage::default(), Some(0.007), None);
+        assert!(run.exhausted() && subagent.exhausted() && root.exhausted());
+        assert!(!RunLedger::child(&Arc::default()).exhausted());
+    }
+
+    #[test]
+    fn unpriced_turns_never_exhaust_the_cap_and_warn_once() {
+        let root = Arc::new(RunLedger::capped(0.01));
+        let subagent = RunLedger::child(&root);
+        subagent.add(usage(FIRST_INPUT), None, None);
+
+        assert!(!root.exhausted());
+        assert!(root.warned_unpriced.load(Ordering::Relaxed));
+        assert!(!root.first_unpriced_turn_under_cap(None));
+    }
+
+    #[test_case(None, None ; "uncapped")]
+    #[test_case(Some(0.01), Some(FIRST_COST) ; "priced")]
+    fn only_an_unpriced_turn_under_a_cap_warns(cap: Option<f64>, cost: Option<f64>) {
+        let ledger = cap.map_or_else(RunLedger::default, RunLedger::capped);
+        assert!(!ledger.first_unpriced_turn_under_cap(cost));
     }
 }

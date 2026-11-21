@@ -547,6 +547,9 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            if self.ledger.exhausted() {
+                return Ok(DoneReason::MaxBudget);
+            }
             self.follow_served_window().await?;
             self.try_auto_compact().await?;
             match self.turn().await? {
@@ -2611,6 +2614,34 @@ mod tests {
         let (turns, reason) = run_agent(provider, max_turns).await;
         assert_eq!(turns, expected_turns);
         assert_eq!(reason, expected_reason);
+    }
+
+    /// `--max-budget-usd`: the turn that crosses the cap finishes, and the
+    /// continuation it would have earned never reaches the provider.
+    #[tokio::test]
+    async fn spent_budget_stops_before_the_next_request() {
+        let mut first = text_response(StopReason::MaxTokens);
+        first.usage = TokenUsage {
+            input: 1_000,
+            output: 400,
+            ..Default::default()
+        };
+        let provider = MockProvider::new(vec![first, text_response(StopReason::EndTurn)]);
+        let mut history = History::new(Vec::new());
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+        agent.ledger = Arc::new(RunLedger::capped(0.000_001));
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+
+        let done = drain_events(&mut event_rx)
+            .into_iter()
+            .find_map(|e| match e.event {
+                AgentEvent::Done {
+                    num_turns, reason, ..
+                } => Some((num_turns, reason)),
+                _ => None,
+            });
+        assert_eq!(done, Some((1, DoneReason::MaxBudget)));
     }
 
     #[test_case(Some(true),  true,  true  ; "after_tool_use_turn")]
