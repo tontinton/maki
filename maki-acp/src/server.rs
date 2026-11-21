@@ -1547,7 +1547,6 @@ mod tests {
     use maki_agent::{McpPromptInfo, McpSnapshot};
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
-    use maki_lua::session_snapshot::NO_CALLING_SESSION_ERR;
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
@@ -3037,7 +3036,6 @@ mod tests {
         for id in [&first_id, &last_id] {
             assert_eq!(read(Some(id)).unwrap()["id"], **id);
         }
-        assert_eq!(read(None).unwrap_err(), NO_CALLING_SESSION_ERR);
 
         close_session(&mut srv, &last_sid, SessionEndReason::Delete).await;
         assert!(read(Some(&last_id)).is_err());

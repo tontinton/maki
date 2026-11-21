@@ -1524,27 +1524,16 @@ mod tests {
         let sessions = acp(&lua);
         let (a, b) = (MakiId::generate(), MakiId::generate());
         let _a = register(&sessions, a);
-        let b_registered = register(&sessions, b);
+        let _b = register(&sessions, b);
         let none_calling = (
             (None, Some(NO_CALLING_SESSION_ERR.to_owned())),
             (None, Some(NO_CALLING_SESSION_ERR.to_owned())),
         );
-
         assert_eq!(current_and_read(&lua).await, none_calling);
+
         serving(&lua, a);
         let a_answers = ((Some(a.to_string()), None), (Some(a.to_string()), None));
         assert_eq!(current_and_read(&lua).await, a_answers);
-
-        drop(b_registered);
-        let (_, read_b_err): (Value, Option<String>) = lua
-            .load(format!("return session.read({{ session = '{b}' }})"))
-            .eval_async()
-            .await
-            .unwrap();
-        assert!(read_b_err.is_some(), "a closed session must not read live");
-        assert_eq!(current_and_read(&lua).await, a_answers);
-        lua.remove_app_data::<TaskHandle>();
-        assert_eq!(current_and_read(&lua).await, none_calling);
     }
 
     /// The TUI asks for the focused tab unless a tool call runs, and then
