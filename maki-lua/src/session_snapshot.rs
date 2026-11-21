@@ -315,6 +315,7 @@ impl HeadlessSessions {
     }
 
     /// Answers for `session` until the returned guard drops.
+    #[must_use = "dropping the guard unregisters the session at once"]
     pub fn register(
         &self,
         session: SessionRef,
