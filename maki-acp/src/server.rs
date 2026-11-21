@@ -1332,7 +1332,9 @@ fn start_event_pump(
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
         while let Some(envelope) = events.next().await {
-            observer.fold(&envelope);
+            // Ahead of the filters below, which keep subagents off the wire:
+            // the plugin host decides what their events mean.
+            observer.observe(&envelope);
             let Envelope {
                 event, subagent, ..
             } = envelope;
@@ -1545,6 +1547,7 @@ mod tests {
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
     use maki_lua::EventHandle;
+    use maki_lua::test_support::probed_event_handle;
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
@@ -2112,6 +2115,17 @@ mod tests {
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
     async fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
+        let observer =
+            SessionObserver::disconnected_for_test(only_session(srv).handle.session_id.clone());
+        run_observed_pump(srv, initial_cost, observer, feed).await;
+    }
+
+    async fn run_observed_pump(
+        srv: &Server,
+        initial_cost: Option<f64>,
+        observer: SessionObserver,
+        feed: impl FnOnce(&EventSender),
+    ) {
         let session = only_session(srv);
         let (guard, events) = maki_agent::event_stream();
         let pump = start_event_pump(
@@ -2119,7 +2133,7 @@ mod tests {
             client_id(&session.handle.session_id),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
-            SessionObserver::disconnected_for_test(session.handle.session_id.clone()),
+            observer,
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -2630,6 +2644,53 @@ mod tests {
             .expect("the permission request reaches the client");
         assert_eq!(request["method"], "session/request_permission");
         assert_eq!(request["params"]["toolCall"]["title"], title);
+    }
+
+    const TOOL_START_EVENT: &str = "ToolStart";
+    const TURN_END_EVENT: &str = "TurnEnd";
+    const ONLY_MAIN_TOOL_CALL_ON_THE_WIRE: &str = "only the main tool call reaches the client";
+
+    /// Plugins hear a session's agent events as under the other drivers: the
+    /// main tool call and the turn end, named by the session, and nothing for
+    /// a subagent's text, while the client still gets only the tool call.
+    #[tokio::test]
+    async fn event_pump_fires_the_host_events_of_its_session() {
+        let (srv, .., mut out_rx) = test_server();
+        let session_id = only_session(&srv).handle.session_id.clone();
+        let (handle, probe) = probed_event_handle();
+        let hosted = fixture_hosted(&HeadlessHost::many(handle), &session_id, &Arc::default());
+
+        run_observed_pump(&srv, None, hosted.observer(), |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: QUEUED_TEXT.to_owned(),
+                    },
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        let fired: Vec<_> = iter::from_fn(|| probe.try_recv_autocmd())
+            .map(|(event, data)| (event, data["session_id"].clone()))
+            .collect();
+        let sid = Value::from(session_id.to_string());
+        assert_eq!(
+            fired,
+            [
+                (TOOL_START_EVENT.to_owned(), sid.clone()),
+                (TURN_END_EVENT.to_owned(), sid),
+            ]
+        );
+        assert_eq!(
+            drain(&mut out_rx).len(),
+            1,
+            "{ONLY_MAIN_TOOL_CALL_ON_THE_WIRE}"
+        );
     }
 
     /// A resumed session opens with a bill, and subagent turns spend against it

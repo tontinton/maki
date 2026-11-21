@@ -133,12 +133,6 @@ impl SessionObserver {
         agent_autocmd::dispatch(&self.handle, &self.session, envelope);
     }
 
-    /// Folds {envelope} into what `maki.session.read` answers, firing no host
-    /// events.
-    pub fn fold(&self, envelope: &Envelope) {
-        self.snapshot.observe(envelope);
-    }
-
     #[doc(hidden)]
     pub fn disconnected_for_test(session: SessionRef) -> Self {
         Self {
