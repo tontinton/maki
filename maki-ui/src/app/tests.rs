@@ -7684,6 +7684,31 @@ fn permission_waits_for_a_focused_window(focused: bool) {
     assert!(!app.permission_prompt.is_open());
 }
 
+/// A float whose plugin stopped reading keys must not leave the tool call
+/// hanging: `<C-c>` still denies the prompt under it, while other keys and
+/// `<C-c>` with no prompt open still go to the float.
+#[test]
+fn ctrl_c_denies_the_permission_prompt_under_a_focused_float() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (mut events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(took_a_key(&mut events));
+
+    open_permission_prompt(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(took_a_key(&mut events));
+    assert!(app.permission_prompt.is_open());
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+}
+
 #[test]
 fn permission_answers_before_the_plan_form_once_the_float_closes() {
     let mut app = test_app();

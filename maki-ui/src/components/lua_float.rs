@@ -387,8 +387,11 @@ impl FloatManager {
         self.windows.iter().any(FloatWindow::needs_input)
     }
 
-    /// The focused window is handed every key, ahead of every overlay the host
-    /// owns: it is the thing the user is looking at and typing into.
+    /// The focused window is handed every key the app routes to it: it is the
+    /// thing the user is looking at and typing into. The app decides which
+    /// overlays answer first: an alert always does, the bottom panel prompts
+    /// do for a focused split, and a permission prompt keeps `<C-c>` even
+    /// under a focused float.
     ///
     /// A press no notation names, like `Super+Enter`, is still spent here with
     /// nothing sent. Letting it through would run a built-in binding on the
