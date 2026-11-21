@@ -7266,6 +7266,23 @@ mod read_tool_required_params {
         );
     }
 
+    #[test_case::test_case(-3, 0, "3: line 3\n4: line 4\n5: line 5" ; "last_lines")]
+    #[test_case::test_case(-3, 2, "3: line 3\n4: line 4\n\n...\n\nTruncated lines: 5-5. Use offset=5 to read further." ; "limited_from_the_end")]
+    #[test_case::test_case(-9, 0, "1: line 1\n2: line 2\n3: line 3\n4: line 4\n5: line 5" ; "more_than_the_file_has")]
+    fn negative_offset_counts_from_the_end(offset: i32, limit: i32, expected: &str) {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line 1\nline 2\nline 3\nline 4\nline 5\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "offset": offset, "limit": limit }),
+        );
+        assert_eq!(out.as_deref(), Ok(expected));
+    }
+
     #[test]
     fn limit_zero_respects_2000_cap() {
         let (reg, _host) = builtins_host();

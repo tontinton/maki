@@ -867,7 +867,8 @@ pub(crate) struct Lineage {
     pub(crate) command_depth: u8,
     /// The session whose tool call this task serves. Its windows go to that
     /// session's tab, which is not always the one on screen.
-    pub(crate) session: Option<MakiId>,
+    /// As the host named it, so a legacy hex id reads back the way it came in.
+    pub(crate) session: Option<SessionRef>,
 }
 
 impl Lineage {
@@ -7176,7 +7177,7 @@ mod tests {
         let lua = enqueue_test_lua();
         let lineage = Lineage {
             command_depth: 3,
-            session: Some(MakiId::generate()),
+            session: Some(SessionRef::generate()),
         };
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.lineage = lineage.clone();
@@ -7377,7 +7378,7 @@ mod tests {
         let mut cell = TaskCell::new(token, Some(Instant::now()), None);
         cell.lineage = Lineage {
             command_depth: SPAWN_COMMAND_DEPTH,
-            session: Some(MakiId::generate()),
+            session: Some(SessionRef::generate()),
         };
         cell.inline_spawn = Some(Vec::new());
         let scope = TaskScope::new(&lua, cell);

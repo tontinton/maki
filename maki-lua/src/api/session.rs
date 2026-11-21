@@ -7,6 +7,7 @@
 //! block's `source`, which is a `maki.image.Image` sharing the payload.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
@@ -96,7 +97,7 @@ fn runs_on_enter(message: &Message) -> bool {
         })
 }
 
-pub(crate) fn not_live(session: MakiId) -> String {
+pub(crate) fn not_live(session: impl Display) -> String {
     format!("{NOT_LIVE_ERR}: {session}")
 }
 
@@ -233,7 +234,11 @@ async fn read(
         Some(t) => t.opt::<String>("session")?,
         None => None,
     }
-    .or_else(|| Lineage::current(&lua).session.map(|id| id.to_string()));
+    .or_else(|| {
+        Lineage::current(&lua)
+            .session
+            .map(|session| session.to_string())
+    });
     // A headless driver installs a provider for the sessions it runs. The
     // UI leaves the slot empty and answers from its event loop, which owns
     // the live runtimes. The slot is asked in its own statement, so its
@@ -268,13 +273,10 @@ async fn read(
 async fn calling_session(
     lua: &Lua,
     tx: Option<&UnboundedSender<UiAction>>,
-) -> Result<MakiId, String> {
+) -> Result<String, String> {
     match Lineage::current(lua).session {
-        Some(id) => Ok(id),
-        None => focused_session(lua, tx)
-            .await?
-            .parse::<MakiId>()
-            .map_err(|e| e.to_string()),
+        Some(session) => Ok(session.to_string()),
+        None => focused_session(lua, tx).await,
     }
 }
 
@@ -311,10 +313,11 @@ async fn named_or_calling(
     tx: Option<&UnboundedSender<UiAction>>,
     id: Option<String>,
 ) -> Result<MakiId, String> {
-    match id {
-        Some(raw) => raw.parse::<MakiId>().map_err(|e| e.to_string()),
-        None => calling_session(lua, tx).await,
-    }
+    let raw = match id {
+        Some(raw) => raw,
+        None => calling_session(lua, tx).await?,
+    };
+    raw.parse::<MakiId>().map_err(|e| e.to_string())
 }
 
 /// A live session from memory, unsaved messages included, any other from
@@ -533,11 +536,7 @@ async fn current(
     lua: Lua,
     #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<String>> {
-    Ok(pair(
-        calling_session(&lua, tx.as_ref())
-            .await
-            .map(|id| id.to_string()),
-    ))
+    Ok(pair(calling_session(&lua, tx.as_ref()).await))
 }
 
 /// Returns this plugin's data directory for a session,
@@ -568,13 +567,7 @@ async fn data_dir(
         None => None,
     };
     let path: Result<String, String> = async {
-        let named = named
-            .map(|raw| raw.parse::<MakiId>().map_err(|e| e.to_string()))
-            .transpose()?;
-        let session = match named {
-            Some(id) => id,
-            None => calling_session(&lua, tx.as_ref()).await?,
-        };
+        let session = named_or_calling(&lua, tx.as_ref(), named).await?;
         let state = state_dir(&lua)?;
         Ok(session_data_dir(state.path(), session)
             .join(&*plugin)
@@ -1345,6 +1338,7 @@ mod tests {
     use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
     use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
+    use maki_storage::id::SessionRef;
     use maki_storage::sessions::{SessionClaim, StoredMode, StoredSubagent, StoredThinking};
     use tempfile::TempDir;
     use tokio::sync::mpsc::UnboundedSender;
@@ -1359,8 +1353,8 @@ mod tests {
     use crate::plugin_permissions::denied_error;
     use crate::runtime::{TaskCell, TaskHandle};
     use crate::session_snapshot::{
-        HeadlessMeta, HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN,
-        NO_CALLING_SESSION_ERR, RegisteredSession, STATUS_IDLE, STATUS_STORED,
+        HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, NO_CALLING_SESSION_ERR,
+        RegisteredSession, STATUS_IDLE, STATUS_STORED,
     };
     use mlua::Value;
     use serde_json::json;
@@ -1428,9 +1422,31 @@ mod tests {
 
     /// Runs what follows as a tool call of `session` would.
     fn serving(lua: &Lua, session: MakiId) {
+        serving_ref(lua, SessionRef::from(session));
+    }
+
+    fn serving_ref(lua: &Lua, session: SessionRef) {
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.lineage.session = Some(session);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+    }
+
+    /// A tool call and the driver must spell a resumed legacy session alike, or
+    /// a plugin comparing `current()` to an event's `session_id` never matches.
+    #[tokio::test]
+    async fn current_keeps_the_spelling_a_legacy_session_resumed_with() {
+        let id = MakiId::generate();
+        let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let lua = headless_focused_on(MakiId::generate());
+        serving_ref(&lua, hex.parse().unwrap());
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.current()")
+            .eval_async()
+            .await
+            .unwrap();
+
+        assert_eq!((got, err), (Some(hex), None));
     }
 
     #[tokio::test]
@@ -1469,13 +1485,17 @@ mod tests {
         sessions
     }
 
-    fn register(sessions: &HeadlessSessions, id: MakiId) -> RegisteredSession {
-        let meta = HeadlessMeta {
-            id: id.to_string(),
-            cwd: FACTS_CWD.to_owned(),
-            model: MODEL.to_owned(),
-        };
-        sessions.register(id, &HeadlessSnapshot::default(), meta, || MODE_BUILD)
+    /// Registered and published, the way an open ACP session is.
+    fn register(
+        sessions: &HeadlessSessions,
+        id: MakiId,
+    ) -> (RegisteredSession, (History, SharedHeader)) {
+        let live = live_unsaved(id, Vec::new());
+        let registered =
+            sessions.register(SessionRef::from(id), &HeadlessSnapshot::default(), || {
+                MODE_BUILD
+            });
+        (registered, live)
     }
 
     async fn current_and_read(lua: &Lua) -> (Pair<String>, Pair<String>) {
@@ -2896,10 +2916,8 @@ mod tests {
     #[tokio::test]
     async fn headless_new_without_a_driver_session_lands_where_maki_runs() {
         let (lua, _dir) = headless();
-        let open = MakiId::generate();
-        let _live = live_unsaved(open, Vec::new());
         let sessions = acp(&lua);
-        let _registered = register(&sessions, open);
+        let _registered = register(&sessions, MakiId::generate());
 
         let id: String = eval(
             &lua,

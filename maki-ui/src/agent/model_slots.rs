@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_config::ModelPolicy;
-use maki_providers::provider::from_model;
-use maki_providers::{Model, Timeouts};
+use maki_providers::provider::{Provider, from_model, from_model_async};
+use maki_providers::{AgentError, Model, Timeouts};
+use tokio::task::{Id, JoinError, JoinSet};
 use tracing::warn;
 
 use super::ModelSlot;
 
-const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
+pub(crate) const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
+const BUILD_PANICKED_ERR: &str = "Building the provider failed unexpectedly";
 
 /// Every model and provider this process has built, keyed by spec.
 ///
@@ -21,11 +23,41 @@ const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 /// provider that match.
 pub(crate) struct ModelSlots {
     built: HashMap<String, Arc<ModelSlot>>,
-    /// What the process started on. `get_or_fallback` leans on it so opening a
-    /// session always ends up with a model that works.
+    /// What the process started on. Opening a session leans on it so it always
+    /// ends up with a model that works.
     fallback: Arc<ModelSlot>,
     policy: Arc<ModelPolicy>,
     timeouts: Timeouts,
+    /// How many invalidates there were. A build stamped with an older one ran
+    /// on credentials or a catalog that are gone.
+    epoch: u64,
+    /// The builds running off the event loop, one per spec, whoever asked.
+    building: JoinSet<Built>,
+    /// The spec each one builds and the epoch it started in.
+    in_flight: HashMap<Id, (String, u64)>,
+}
+
+type Built = Result<Arc<ModelSlot>, String>;
+
+/// What [`ModelSlots::next_built`] hands to [`ModelSlots::land`].
+pub(crate) type Landed = Result<(Id, Built), JoinError>;
+
+fn model(policy: &ModelPolicy, spec: &str) -> Result<Model, String> {
+    if !policy.allows(spec) {
+        return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
+    }
+    Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))
+}
+
+fn into_slot(
+    model: Model,
+    provider: Result<Box<dyn Provider>, AgentError>,
+) -> Result<Arc<ModelSlot>, String> {
+    let provider = provider.map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+    Ok(Arc::new(ModelSlot {
+        model,
+        provider: Arc::from(provider),
+    }))
 }
 
 impl ModelSlots {
@@ -40,25 +72,25 @@ impl ModelSlots {
             fallback: startup,
             policy,
             timeouts,
+            epoch: 0,
+            building: JoinSet::new(),
+            in_flight: HashMap::new(),
         }
     }
 
-    /// An explicit pick, where a rejected spec has to surface rather than
-    /// quietly downgrade the user to something else.
-    pub(crate) fn try_get(&mut self, spec: &str) -> Result<Arc<ModelSlot>, String> {
-        if let Some(slot) = self.built.get(spec) {
-            return Ok(Arc::clone(slot));
+    pub(crate) fn get(&self, spec: &str) -> Option<Arc<ModelSlot>> {
+        self.built.get(spec).map(Arc::clone)
+    }
+
+    /// Building reads credentials and `providers.toml` and can run a child
+    /// process, so only startup, which has nothing to draw yet, builds here.
+    fn try_get(&mut self, spec: &str) -> Result<Arc<ModelSlot>, String> {
+        if let Some(slot) = self.get(spec) {
+            return Ok(slot);
         }
-        if !self.policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        let mut model = Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let provider = from_model(&mut model, self.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
-        let slot = Arc::new(ModelSlot {
-            model,
-            provider: Arc::from(provider),
-        });
+        let mut model = model(&self.policy, spec)?;
+        let provider = from_model(&mut model, self.timeouts);
+        let slot = into_slot(model, provider)?;
         // Keyed by the requested spec, not the built model's. `from_model`
         // adjusts the model, and later lookups only have the request in hand.
         self.built.insert(spec.to_owned(), Arc::clone(&slot));
@@ -70,41 +102,111 @@ impl ModelSlots {
     pub(crate) fn get_or_fallback(&mut self, spec: &str) -> (Arc<ModelSlot>, Option<String>) {
         match self.try_get(spec) {
             Ok(slot) => (slot, None),
-            Err(reason) => {
-                let chosen = self.fallback.model.spec();
-                warn!(requested = spec, %chosen, %reason, "session opened on a fallback model");
-                (Arc::clone(&self.fallback), Some(reason))
-            }
+            Err(reason) => self.fall_back(spec, reason),
         }
     }
 
-    /// Discovery landed or a provider was re-authenticated. The next `try_get`
-    /// builds again, and only for specs somebody is actually on.
+    pub(crate) fn fall_back(&self, spec: &str, reason: String) -> (Arc<ModelSlot>, Option<String>) {
+        let chosen = self.fallback.model.spec();
+        warn!(requested = spec, %chosen, %reason, "session opened on a fallback model");
+        (Arc::clone(&self.fallback), Some(reason))
+    }
+
+    /// Starts a build of `spec` off the loop unless it has a slot or a build
+    /// already. [`Self::next_built`] says when it is done.
+    pub(crate) fn request(&mut self, spec: &str) {
+        if self.built.contains_key(spec)
+            || self
+                .in_flight
+                .values()
+                .any(|(building, _)| building == spec)
+        {
+            return;
+        }
+        let (policy, timeouts) = (Arc::clone(&self.policy), self.timeouts);
+        let requested = spec.to_owned();
+        let task = self.building.spawn(async move {
+            let mut model = model(&policy, &requested)?;
+            let provider = from_model_async(&mut model, timeouts).await;
+            into_slot(model, provider)
+        });
+        self.in_flight
+            .insert(task.id(), (spec.to_owned(), self.epoch));
+    }
+
+    /// The next build to finish, `None` while none is running.
+    pub(crate) async fn next_built(&mut self) -> Option<Landed> {
+        self.building.join_next_with_id().await
+    }
+
+    /// Takes in a finished build: the spec it was for and its slot, kept for
+    /// the next caller, or why there is none. `None` for a build from before
+    /// the last invalidate, which runs again.
+    pub(crate) fn land(&mut self, landed: Landed) -> Option<(String, Built)> {
+        let (id, built) = match landed {
+            Ok((id, built)) => (id, Ok(built)),
+            Err(panicked) => (panicked.id(), Err(panicked)),
+        };
+        let (spec, epoch) = self.in_flight.remove(&id)?;
+        if epoch != self.epoch {
+            self.request(&spec);
+            return None;
+        }
+        let built = built.unwrap_or_else(|panicked| {
+            warn!(%spec, error = %panicked, "slot build panicked");
+            Err(format!("{BUILD_PANICKED_ERR}: {spec}"))
+        });
+        let built = built.map(|slot| Arc::clone(self.built.entry(spec.clone()).or_insert(slot)));
+        if let Ok(slot) = &built
+            && spec == self.fallback.model.spec()
+        {
+            self.fallback = Arc::clone(slot);
+        }
+        Some((spec, built))
+    }
+
+    /// Discovery landed or a provider was re-authenticated, so every spec
+    /// builds again the next time somebody asks for it. The fallback builds
+    /// again right away, or a session that falls back later would get a
+    /// provider on the credentials from before.
     pub(crate) fn invalidate(&mut self) {
         self.built.clear();
+        self.epoch += 1;
+        self.request(&self.fallback.model.spec());
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{INVALID_MODEL_ERR, MODEL_POLICY_ERR, ModelSlots};
+pub(crate) mod tests {
+    use super::{INVALID_MODEL_ERR, MODEL_POLICY_ERR, ModelSlots, PROVIDER_INIT_ERR};
     use maki_config::ModelPolicy;
+    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
     use maki_providers::provider::from_model;
+    use maki_providers::test_support::isolated_home;
     use maki_providers::{Model, Timeouts};
     use std::sync::Arc;
     use test_case::test_case;
 
     /// A built-in provider that takes any model name and builds without
     /// credentials, so these tests never touch the catalog or the network.
-    const STARTUP_SPEC: &str = "opencode/startup";
-    const OTHER_SPEC: &str = "opencode/other";
+    pub(crate) const STARTUP_SPEC: &str = "opencode/startup";
+    pub(crate) const OTHER_SPEC: &str = "opencode/other";
     const UNPARSEABLE_SPEC: &str = "not-a-spec";
+    /// A `providers.toml` entry with no key anywhere, so its spec parses and
+    /// only building the provider fails.
+    const KEYLESS_SLUG: &str = "keyless";
+    const KEYLESS_SPEC: &str = "keyless/model";
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_KEYLESS_API_KEY";
     const CACHED: &str = "the same spec must not be built twice";
     const NOT_REBUILT: &str = "invalidate must force a rebuild";
     const NOT_THE_STARTUP_SLOT: &str = "the startup spec must resolve to the startup slot";
     const FELL_BACK: &str = "an allowed, buildable spec must not fall back";
     const NO_FLOOR: &str = "invalidate must keep the fallback floor";
     const POISONED: &str = "a failed lookup must not leave a cache entry";
+    const STALE_KEPT: &str = "only a slot built since the last invalidate may be kept";
+    const STALE_FALLBACK: &str = "a fallback must not keep a provider from before an invalidate";
+    const NOT_RUNNING: &str = "a requested spec with no slot has a build running";
+    const OFF_LOOP_DIFFERS: &str = "a build off the loop must reject what try_get rejects";
 
     fn startup_slot() -> Arc<super::ModelSlot> {
         let mut model = Model::from_spec(STARTUP_SPEC).unwrap();
@@ -115,12 +217,25 @@ mod tests {
         })
     }
 
-    fn slots(policy: ModelPolicy) -> ModelSlots {
+    pub(crate) fn slots(policy: ModelPolicy) -> ModelSlots {
         ModelSlots::new(startup_slot(), Arc::new(policy), Timeouts::default())
     }
 
-    fn strict_policy() -> ModelPolicy {
+    pub(crate) fn strict_policy() -> ModelPolicy {
         ModelPolicy::new(&[STARTUP_SPEC.to_owned()], &[]).unwrap()
+    }
+
+    fn declare_keyless_provider() {
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            KEYLESS_SLUG.to_owned(),
+            ProviderDef {
+                protocol: Some(Protocol::Openai),
+                api_key_env: Some(UNSET_KEY_ENV.to_owned()),
+                ..ProviderDef::default()
+            },
+        );
+        config.save().unwrap();
     }
 
     /// Opening ten stored sessions on one model should build one provider, so
@@ -162,8 +277,8 @@ mod tests {
 
     /// `fallback` lives outside `built` on purpose. A clear that took it down
     /// too would leave session-open with nothing to land on.
-    #[test]
-    fn invalidate_rebuilds_and_keeps_the_fallback_floor() {
+    #[tokio::test]
+    async fn invalidate_rebuilds_and_keeps_the_fallback_floor() {
         let mut slots = slots(strict_policy());
         let first = slots.try_get(STARTUP_SPEC).unwrap();
         slots.invalidate();
@@ -177,6 +292,66 @@ mod tests {
         assert!(reason.is_some(), "{NO_FLOOR}");
     }
 
+    /// Lands builds until the one for `spec` is taken in, and says how many
+    /// were turned away as stale on the way.
+    async fn build(
+        slots: &mut ModelSlots,
+        spec: &str,
+    ) -> (usize, Result<Arc<super::ModelSlot>, String>) {
+        slots.request(spec);
+        let mut stale = 0;
+        loop {
+            let landed = slots.next_built().await.expect(NOT_RUNNING);
+            match slots.land(landed) {
+                Some((landed_spec, built)) if landed_spec == spec => return (stale, built),
+                Some(_) => {}
+                None => stale += 1,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spec_has_one_build_however_many_ask() {
+        let mut slots = slots(ModelPolicy::default());
+        slots.request(OTHER_SPEC);
+        let (_, built) = build(&mut slots, OTHER_SPEC).await;
+        let built = built.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&slots.get(OTHER_SPEC).unwrap(), &built),
+            "{CACHED}"
+        );
+        slots.request(OTHER_SPEC);
+        assert!(slots.next_built().await.is_none(), "{CACHED}");
+    }
+
+    #[test_case(ModelPolicy::default(), true ; "a_slot")]
+    #[test_case(strict_policy(), false ; "a_refusal")]
+    #[tokio::test]
+    async fn a_build_from_before_an_invalidate_runs_again(policy: ModelPolicy, builds: bool) {
+        let mut slots = slots(policy);
+        slots.request(OTHER_SPEC);
+        slots.invalidate();
+
+        let (stale, rebuilt) = build(&mut slots, OTHER_SPEC).await;
+        assert_eq!(stale, 1, "{STALE_KEPT}");
+        assert_eq!(rebuilt.is_ok(), builds);
+        assert_eq!(slots.get(OTHER_SPEC).is_some(), builds, "{CACHED}");
+    }
+
+    #[tokio::test]
+    async fn a_fallback_after_an_invalidate_was_built_after_it() {
+        let mut slots = slots(strict_policy());
+        let (before, _) = slots.fall_back(OTHER_SPEC, MODEL_POLICY_ERR.to_owned());
+        slots.invalidate();
+        let landed = slots.next_built().await.expect(NOT_RUNNING);
+        slots.land(landed).expect(STALE_KEPT).1.unwrap();
+
+        let (after, _) = slots.fall_back(OTHER_SPEC, MODEL_POLICY_ERR.to_owned());
+        assert_eq!(after.model.spec(), STARTUP_SPEC, "{NO_FLOOR}");
+        assert!(!Arc::ptr_eq(&before, &after), "{STALE_FALLBACK}");
+    }
+
     /// A cache hit skips both the policy check and the build, so a refusal must
     /// never leave an entry behind or the next caller gets handed a bogus slot.
     /// The strict and unparseable case pins the order, keeping a spec the user
@@ -184,16 +359,23 @@ mod tests {
     #[test_case(strict_policy(), OTHER_SPEC, MODEL_POLICY_ERR ; "a spec off the allow list")]
     #[test_case(ModelPolicy::default(), UNPARSEABLE_SPEC, INVALID_MODEL_ERR ; "a spec that will not parse")]
     #[test_case(strict_policy(), UNPARSEABLE_SPEC, MODEL_POLICY_ERR ; "policy is checked before parsing")]
-    fn a_rejected_spec_errors_every_time_and_falls_back(
+    #[test_case(ModelPolicy::default(), KEYLESS_SPEC, PROVIDER_INIT_ERR ; "a provider that will not build")]
+    #[tokio::test]
+    async fn a_rejected_spec_errors_every_time_and_falls_back(
         policy: ModelPolicy,
         spec: &str,
         expected: &str,
     ) {
+        let _home = isolated_home();
+        declare_keyless_provider();
         let mut slots = slots(policy);
 
         let err = slots.try_get(spec).err().unwrap();
         assert!(err.starts_with(expected), "{err}");
         assert!(slots.try_get(spec).is_err(), "{POISONED}");
+        let off_loop = build(&mut slots, spec).await.1.err();
+        assert_eq!(off_loop.as_ref(), Some(&err), "{OFF_LOOP_DIFFERS}");
+        assert!(slots.get(spec).is_none(), "{POISONED}");
 
         let (slot, reason) = slots.get_or_fallback(spec);
         assert_eq!(slot.model.spec(), STARTUP_SPEC, "{POISONED}");

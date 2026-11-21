@@ -1,6 +1,6 @@
 //! Coalescing write-behind cache with incremental JSONL persistence.
 //!
-//! Apps post session snapshots keyed by session id; the writer thread drains
+//! Apps post session snapshots keyed by session id; the writer task drains
 //! the newest snapshot of every session per wake and performs O(delta)
 //! appends. Deletes travel through the same per-session slot as saves, so
 //! whichever the app asked for last is what reaches disk.
@@ -10,19 +10,21 @@
 //! a write for it is still queued, so a tab that lets go frees it the moment
 //! its last snapshot lands. There is no release message that could overtake
 //! that snapshot.
+//!
+//! Other state files have no session to coalesce under, so they ride the
+//! wake itself as one-off jobs and land in the order they were queued.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
-use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionClaim, SessionError};
-use maki_storage::{StateDir, StorageError};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
+use maki_storage::{StateDir, StorageError, blocking};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -34,6 +36,13 @@ const SAVE_RECOVERED: &str = "Session save recovered";
 type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
+
+type Job = Box<dyn FnOnce(&StateDir) + Send>;
+
+enum Wake {
+    Flush,
+    Run(Job),
+}
 
 /// One slot per session, holding whatever the app asked for last. Deletes
 /// used to ride a side channel, where a flush queued before a delete could
@@ -48,37 +57,46 @@ enum Entry {
 
 pub struct StorageWriter {
     pending: Pending,
-    wake: Sender<()>,
-    done_rx: oneshot::Receiver<Vec<MakiId>>,
+    wake: UnboundedSender<Wake>,
+    /// Not aborted on drop: a writer let go without [`Self::shutdown`] still
+    /// drains what was queued, as long as the runtime lives.
+    task: JoinHandle<Vec<MakiId>>,
 }
 
 impl StorageWriter {
+    /// Spawns the writer task, so it needs a runtime.
     pub fn new(dir: StateDir, warn_tx: UnboundedSender<String>) -> Self {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
-        let (wake, wake_rx) = channel::<()>();
-        let (done_tx, done_rx) = oneshot::channel::<Vec<MakiId>>();
+        let (wake, mut wake_rx) = unbounded_channel::<Wake>();
 
-        std::thread::Builder::new()
-            .name("storage-writer".into())
-            .spawn(move || {
-                let mut writer = Writer {
-                    dir,
-                    warn_tx,
-                    failing: HashSet::new(),
-                };
-                while wake_rx.recv().is_ok() {
-                    writer.flush(&writer_pending);
+        let task = tokio::spawn(async move {
+            let mut writer = Writer {
+                dir,
+                warn_tx,
+                failing: HashSet::new(),
+            };
+            while let Some(wake) = wake_rx.recv().await {
+                match wake {
+                    Wake::Flush => writer = writer.flushed(&writer_pending).await,
+                    Wake::Run(job) => {
+                        let dir = writer.dir.clone();
+                        blocking(move || job(&dir)).await;
+                    }
                 }
-                writer.flush(&writer_pending);
-                let _ = done_tx.send(writer.failing.into_iter().collect());
-            })
-            .expect("failed to spawn storage writer thread");
+            }
+            writer
+                .flushed(&writer_pending)
+                .await
+                .failing
+                .into_iter()
+                .collect()
+        });
 
         Self {
             pending,
             wake,
-            done_rx,
+            task,
         }
     }
 
@@ -86,7 +104,7 @@ impl StorageWriter {
         self.enqueue(session.id, Entry::Save(session, claim));
     }
 
-    /// Delete a session's files on the writer thread; `done` fires there, so
+    /// Delete a session's files on the writer task; `done` fires there, so
     /// callers never block on disk. Deleting a session that was never written
     /// reports success, and a save enqueued afterwards supersedes the delete.
     /// A caller with the session open passes its claim. Any other session is
@@ -100,9 +118,15 @@ impl StorageWriter {
         self.enqueue(id, Entry::Delete(claim, Box::new(done)));
     }
 
+    /// Runs `job` on the writer task after every job queued before it, and
+    /// before [`Self::shutdown`] returns.
+    pub fn persist(&self, job: impl FnOnce(&StateDir) + Send + 'static) {
+        let _ = self.wake.send(Wake::Run(Box::new(job)));
+    }
+
     fn enqueue(&self, id: MakiId, entry: Entry) {
         lock(&self.pending).insert(id, entry);
-        if self.wake.send(()).is_err()
+        if self.wake.send(Wake::Flush).is_err()
             && let Some(Entry::Delete(_, done)) = lock(&self.pending).remove(&id)
         {
             done(Err(writer_gone()));
@@ -114,14 +138,19 @@ impl StorageWriter {
     #[must_use]
     pub async fn shutdown(self, limit: Duration) -> Vec<MakiId> {
         drop(self.wake);
-        timeout(limit, self.done_rx)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| {
+        match timeout(limit, self.task).await {
+            Ok(Ok(failing)) => failing,
+            // The rest of the shutdown still has to run, so a writer that
+            // died only loses its own report.
+            Ok(Err(error)) => {
+                warn!(%error, "storage writer stopped before it drained");
+                Vec::new()
+            }
+            Err(_) => {
                 warn!("storage writer did not drain within {limit:?}");
                 Vec::new()
-            })
+            }
+        }
     }
 }
 
@@ -133,18 +162,32 @@ fn writer_gone() -> SessionError {
     StorageError::Io(io::Error::other("storage writer unavailable")).into()
 }
 
-/// Everything the writer thread owns. It never leaves that thread, so nothing
+/// Everything the writer task owns. One flush has it at a time, so nothing
 /// here needs a lock.
 struct Writer {
     dir: StateDir,
     warn_tx: UnboundedSender<String>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
-    /// Whatever is still in here when the thread stops never reached disk.
+    /// Whatever is still in here when the task ends never reached disk.
     failing: HashSet<MakiId>,
 }
 
 impl Writer {
+    /// The session files are written by sync code, so a whole flush is one
+    /// hop to the blocking pool.
+    async fn flushed(mut self, pending: &Pending) -> Self {
+        if lock(pending).is_empty() {
+            return self;
+        }
+        let pending = Arc::clone(pending);
+        blocking(move || {
+            self.flush(&pending);
+            self
+        })
+        .await
+    }
+
     fn flush(&mut self, pending: &Pending) {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
@@ -205,16 +248,19 @@ impl Writer {
 mod tests {
     use std::path::PathBuf;
 
-    use maki_lua::test_support::runtime;
+    use maki_storage::model::{persist_model, push_recent, read_model, read_recents};
     use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::OpenSession;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
+    const FIRST_PICK: &str = "test/first";
+    const SECOND_PICK: &str = "test/second";
     const CWD: &str = "/tmp/writer";
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
@@ -224,7 +270,8 @@ mod tests {
     const OWED_WRITE_HOLDS: &str = "a session with a write still owed must stay claimed";
     const LANDED_RELEASES: &str = "a session let go is free once its last snapshot landed";
     const NO_WARNING: &str = "the writer never warned";
-    const WRITER_GONE: &str = "the writer thread ended without warning";
+    const JOB_PANIC: &str = "job panicked";
+    const WRITER_GONE: &str = "the writer task ended without warning";
     const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
     const REPORTED_UNSAVED: &str = "a transcript that never landed must be named on the way out";
 
@@ -239,15 +286,15 @@ mod tests {
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
     }
 
-    fn next_warning(warn_rx: &mut UnboundedReceiver<String>) -> String {
-        runtime()
-            .block_on(async { timeout(DRAIN_TIMEOUT, warn_rx.recv()).await })
+    async fn next_warning(warn_rx: &mut UnboundedReceiver<String>) -> String {
+        timeout(DRAIN_TIMEOUT, warn_rx.recv())
+            .await
             .expect(NO_WARNING)
             .expect(WRITER_GONE)
     }
 
-    fn drain(writer: StorageWriter) {
-        let unsaved = runtime().block_on(writer.shutdown(DRAIN_TIMEOUT));
+    async fn drain(writer: StorageWriter) {
+        let unsaved = writer.shutdown(DRAIN_TIMEOUT).await;
         assert!(unsaved.is_empty(), "{ALL_LANDED}");
     }
 
@@ -290,10 +337,35 @@ mod tests {
         blocker
     }
 
+    #[tokio::test]
+    async fn persist_jobs_land_in_order_before_shutdown_returns() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        for spec in [FIRST_PICK, SECOND_PICK] {
+            writer.persist(move |dir| {
+                persist_model(dir, spec);
+                push_recent(dir, spec);
+            });
+        }
+        drain(writer).await;
+
+        assert_eq!(read_model(&dir).as_deref(), Some(SECOND_PICK));
+        assert_eq!(read_recents(&dir), [SECOND_PICK, FIRST_PICK]);
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_panicked_lets_shutdown_finish() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        writer.delete(MakiId::generate(), None, |_| panic!("{JOB_PANIC}"));
+
+        assert!(writer.shutdown(DRAIN_TIMEOUT).await.is_empty());
+    }
+
     /// Snapshots must coalesce per session id, not into one `latest` slot:
     /// two racing sessions used to silently drop one.
-    #[test]
-    fn shutdown_drains_newest_snapshot_of_every_session() {
+    #[tokio::test]
+    async fn shutdown_drains_newest_snapshot_of_every_session() {
         let (_tmp, dir) = state_dir();
         let (writer, _warn_rx) = writer(&dir);
         let (a, a_claim) = fresh(&dir);
@@ -303,34 +375,34 @@ mod tests {
         writer.send(Arc::new(b.clone()), b_claim.clone());
         b.set_title("renamed".into());
         writer.send(Arc::new(b), b_claim);
-        drain(writer);
+        drain(writer).await;
 
         assert!(AppSession::load(a_id, &dir).is_ok());
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
     }
 
-    #[test]
-    fn delete_discards_pending_snapshot() {
+    #[tokio::test]
+    async fn delete_discards_pending_snapshot() {
         let (_tmp, dir) = state_dir();
         let (writer, _warn_rx) = writer(&dir);
         let (session, claim) = fresh(&dir);
         let id = session.id;
         writer.send(Arc::new(session), claim.clone());
-        let (done_tx, done_rx) = channel();
+        let (done_tx, done_rx) = oneshot::channel();
         writer.delete(id, Some(claim), move |res| {
             let _ = done_tx.send(res);
         });
-        drain(writer);
+        drain(writer).await;
 
-        assert!(done_rx.recv().unwrap().is_ok());
+        assert!(done_rx.await.unwrap().is_ok());
         assert!(AppSession::load(id, &dir).is_err());
     }
 
     /// A later run over an existing file holds a new claim and so no cursor.
     /// Its first write must start the file over instead of landing on offsets
     /// that describe the session as the earlier run left it.
-    #[test]
-    fn a_new_claim_rewrites_the_file_instead_of_appending() {
+    #[tokio::test]
+    async fn a_new_claim_rewrites_the_file_instead_of_appending() {
         let (_tmp, dir) = state_dir();
         let (mut session, claim) = fresh(&dir);
         let id = session.id;
@@ -339,7 +411,7 @@ mod tests {
         }
         let (first, _first_warn_rx) = writer(&dir);
         first.send(Arc::new(session.clone()), claim);
-        drain(first);
+        drain(first).await;
 
         session.truncate_messages(2);
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
@@ -352,7 +424,7 @@ mod tests {
         let (second, second_warn_rx) = writer(&dir);
         let claim = SessionClaim::acquire(id, &dir).expect("the first run let go");
         second.send(Arc::new(session.clone()), claim);
-        drain(second);
+        drain(second).await;
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(
@@ -369,8 +441,8 @@ mod tests {
 
     /// A disk that keeps failing warns once, not once per frame, and says so
     /// exactly once when writes start working again.
-    #[test]
-    fn failing_flush_warns_once_and_reports_recovery() {
+    #[tokio::test]
+    async fn failing_flush_warns_once_and_reports_recovery() {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, mut warn_rx) = writer(&dir);
@@ -379,24 +451,24 @@ mod tests {
         let id = session.id;
 
         writer.send(Arc::clone(&session), claim.clone());
-        let warning = next_warning(&mut warn_rx);
+        let warning = next_warning(&mut warn_rx).await;
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         // The save is enqueued before the delete, so the flush that runs the
         // delete has already drained it; a repeat failure must stay silent.
         writer.send(Arc::clone(&session), claim.clone());
-        let (done_tx, done_rx) = channel();
+        let (done_tx, done_rx) = oneshot::channel();
         writer.delete(MakiId::generate(), None, move |res| {
             let _ = done_tx.send(res);
         });
-        assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
+        assert!(done_rx.await.unwrap().is_err());
         assert!(warn_rx.is_empty(), "second failure warned again");
 
         std::fs::remove_file(sessions_dir(&dir)).unwrap();
         writer.send(session, claim);
-        let recovered = next_warning(&mut warn_rx);
+        let recovered = next_warning(&mut warn_rx).await;
         assert_eq!(recovered, SAVE_RECOVERED);
-        drain(writer);
+        drain(writer).await;
 
         assert!(warn_rx.is_empty());
         assert!(AppSession::load(id, &dir).is_ok());
@@ -405,8 +477,8 @@ mod tests {
     /// A tab that swaps its session out drops its claim right after queueing
     /// the last snapshot. The session must stay locked until that snapshot is
     /// on disk and be free right after, without anyone telling the writer.
-    #[test]
-    fn a_session_let_go_stays_claimed_until_its_last_snapshot_lands() {
+    #[tokio::test]
+    async fn a_session_let_go_stays_claimed_until_its_last_snapshot_lands() {
         let (_tmp, dir) = state_dir();
         let (writer, mut warn_rx) = writer(&dir);
         let (mut session, claim) = fresh(&dir);
@@ -415,7 +487,7 @@ mod tests {
         let blocker = block_log(&dir, id);
 
         writer.send(Arc::new(session), claim);
-        let warning = next_warning(&mut warn_rx);
+        let warning = next_warning(&mut warn_rx).await;
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
         assert!(
             SessionClaim::acquire(id, &dir).is_err(),
@@ -423,7 +495,7 @@ mod tests {
         );
 
         std::fs::remove_dir(blocker).unwrap();
-        drain(writer);
+        drain(writer).await;
 
         SessionClaim::acquire(id, &dir).expect(LANDED_RELEASES);
         assert_eq!(
@@ -434,8 +506,8 @@ mod tests {
 
     /// The final flush runs after the status bar is gone, so the return value
     /// is the only way a lost transcript gets reported.
-    #[test]
-    fn a_transcript_that_never_landed_is_named_at_shutdown() {
+    #[tokio::test]
+    async fn a_transcript_that_never_landed_is_named_at_shutdown() {
         let (_tmp, dir) = state_dir();
         let (mut session, claim) = fresh(&dir);
         session.push_message(user_message(0));
@@ -446,7 +518,7 @@ mod tests {
         writer.send(Arc::new(session), claim);
 
         assert_eq!(
-            runtime().block_on(writer.shutdown(DRAIN_TIMEOUT)),
+            writer.shutdown(DRAIN_TIMEOUT).await,
             vec![id],
             "{REPORTED_UNSAVED}"
         );
@@ -455,8 +527,8 @@ mod tests {
     /// A save enqueued after a delete must win: clear a draft and retype it
     /// fast enough, and the queued delete used to unlink the file the retype
     /// had just saved.
-    #[test]
-    fn save_enqueued_after_delete_survives() {
+    #[tokio::test]
+    async fn save_enqueued_after_delete_survives() {
         let (_tmp, dir) = state_dir();
         let (writer, warn_rx) = writer(&dir);
         let (mut session, claim) = fresh(&dir);
@@ -466,7 +538,7 @@ mod tests {
         writer.delete(id, Some(claim.clone()), |_| {});
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session), claim);
-        drain(writer);
+        drain(writer).await;
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(
@@ -479,8 +551,8 @@ mod tests {
     /// A failed write stays queued: `checkpoint` never resends an unchanged
     /// revision, so the writer owns the retry, and the shutdown flush is the
     /// last one.
-    #[test]
-    fn failed_write_is_retried_by_a_later_flush() {
+    #[tokio::test]
+    async fn failed_write_is_retried_by_a_later_flush() {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, mut warn_rx) = writer(&dir);
@@ -488,22 +560,22 @@ mod tests {
         let id = session.id;
 
         writer.send(Arc::new(session), claim);
-        let warning = next_warning(&mut warn_rx);
+        let warning = next_warning(&mut warn_rx).await;
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         std::fs::remove_file(sessions_dir(&dir)).unwrap();
-        drain(writer);
+        drain(writer).await;
 
         assert!(AppSession::load(id, &dir).is_ok());
-        assert_eq!(next_warning(&mut warn_rx), SAVE_RECOVERED);
+        assert_eq!(next_warning(&mut warn_rx).await, SAVE_RECOVERED);
     }
 
     /// After a delete the cursor still holds an open handle to the unlinked
     /// file, which still looks unchanged, so an append would write the session
     /// into nothing. The delete voids the claim's cursor, so the next snapshot
     /// writes a whole file.
-    #[test]
-    fn session_recreated_after_delete_is_written_in_full() {
+    #[tokio::test]
+    async fn session_recreated_after_delete_is_written_in_full() {
         let (_tmp, dir) = state_dir();
         let (writer, warn_rx) = writer(&dir);
         let (mut session, claim) = fresh(&dir);
@@ -511,16 +583,16 @@ mod tests {
         session.push_message(user_message(0));
         writer.send(Arc::new(session.clone()), claim.clone());
 
-        let (done_tx, done_rx) = channel();
+        let (done_tx, done_rx) = oneshot::channel();
         writer.delete(id, Some(claim.clone()), move |res| {
             let _ = done_tx.send(res);
         });
-        done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        done_rx.await.unwrap().unwrap();
         assert!(AppSession::load(id, &dir).is_err());
 
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session), claim);
-        drain(writer);
+        drain(writer).await;
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(
