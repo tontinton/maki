@@ -734,7 +734,7 @@ async fn start_session(
     .await;
     let sid = client_id(&handle.session_id);
     let plan_mode = Arc::new(AtomicBool::new(false));
-    let snapshot = HeadlessSnapshot::default();
+    let snapshot = HeadlessSnapshot::starting_at(initial_cost, srv.stack.model.context_window);
     let registered = register_snapshot(
         &srv.stack.session_snapshots,
         &snapshot,

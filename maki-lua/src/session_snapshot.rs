@@ -157,6 +157,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct HeadlessSnapshot(Arc<Mutex<Totals>>);
 
 impl HeadlessSnapshot {
+    /// A session that has already spent and has a window before its first
+    /// turn, like a resumed one.
+    pub fn starting_at(cost: Option<f64>, context_window: u32) -> Self {
+        Self(Arc::new(Mutex::new(Totals {
+            cost,
+            context_window,
+            ..Totals::default()
+        })))
+    }
+
     /// Fold one envelope in. The drivers already loop over the stream, so
     /// they hand every envelope here and keep no bookkeeping of their own.
     pub fn observe(&self, envelope: &Envelope) {
@@ -485,6 +495,26 @@ mod tests {
         assert_eq!(read["mode"], MODE_PLAN);
         assert_eq!(read["cost"], TURN_COST);
         assert_eq!(read["context_window"], WINDOW);
+    }
+
+    /// A resumed session has spent and has a window before its first new turn,
+    /// and what it spends next adds to that.
+    #[test]
+    fn a_resumed_session_reads_its_restored_bill_and_adds_to_it() {
+        const RESTORED_COST: f64 = 3.0;
+        let session = SessionRef::generate();
+        let _live = publish(session.id());
+        let snapshot = HeadlessSnapshot::starting_at(Some(RESTORED_COST), WINDOW);
+        let sessions = HeadlessSessions::default();
+        let _registered = sessions.register(session.clone(), &snapshot, || MODE_BUILD);
+        let read = || sessions.provider()(Some(session.as_str())).unwrap();
+
+        assert_eq!(read()["cost"], RESTORED_COST);
+        assert_eq!(read()["context_window"], WINDOW);
+
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+
+        assert_eq!(read()["cost"], RESTORED_COST + TURN_COST);
     }
 
     /// Lineage carries the base58 form, a resumed legacy session its hex one.
