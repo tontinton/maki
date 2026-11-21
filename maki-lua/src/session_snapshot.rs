@@ -2,16 +2,19 @@
 //! drivers all serialize this struct, so a plugin sees the same keys wherever
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use maki_agent::agent::live_header;
 use maki_agent::session::{SessionHeader, StoredSession};
 use maki_agent::{AgentEvent, Envelope};
 use maki_providers::{TokenUsage, add_cost};
-use maki_storage::id::MakiId;
+use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredMode;
 use serde::Serialize;
 
 use crate::EventHandle;
+use crate::api::session::{SessionSnapshotFn, not_live};
 
 pub const MODE_BUILD: &str = "build";
 pub const MODE_PLAN: &str = "plan";
@@ -20,6 +23,10 @@ pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
 /// A session no runtime here has open, read from disk.
 pub const STATUS_STORED: &str = "stored";
+/// ACP runs many sessions and none is the default, so an id-less ask outside
+/// a tool call has nothing to answer for.
+pub const NO_CALLING_SESSION_ERR: &str =
+    "no calling session: pass `session`, events carry it as `session_id`";
 
 #[derive(Serialize)]
 pub struct SessionSnapshot {
@@ -139,17 +146,27 @@ struct Totals {
 /// A poisoned lock only means some other run panicked mid-update. The
 /// numbers are still whole, so read them instead of losing the session's
 /// whole accounting over it.
-fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
-    totals.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Backs `maki.session.read` for the single session headless drivers
-/// (`maki -p`, sdk mode). The driver writes while the Lua thread reads, hence
-/// the lock, though the two rarely meet.
+/// Backs `maki.session.read` for a session a headless driver runs (`maki -p`,
+/// sdk mode, each ACP session). The driver writes while the Lua thread reads,
+/// hence the lock, though the two rarely meet.
 #[derive(Clone, Default)]
 pub struct HeadlessSnapshot(Arc<Mutex<Totals>>);
 
 impl HeadlessSnapshot {
+    /// A session that has already spent and has a window before its first
+    /// turn, like a resumed one.
+    pub fn starting_at(cost: Option<f64>, context_window: u32) -> Self {
+        Self(Arc::new(Mutex::new(Totals {
+            cost,
+            context_window,
+            ..Totals::default()
+        })))
+    }
+
     /// Fold one envelope in. The drivers already loop over the stream, so
     /// they hand every envelope here and keep no bookkeeping of their own.
     pub fn observe(&self, envelope: &Envelope) {
@@ -188,25 +205,36 @@ impl HeadlessSnapshot {
         }
     }
 
-    /// Install as the provider `maki.session.read` answers from. `mode`
-    /// is a callback because sdk mode can flip between build and plan
-    /// mid-run.
-    ///
-    /// There is no stored session and no rename path under either driver,
-    /// so `title` stays nil rather than echoing the id back as a fake one.
+    /// Install as the provider `maki.session.read` answers from, for the
+    /// single session drivers.
     pub fn install(
         &self,
         handle: &EventHandle,
         meta: HeadlessMeta,
         mode: impl Fn() -> &'static str + Send + Sync + 'static,
     ) {
+        handle.install_session_snapshot(Box::new(self.provider(meta, mode)));
+    }
+
+    /// `mode` is a callback because sdk mode and ACP can flip between build
+    /// and plan mid-run.
+    ///
+    /// There is no stored session and no rename path under these drivers, so
+    /// `title` stays nil rather than echoing the id back as a fake one.
+    fn provider(
+        &self,
+        meta: HeadlessMeta,
+        mode: impl Fn() -> &'static str + Send + Sync + 'static,
+    ) -> impl Fn(Option<&str>) -> Result<serde_json::Value, String> + Send + Sync + 'static {
         let totals = Arc::clone(&self.0);
-        handle.install_session_snapshot(Box::new(move |id| {
-            // One session here, so any other id names a tab that is not ours.
+        // A legacy hex id and its base58 form name the same session.
+        let own = meta.id.parse::<MakiId>().ok();
+        move |id| {
             if let Some(want) = id
                 && want != meta.id
+                && (own.is_none() || want.parse::<MakiId>().ok() != own)
             {
-                return Err(format!("session {want} not live"));
+                return Err(not_live(want));
             }
             let mode = mode();
             let totals = lock(&totals);
@@ -232,12 +260,103 @@ impl HeadlessSnapshot {
                 cost: totals.cost,
             })
             .map_err(|e| e.to_string())
-        }));
+        }
+    }
+
+    /// What the session publishes (title, thinking, fast, the model it runs,
+    /// usage), with the cost and window only this tally has on top. `mode` is
+    /// a callback because the published one lags until the next turn.
+    fn hosted_provider(
+        &self,
+        session: SessionRef,
+        mode: impl Fn() -> &'static str + Send + Sync + 'static,
+    ) -> Provider {
+        let totals = Arc::clone(&self.0);
+        Arc::new(move || {
+            let id = session.id();
+            let header = live_header(id).ok_or_else(|| not_live(&session))?;
+            let mut snapshot = SessionSnapshot::live_headless(id, Arc::unwrap_or_clone(header));
+            let totals = lock(&totals);
+            snapshot.id = session.to_string();
+            snapshot.mode = mode();
+            snapshot.context_window = Some(totals.context_window);
+            snapshot.cost = totals.cost;
+            serde_json::to_value(snapshot).map_err(|e| e.to_string())
+        })
+    }
+}
+
+type Provider = Arc<dyn Fn() -> Result<serde_json::Value, String> + Send + Sync>;
+type Providers = Arc<Mutex<HashMap<MakiId, Provider>>>;
+
+/// Backs `maki.session.read` for ACP, which runs many sessions on one plugin
+/// host. Each answers only for its own id, so no session can stand in for
+/// another, and a closed one leaves nothing behind.
+#[derive(Clone, Default)]
+pub struct HeadlessSessions(Providers);
+
+impl HeadlessSessions {
+    pub fn install(&self, handle: &EventHandle) {
+        handle.install_session_snapshot(self.provider());
+    }
+
+    pub fn provider(&self) -> SessionSnapshotFn {
+        let providers = Arc::clone(&self.0);
+        Box::new(move |id| {
+            let want = id.ok_or_else(|| NO_CALLING_SESSION_ERR.to_owned())?;
+            let unknown = || not_live(want);
+            let session = want.parse::<MakiId>().map_err(|_| unknown())?;
+            let provider = lock(&providers)
+                .get(&session)
+                .cloned()
+                .ok_or_else(unknown)?;
+            provider()
+        })
+    }
+
+    /// Answers for `session` until the returned guard drops.
+    #[must_use = "dropping the guard unregisters the session at once"]
+    pub fn register(
+        &self,
+        session: SessionRef,
+        snapshot: &HeadlessSnapshot,
+        mode: impl Fn() -> &'static str + Send + Sync + 'static,
+    ) -> RegisteredSession {
+        let id = session.id();
+        let provider = snapshot.hosted_provider(session, mode);
+        lock(&self.0).insert(id, Arc::clone(&provider));
+        RegisteredSession {
+            providers: Arc::clone(&self.0),
+            id,
+            provider,
+        }
+    }
+}
+
+/// Unregisters on drop, so every way a session ends drops it. A reload that
+/// registered again first keeps its own entry.
+pub struct RegisteredSession {
+    providers: Providers,
+    id: MakiId,
+    provider: Provider,
+}
+
+impl Drop for RegisteredSession {
+    fn drop(&mut self) {
+        let mut providers = lock(&self.providers);
+        if providers
+            .get(&self.id)
+            .is_some_and(|live| Arc::ptr_eq(live, &self.provider))
+        {
+            providers.remove(&self.id);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use arc_swap::ArcSwap;
+    use maki_agent::agent::{HistorySnapshot, SharedHeader, SharedMessages, publish_live_session};
     use maki_agent::{DoneReason, RunTotals, TurnCompleteEvent};
     use maki_providers::Message;
 
@@ -247,6 +366,9 @@ mod tests {
     const SECOND_TURN_INPUT: u32 = 400;
     const TURN_COST: f64 = 0.25;
     const WINDOW: u32 = 200_000;
+    const TITLE: &str = "fix the build";
+    const MODEL: &str = "anthropic/claude-sonnet-4-5";
+    const CWD: &str = "/work/repo";
     const GROWS_MSG: &str = "session totals add up across turns, they never restart at one turn";
     const WORKING_MSG: &str = "a second turn has to read as working again";
 
@@ -312,6 +434,106 @@ mod tests {
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
         assert_eq!(totals.context_size, SECOND_TURN_INPUT);
+    }
+
+    fn meta(id: String) -> HeadlessMeta {
+        HeadlessMeta {
+            id,
+            cwd: String::new(),
+            model: String::new(),
+        }
+    }
+
+    /// Keep the returned pair alive for as long as the session should be.
+    fn publish(id: MakiId) -> (SharedMessages, SharedHeader) {
+        let header = SessionHeader::of(&StoredSession::new("", ""));
+        let header: SharedHeader = Arc::new(ArcSwap::from_pointee(header));
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_session(id, &mirror, &header);
+        (mirror, header)
+    }
+
+    /// A reload registers the same id before the old run's guard drops, and
+    /// that late drop must not unregister the new run.
+    #[test]
+    fn a_stale_guard_leaves_the_reloaded_session_registered() {
+        let sessions = HeadlessSessions::default();
+        let read = sessions.provider();
+        let session = SessionRef::generate();
+        let _live = publish(session.id());
+        let register =
+            || sessions.register(session.clone(), &HeadlessSnapshot::default(), || MODE_BUILD);
+        let old = register();
+        let new = register();
+
+        drop(old);
+
+        assert!(read(Some(session.as_str())).is_ok());
+        drop(new);
+        assert_eq!(
+            read(Some(session.as_str())).unwrap_err(),
+            not_live(&session)
+        );
+    }
+
+    /// The window and cost are the pump's tally, the rest what the session
+    /// publishes, so a read keeps every field it had before ACP had a tally.
+    #[test]
+    fn a_hosted_read_lays_the_tally_over_the_published_header() {
+        let session = SessionRef::generate();
+        let (_mirror, header) = publish(session.id());
+        header.store(Arc::new(SessionHeader {
+            title: TITLE.into(),
+            fast: true,
+            ..SessionHeader::of(&StoredSession::new(MODEL, CWD))
+        }));
+        let snapshot = HeadlessSnapshot::default();
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+        let sessions = HeadlessSessions::default();
+        let _registered = sessions.register(session.clone(), &snapshot, || MODE_PLAN);
+
+        let read = sessions.provider()(Some(session.as_str())).unwrap();
+
+        assert_eq!(read["title"], TITLE);
+        assert_eq!(read["fast"], true);
+        assert_eq!(read["model"], MODEL);
+        assert_eq!(read["focused"], false);
+        assert_eq!(read["mode"], MODE_PLAN);
+        assert_eq!(read["cost"], TURN_COST);
+        assert_eq!(read["context_window"], WINDOW);
+    }
+
+    /// A resumed session has spent and has a window before its first new turn,
+    /// and what it spends next adds to that.
+    #[test]
+    fn a_resumed_session_reads_its_restored_bill_and_adds_to_it() {
+        const RESTORED_COST: f64 = 3.0;
+        let session = SessionRef::generate();
+        let _live = publish(session.id());
+        let snapshot = HeadlessSnapshot::starting_at(Some(RESTORED_COST), WINDOW);
+        let sessions = HeadlessSessions::default();
+        let _registered = sessions.register(session.clone(), &snapshot, || MODE_BUILD);
+        let read = || sessions.provider()(Some(session.as_str())).unwrap();
+
+        assert_eq!(read()["cost"], RESTORED_COST);
+        assert_eq!(read()["context_window"], WINDOW);
+
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+
+        assert_eq!(read()["cost"], RESTORED_COST + TURN_COST);
+    }
+
+    /// Lineage carries the base58 form, a resumed legacy session its hex one.
+    #[test]
+    fn a_legacy_hex_session_answers_to_its_base58_id() {
+        let id = MakiId::generate();
+        let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex.parse::<MakiId>().unwrap(), id);
+        let read = HeadlessSnapshot::default().provider(meta(hex), || MODE_BUILD);
+
+        assert!(read(Some(&id.to_string())).is_ok());
+        let stranger = MakiId::generate().to_string();
+        assert_eq!(read(Some(&stranger)).unwrap_err(), not_live(&stranger));
     }
 
     #[test]

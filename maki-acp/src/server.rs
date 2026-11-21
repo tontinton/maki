@@ -35,6 +35,9 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
+use maki_lua::session_snapshot::{
+    HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, RegisteredSession,
+};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::settle_session;
@@ -108,7 +111,10 @@ struct SessionState {
     /// Sends the command list again once MCP prompts land. Stopped with the
     /// pump, so no list goes out after a close is answered.
     commands_watch: Option<AbortOnDropHandle<()>>,
-    current_mode: AgentMode,
+    /// Shared with the snapshot plugins read.
+    current_mode: Arc<Mutex<AgentMode>>,
+    /// Keeps `maki.session` answering for this session until it closes.
+    _snapshot: RegisteredSession,
     current_model: String,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
@@ -726,6 +732,14 @@ async fn start_session(
     })
     .await;
     let sid = client_id(&handle.session_id);
+    let current_mode = Arc::<Mutex<AgentMode>>::default();
+    let snapshot = HeadlessSnapshot::starting_at(initial_cost, srv.stack.model.context_window);
+    let registered = register_snapshot(
+        &srv.stack.session_snapshots,
+        &snapshot,
+        &handle.session_id,
+        &current_mode,
+    );
     // Before the pump starts, so nothing the new run says lands inside the
     // history the client is still rebuilding.
     for update in replay {
@@ -736,6 +750,7 @@ async fn start_session(
         sid.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        snapshot,
         cwd,
         maki_storage::paths::home(),
         project_trusted,
@@ -750,13 +765,28 @@ async fn start_session(
         mcp,
         commands,
         commands_watch: None,
-        current_mode: AgentMode::Build,
+        current_mode,
+        _snapshot: registered,
         current_model: srv.stack.model.spec(),
         pending,
         claim,
     };
     srv.sessions.insert(sid.clone(), state);
     sid
+}
+
+fn register_snapshot(
+    sessions: &HeadlessSessions,
+    snapshot: &HeadlessSnapshot,
+    session_id: &SessionRef,
+    current_mode: &Arc<Mutex<AgentMode>>,
+) -> RegisteredSession {
+    let current_mode = Arc::clone(current_mode);
+    let mode = move || match *current_mode.lock().unwrap() {
+        AgentMode::Build => MODE_BUILD,
+        AgentMode::Plan(_) => MODE_PLAN,
+    };
+    sessions.register(session_id.clone(), snapshot, mode)
 }
 
 /// The id the client names a run's session with.
@@ -1078,7 +1108,7 @@ fn handle_prompt(
         }
         let mut input = AgentInput::from_defaults(
             message,
-            session.current_mode.clone(),
+            session.current_mode.lock().unwrap().clone(),
             images,
             srv.stack.defaults,
             InputSource::Acp,
@@ -1112,7 +1142,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     session.handle.switch_mode(new_mode.clone());
-    session.current_mode = new_mode;
+    *session.current_mode.lock().unwrap() = new_mode;
 
     session_update(
         &srv.out_tx,
@@ -1289,6 +1319,7 @@ fn start_event_pump(
     sid: SessionId,
     out_tx: UnboundedSender<Value>,
     pending: PendingState,
+    snapshot: HeadlessSnapshot,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -1302,10 +1333,11 @@ fn start_event_pump(
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
-        {
+        while let Some(envelope) = events.next().await {
+            snapshot.observe(&envelope);
+            let Envelope {
+                event, subagent, ..
+            } = envelope;
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1500,10 +1532,13 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use agent_client_protocol_schema::v1::ErrorCode;
+    use arc_swap::ArcSwap;
+    use maki_agent::agent::{HistorySnapshot, SharedHeader, SharedMessages, publish_live_session};
     use maki_agent::command::{COMPACT_NAME, CommandScope};
     use maki_agent::headless::SessionEnd;
     use maki_agent::mcp::{USAGE_PREFIX, test_support};
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::session::SessionHeader;
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
@@ -1564,6 +1599,7 @@ mod tests {
     const REQUEST_ID: i64 = 8;
     const OTHER_SESSIONS_UNTOUCHED: &str = "a request for one session leaves the others alone";
     const MODE_BUILD_ID: &str = "build";
+    const MODE_PLAN_ID: &str = "plan";
     const STOP_CANCELLED: &str = "cancelled";
     const REQUEST_ANSWERED: &str = "the request is answered";
     const PROMPT_ANSWERED_ON_TURN_END: &str = "an accepted prompt is answered when its turn ends";
@@ -1769,6 +1805,8 @@ mod tests {
     /// can see what reached which session.
     struct FixtureSession {
         state: SessionState,
+        /// What the agent publishes for the session while it is open.
+        _published: (SharedMessages, SharedHeader),
         answer_rx: UnboundedReceiver<String>,
         input_rx: UnboundedReceiver<SessionInput>,
         cancel_rx: watch::Receiver<()>,
@@ -1801,7 +1839,14 @@ mod tests {
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
+        let current_mode = Arc::default();
+        let snapshot = fixture_snapshot(
+            &HeadlessSessions::default(),
+            &handle.session_id,
+            &current_mode,
+        );
         FixtureSession {
+            _published: publish_fixture(&handle.session_id),
             state: SessionState {
                 handle,
                 pump: AbortOnDropHandle::new(tokio::spawn(future::ready(()))),
@@ -1809,7 +1854,8 @@ mod tests {
                 commands: Arc::default(),
                 mcp_prompts: McpSnapshotReader::empty(),
                 commands_watch: None,
-                current_mode: AgentMode::Build,
+                current_mode,
+                _snapshot: snapshot,
                 current_model: String::new(),
                 pending: Arc::default(),
                 claim,
@@ -1820,6 +1866,22 @@ mod tests {
             model_rx,
             mode_rx,
         }
+    }
+
+    fn fixture_snapshot(
+        sessions: &HeadlessSessions,
+        id: &SessionRef,
+        current_mode: &Arc<Mutex<AgentMode>>,
+    ) -> RegisteredSession {
+        register_snapshot(sessions, &HeadlessSnapshot::default(), id, current_mode)
+    }
+
+    fn publish_fixture(id: &SessionRef) -> (SharedMessages, SharedHeader) {
+        let header = SessionHeader::of(&StoredSession::new(SELECTED_SPEC, PUMP_CWD));
+        let header: SharedHeader = Arc::new(ArcSwap::from_pointee(header));
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_session(id.id(), &mirror, &header);
+        (mirror, header)
     }
 
     fn test_stack() -> ProjectStack {
@@ -1834,6 +1896,7 @@ mod tests {
             trust_policy: Arc::default(),
             yolo: false,
             on_session_end: None,
+            session_snapshots: HeadlessSessions::default(),
         }
     }
 
@@ -2054,6 +2117,7 @@ mod tests {
             client_id(&session.handle.session_id),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
+            HeadlessSnapshot::default(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -2947,6 +3011,70 @@ mod tests {
         );
     }
 
+    /// Two chats on one plugin host: each answers only for itself, and the one
+    /// opened last never becomes everyone's default, closed or not.
+    #[tokio::test]
+    async fn plugins_read_each_session_by_id_and_never_a_closed_one() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.session_snapshots.provider();
+        let mut first = fixture_session();
+        let mut last = fixture_session();
+        for fixture in [&mut first, &mut last] {
+            fixture.state._snapshot = fixture_snapshot(
+                &srv.stack.session_snapshots,
+                &fixture.state.handle.session_id,
+                &fixture.state.current_mode,
+            );
+        }
+        let (first_id, last_id) = (
+            first.state.handle.session_id.to_string(),
+            last.state.handle.session_id.to_string(),
+        );
+        install(&mut srv, first.state);
+        let last_sid = install(&mut srv, last.state);
+
+        for id in [&first_id, &last_id] {
+            assert_eq!(read(Some(id)).unwrap()["id"], **id);
+        }
+
+        close_session(&mut srv, &last_sid, SessionEndReason::Delete).await;
+        assert!(read(Some(&last_id)).is_err());
+        assert_eq!(read(Some(&first_id)).unwrap()["id"], *first_id);
+
+        close_all_sessions(&mut srv, SessionEndReason::Shutdown).await;
+        assert!(read(Some(&first_id)).is_err());
+    }
+
+    /// The snapshot plugins read and the mode the next prompt runs under are
+    /// one value, so a switch can never reach one and miss the other.
+    #[tokio::test]
+    async fn a_mode_switch_shows_in_what_plugins_read() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.session_snapshots.provider();
+        let mut fixture = fixture_session();
+        fixture.state._snapshot = fixture_snapshot(
+            &srv.stack.session_snapshots,
+            &fixture.state.handle.session_id,
+            &fixture.state.current_mode,
+        );
+        let id = fixture.state.handle.session_id.to_string();
+        let sid = install(&mut srv, fixture.state);
+        let mode = || read(Some(&id)).unwrap()["mode"].clone();
+        assert_eq!(mode(), MODE_BUILD);
+
+        let request = with_params(SetSessionModeRequest::new(sid, MODE_PLAN_ID));
+        handle_request(
+            &mut srv,
+            "session/set_mode",
+            RequestId::Number(REQUEST_ID),
+            &request,
+            &fixture_settings(),
+        )
+        .await;
+
+        assert_eq!(mode(), MODE_PLAN);
+    }
+
     /// The hook can take seconds, so a prompt left for it to answer would
     /// leave the client's turn spinning that long after the user closed it.
     #[tokio::test]
@@ -2986,6 +3114,7 @@ mod tests {
             sid.clone(),
             srv.out_tx.clone(),
             Arc::clone(&srv.sessions[&sid].pending),
+            HeadlessSnapshot::default(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
