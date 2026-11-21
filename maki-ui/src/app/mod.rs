@@ -238,9 +238,10 @@ enum KeyboardOwner {
     Help,
     Usage,
     Btw,
-    /// A focused Lua split. It sits beside the bottom panel, not over it, so
-    /// the prompts there answer first. An unfocused split never holds the
-    /// keyboard.
+    /// A focused Lua split. The prompts in the bottom panel answer first: a
+    /// side split sits beside the panel, not over it, and a `below` split is
+    /// taken out of the layout while the panel is up. An unfocused split
+    /// never holds the keyboard.
     FocusedSplit,
     Search,
     FilePicker,
@@ -1871,12 +1872,15 @@ impl App {
     /// 6. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
     ///
     /// A focused float is above the overlays opened under it because it is
-    /// the window the user is in. A focused split sits beside the bottom
-    /// panel, so the prompts there answer first. An unfocused window is below
-    /// the overlays because it is not where the user is: the popup is up while the user works underneath, so a modal
-    /// opened over it outranks it, and its keys come back the moment the
-    /// modal closes. The command palette is one of those overlays, so a
-    /// popup's `<Tab>` or `<CR>` leaves the `/` command being typed alone.
+    /// the window the user is in. A focused side split sits beside the
+    /// bottom panel and a `below` split leaves the layout while the panel is
+    /// up, so the prompts there answer first. A focused window that is hidden
+    /// or painted nothing holds no keys. An unfocused window is below the
+    /// overlays because it is not where the user is: the popup is up while
+    /// the user works underneath, so a modal opened over it outranks it, and
+    /// its keys come back the moment the modal closes. The command palette is
+    /// one of those overlays, so a popup's `<Tab>` or `<CR>` leaves the `/`
+    /// command being typed alone.
     ///
     /// Every step either answers the key or passes it on untouched, and no key
     /// is ever handed back after the fact, because a keystroke replayed into a
