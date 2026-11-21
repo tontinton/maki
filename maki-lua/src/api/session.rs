@@ -233,7 +233,11 @@ async fn read(
         Some(t) => t.opt::<String>("session")?,
         None => None,
     }
-    .or_else(|| Lineage::current(&lua).session.map(|id| id.to_string()));
+    .or_else(|| {
+        Lineage::current(&lua)
+            .session
+            .map(|session| session.to_string())
+    });
     // A headless driver installs a provider for the sessions it runs. The
     // UI leaves the slot empty and answers from its event loop, which owns
     // the live runtimes. The slot is asked in its own statement, so its
@@ -268,13 +272,10 @@ async fn read(
 async fn calling_session(
     lua: &Lua,
     tx: Option<&UnboundedSender<UiAction>>,
-) -> Result<MakiId, String> {
+) -> Result<String, String> {
     match Lineage::current(lua).session {
-        Some(id) => Ok(id),
-        None => focused_session(lua, tx)
-            .await?
-            .parse::<MakiId>()
-            .map_err(|e| e.to_string()),
+        Some(session) => Ok(session.to_string()),
+        None => focused_session(lua, tx).await,
     }
 }
 
@@ -311,10 +312,11 @@ async fn named_or_calling(
     tx: Option<&UnboundedSender<UiAction>>,
     id: Option<String>,
 ) -> Result<MakiId, String> {
-    match id {
-        Some(raw) => raw.parse::<MakiId>().map_err(|e| e.to_string()),
-        None => calling_session(lua, tx).await,
-    }
+    let raw = match id {
+        Some(raw) => raw,
+        None => calling_session(lua, tx).await?,
+    };
+    raw.parse::<MakiId>().map_err(|e| e.to_string())
 }
 
 /// A live session from memory, unsaved messages included, any other from
@@ -533,11 +535,7 @@ async fn current(
     lua: Lua,
     #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<String>> {
-    Ok(pair(
-        calling_session(&lua, tx.as_ref())
-            .await
-            .map(|id| id.to_string()),
-    ))
+    Ok(pair(calling_session(&lua, tx.as_ref()).await))
 }
 
 /// Returns this plugin's data directory for a session,
@@ -568,13 +566,7 @@ async fn data_dir(
         None => None,
     };
     let path: Result<String, String> = async {
-        let named = named
-            .map(|raw| raw.parse::<MakiId>().map_err(|e| e.to_string()))
-            .transpose()?;
-        let session = match named {
-            Some(id) => id,
-            None => calling_session(&lua, tx.as_ref()).await?,
-        };
+        let session = named_or_calling(&lua, tx.as_ref(), named).await?;
         let state = state_dir(&lua)?;
         Ok(session_data_dir(state.path(), session)
             .join(&*plugin)
@@ -1429,9 +1421,31 @@ mod tests {
 
     /// Runs what follows as a tool call of `session` would.
     fn serving(lua: &Lua, session: MakiId) {
+        serving_ref(lua, SessionRef::from(session));
+    }
+
+    fn serving_ref(lua: &Lua, session: SessionRef) {
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.lineage.session = Some(session);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+    }
+
+    /// A tool call and the driver must spell a resumed legacy session alike, or
+    /// a plugin comparing `current()` to an event's `session_id` never matches.
+    #[tokio::test]
+    async fn current_keeps_the_spelling_a_legacy_session_resumed_with() {
+        let id = MakiId::generate();
+        let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let lua = headless_focused_on(MakiId::generate());
+        serving_ref(&lua, hex.parse().unwrap());
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.current()")
+            .eval_async()
+            .await
+            .unwrap();
+
+        assert_eq!((got, err), (Some(hex), None));
     }
 
     #[tokio::test]

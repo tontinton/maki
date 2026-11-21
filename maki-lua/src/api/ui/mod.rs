@@ -6,7 +6,7 @@ use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_storage::id::{MakiId, MakiIdParseError};
+use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use mlua::{Lua, Result as LuaResult, Table};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -1135,7 +1135,8 @@ fn open_win(
     opts: Table,
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
-    let session = session_opt(OPEN_WIN, &opts)?.or_else(|| Lineage::current(lua).session);
+    let session = session_opt(OPEN_WIN, &opts)?
+        .or_else(|| Lineage::current(lua).session.as_ref().map(SessionRef::id));
     let title: String = opts.get("title").unwrap_or_default();
     let cursor_line = opts.opt_bool("cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
