@@ -1,8 +1,7 @@
 //! Every event the host fires, and the one place that classifies its fields.
 //! Agent events are turned into host events here too, shared by the UI app
-//! loop, `maki -p` and sdk mode, so a plugin sees the same events whichever
-//! way maki was started. `maki-acp` drives the agent from its own loop and
-//! does not call this yet, so plugins loaded under ACP get no turn events.
+//! loop, `maki -p`, sdk mode and ACP, so a plugin sees the same events
+//! whichever way maki was started.
 
 use std::fmt::Display;
 

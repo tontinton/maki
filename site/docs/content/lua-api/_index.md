@@ -1011,10 +1011,8 @@ A subagent's run fires only `"TurnComplete"`, never tool or other turn
 events. `"TurnEnd"` fires once per turn of the main session. A manual
 `/compact` fires no `"TurnEnd"`.
 
-Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
-`maki-ui` only. `maki-acp` runs the agent on its own loop and does not
-call the dispatcher yet, so plugins loaded under ACP receive no turn
-events. Everything else fires under `maki -p` and sdk mode as well.
+`"TurnStart"` and `"PlanReady"` come from `maki-ui` only. Everything the
+agent itself reports fires under `maki -p`, sdk mode and ACP as well.
 
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are

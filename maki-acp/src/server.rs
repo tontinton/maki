@@ -52,7 +52,9 @@ use tracing::{debug, info, warn};
 
 use crate::commands::{self, Invocation};
 use crate::router::{EventSink, Relay, RelayEvent};
-use crate::{AcpParams, ProjectStack, elicitation, methods, permissions, translate};
+use crate::{
+    AcpParams, AgentEventHook, ProjectStack, elicitation, methods, permissions, translate,
+};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// Turns already recorded were priced when they ran. `always_fast` is a live
@@ -740,6 +742,7 @@ async fn start_session(
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        srv.stack.on_agent_event.clone(),
     );
     let state = SessionState {
         handle,
@@ -1293,6 +1296,7 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    on_agent_event: Option<AgentEventHook>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut cost = CostTally::starting_at(initial_cost);
@@ -1302,10 +1306,14 @@ fn start_event_pump(
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
-        {
+        while let Some(envelope) = events.next().await {
+            // Before the filters below: the hook decides what a subagent's event means.
+            if let Some(hook) = &on_agent_event {
+                hook(&sid.0, &envelope);
+            }
+            let Envelope {
+                event, subagent, ..
+            } = envelope;
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1834,6 +1842,7 @@ mod tests {
             trust_policy: Arc::default(),
             yolo: false,
             on_session_end: None,
+            on_agent_event: None,
         }
     }
 
@@ -2047,6 +2056,15 @@ mod tests {
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
     async fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
+        run_pump_with_hook(srv, initial_cost, None, feed).await;
+    }
+
+    async fn run_pump_with_hook(
+        srv: &Server,
+        initial_cost: Option<f64>,
+        on_agent_event: Option<AgentEventHook>,
+        feed: impl FnOnce(&EventSender),
+    ) {
         let session = only_session(srv);
         let (guard, events) = maki_agent::event_stream();
         let pump = start_event_pump(
@@ -2058,6 +2076,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             initial_cost,
+            on_agent_event,
         );
         let sender = guard.sender(0);
         feed(&sender);
@@ -2566,6 +2585,58 @@ mod tests {
         assert_eq!(request["params"]["toolCall"]["title"], title);
     }
 
+    /// The plugin host decides what a subagent's event means, so the hook sees
+    /// every envelope in order while the client still gets only the main ones.
+    #[tokio::test]
+    async fn event_pump_hands_every_envelope_to_the_agent_event_hook() {
+        let (srv, .., mut out_rx) = test_server();
+        let session_id = client_id(&only_session(&srv).handle.session_id);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook: AgentEventHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |sid, envelope| {
+                let kind = match &envelope.event {
+                    AgentEvent::ToolStart(_) => "tool_start",
+                    AgentEvent::TextDelta { .. } => "text_delta",
+                    AgentEvent::Done { .. } => "done",
+                    _ => "other",
+                };
+                seen.lock()
+                    .unwrap()
+                    .push((sid.to_owned(), kind, envelope.subagent.is_some()));
+            })
+        };
+        run_pump_with_hook(&srv, None, Some(hook), |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: QUEUED_TEXT.to_owned(),
+                    },
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        let sid = session_id.0.to_string();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (sid.clone(), "tool_start", false),
+                (sid.clone(), "text_delta", true),
+                (sid, "done", false),
+            ]
+        );
+        assert_eq!(
+            drain(&mut out_rx).len(),
+            1,
+            "only the tool call reaches the client"
+        );
+    }
+
     /// A resumed session opens with a bill, and subagent turns spend against it
     /// even though their events never enter the transcript.
     #[tokio::test]
@@ -2989,6 +3060,7 @@ mod tests {
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
+            None,
             None,
         );
         srv.sessions.get_mut(&sid).expect(SESSION_INSTALLED).pump = AbortOnDropHandle::new(pump);
