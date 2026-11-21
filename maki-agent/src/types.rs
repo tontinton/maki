@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use futures::FutureExt;
+use llm_budget::BudgetError;
+use llm_budget::budget::AtomicBudget;
 use maki_config::ToolKey;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, RequestOptions, Role, StopReason, TaskEnd,
@@ -614,6 +616,8 @@ pub enum DoneReason {
     EndTurn,
     MaxTokens,
     MaxTurns,
+    /// The session spent its `max_budget_usd`.
+    MaxBudget,
     Cancelled,
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
@@ -1287,13 +1291,47 @@ impl CostTally {
 /// ledger holds its own subtree: a subagent reports its own spend, and the
 /// turn that spawned it still gets billed for the whole fan-out. Several
 /// subagents run at once, hence the lock.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RunLedger {
     totals: Mutex<RunTotals>,
     parent: Option<Arc<RunLedger>>,
+    /// The session's dollar cap. Only a root ledger has one: children pass
+    /// their spend up, so the root sees every run, subagent and compaction.
+    cap: Option<AtomicBudget>,
+}
+
+impl std::fmt::Debug for RunLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunLedger")
+            .field("totals", &self.totals)
+            .field("parent", &self.parent)
+            .field("cap_usd", &self.cap.as_ref().map(AtomicBudget::limit_usd))
+            .finish()
+    }
 }
 
 impl RunLedger {
+    /// A root ledger that stops the session once `limit_usd` is spent.
+    ///
+    /// # Errors
+    /// When `limit_usd` is not a positive, finite number.
+    pub fn capped(limit_usd: f64) -> Result<Self, BudgetError> {
+        Ok(Self {
+            cap: Some(AtomicBudget::new(limit_usd)?),
+            ..Self::default()
+        })
+    }
+
+    /// Whether this ledger or one above it has spent its cap. Spend is booked
+    /// after the fact, so the check sits before each request.
+    pub fn exhausted(&self) -> bool {
+        self.cap.as_ref().is_some_and(AtomicBudget::is_exhausted)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.exhausted())
+    }
+
     pub fn child(parent: &Arc<Self>) -> Arc<Self> {
         Self::carrying(parent, RunTotals::default())
     }
@@ -1304,6 +1342,7 @@ impl RunLedger {
         Arc::new(Self {
             totals: Mutex::new(carried),
             parent: Some(Arc::clone(parent)),
+            cap: None,
         })
     }
 
@@ -1313,6 +1352,10 @@ impl RunLedger {
             cost,
             list_cost,
         };
+        if let (Some(cap), Some(cost)) = (&self.cap, cost) {
+            // The request already happened, so its cost books even past the cap.
+            cap.charge_force(cost);
+        }
         if let Some(parent) = &self.parent {
             parent.add(usage, cost, list_cost);
         }
@@ -2229,5 +2272,25 @@ mod tests {
             retained.send(AgentEvent::Nudge),
             Err(AgentError::Channel)
         ));
+    }
+
+    #[test]
+    fn capped_ledger_sees_spend_from_every_child() {
+        let root = Arc::new(RunLedger::capped(0.01).unwrap());
+        let run = RunLedger::child(&root);
+        let subagent = RunLedger::child(&run);
+
+        subagent.add(TokenUsage::default(), Some(0.004), None);
+        assert!(!run.exhausted());
+        subagent.add(TokenUsage::default(), Some(0.007), None);
+        assert!(run.exhausted() && subagent.exhausted() && root.exhausted());
+        assert!(!RunLedger::child(&Arc::default()).exhausted());
+    }
+
+    #[test_case(0.0 ; "zero")]
+    #[test_case(-1.0 ; "negative")]
+    #[test_case(f64::NAN ; "nan")]
+    fn capped_ledger_refuses_a_cap_that_is_not_positive(limit: f64) {
+        assert!(RunLedger::capped(limit).is_err());
     }
 }

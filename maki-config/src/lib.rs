@@ -1449,6 +1449,12 @@ pub struct AgentConfig {
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
+    /// Dollar cap on a session's total spend, subagents and compaction
+    /// included. Checked before each request, so the request that crosses it
+    /// finishes and the next one never starts.
+    #[config(skip, default = "None")]
+    pub max_budget_usd: Option<f64>,
+
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
@@ -1480,6 +1486,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
             max_turns: None,
+            max_budget_usd: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
             instructions: InstructionsConfig::default(),

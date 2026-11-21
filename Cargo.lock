@@ -3510,6 +3510,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "llm-budget"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dc5da5b440da690a3fe3cbef4e3a7a52a3ad5f7c37b456feb3d048abf384244"
+dependencies = [
+ "llm-prices",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "llm-prices"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8687beff4d5ceb2b1a5fc5f242df4f2c107ca92609f47d30fab584591157d9dd"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3580,6 +3598,7 @@ dependencies = [
  "color-eyre",
  "futures",
  "libc",
+ "llm-budget",
  "maki-acp",
  "maki-agent",
  "maki-config",
@@ -3638,6 +3657,7 @@ dependencies = [
  "ignore",
  "jiff",
  "jsonrepair",
+ "llm-budget",
  "maki-config",
  "maki-otel",
  "maki-providers",

@@ -1265,6 +1265,7 @@ impl EventPump {
                     DoneReason::EndTurn
                     | DoneReason::MaxTokens
                     | DoneReason::MaxTurns
+                    | DoneReason::MaxBudget
                     | DoneReason::Compact => false,
                 };
                 let result = mem::take(&mut self.result_text);

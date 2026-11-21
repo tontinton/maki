@@ -363,6 +363,8 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         DoneReason::EndTurn => StopReason::EndTurn,
         DoneReason::MaxTokens => StopReason::MaxTokens,
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
+        // ACP has no budget stop; like a turn cap, a limit the caller set ran out.
+        DoneReason::MaxBudget => StopReason::MaxTurnRequests,
         DoneReason::Cancelled => StopReason::Cancelled,
         // Manual `/compact` isn't a turn boundary; ACP has no dedicated
         // stop reason for housekeeping, so surface it as EndTurn.
@@ -534,6 +536,7 @@ mod tests {
     /// model stopped" from "the agent ran out of turns" or "the prompt never
     /// ran".
     #[test_case(DoneReason::MaxTurns, StopReason::MaxTurnRequests ; "max_turns_maps_to_max_turn_requests")]
+    #[test_case(DoneReason::MaxBudget, StopReason::MaxTurnRequests ; "max_budget_maps_to_max_turn_requests")]
     #[test_case(DoneReason::Dropped, StopReason::Refusal ; "dropped_maps_to_refusal")]
     fn map_done_reason_renames(reason: DoneReason, expected: StopReason) {
         assert_eq!(map_done_reason(reason), expected);
