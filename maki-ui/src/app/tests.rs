@@ -7727,6 +7727,54 @@ fn a_focused_split_does_not_take_keys_from_the_permission_prompt() {
     assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedSplit);
 }
 
+/// `win:hide()` keeps the focus, but a float nobody can see must not eat the
+/// `y` meant for the prompt that is the only thing on screen.
+#[test]
+fn a_hidden_focused_float_gives_the_keys_back_to_the_permission_prompt() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (mut events, cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+    open_permission_prompt(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedFloat);
+
+    cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+    let _ = app.float_mgr.drain_commands();
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    let _ = draw_to_buffer(&mut app);
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+}
+
+/// A visible float sized to nothing paints nothing, so once a frame has gone
+/// by it is not on screen and the prompt keeps the keys.
+#[test]
+fn a_focused_float_sized_to_nothing_leaves_the_keys_to_the_permission_prompt() {
+    let mut app = test_app();
+    let mut answer_rx = answer_channel(&mut app);
+    let (event_tx, mut events) = unbounded_channel::<WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
+    let config = FloatConfig {
+        width: Dimension::Abs(0),
+        height: Dimension::Abs(0),
+        zindex: WINDOW_Z,
+        ..FloatConfig::default()
+    };
+    app.float_mgr
+        .open(Arc::new(SharedBuf::new()), config, true, event_tx, cmd_rx);
+    let _ = draw_to_buffer(&mut app);
+    open_permission_prompt(&mut app);
+
+    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(!took_a_key(&mut events));
+    assert!(!app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_ok());
+}
+
 fn open_alert(app: &mut App) {
     app.open_alert("alert".into());
 }
