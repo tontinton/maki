@@ -12,8 +12,8 @@ use agent_client_protocol_schema::v1::{
     EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest, JsonRpcMessage,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest,
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
-    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionInfo,
-    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    RequestPermissionResponse, Response, SessionConfigOption, SessionConfigOptionValue, SessionId,
+    SessionInfo, SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent,
 };
@@ -35,6 +35,10 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
+use maki_lua::session_snapshot::{
+    HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, RegisteredSession,
+};
+use maki_lua::{EventHandle, PermissionModeInfo};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::settle_session;
@@ -45,6 +49,7 @@ use maki_storage::stdin;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, stdout};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio_util::task::AbortOnDropHandle;
@@ -64,6 +69,7 @@ const RESTORED_FAST: bool = false;
 /// already says which session and why.
 const SESSION_BUSY_CODE: i32 = -32000;
 const CWD_UNUSABLE: &str = "session cwd is not a usable folder";
+const SESSION_ENDED: &str = "session ended";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -95,6 +101,10 @@ type PendingState = Arc<Mutex<Pending>>;
 /// Keyed by the id the client names the session with.
 type Sessions = HashMap<SessionId, SessionState>;
 
+/// The level plugins were last told a session is on. Held across a switch's
+/// plugin calls, so one session's switches run one at a time, in arrival order.
+type LevelGate = Arc<AsyncMutex<String>>;
+
 struct SessionState {
     handle: InteractiveHandle,
     /// Stopped before a close is answered, so no update for a closed session
@@ -108,8 +118,15 @@ struct SessionState {
     /// Sends the command list again once MCP prompts land. Stopped with the
     /// pump, so no list goes out after a close is answered.
     commands_watch: Option<AbortOnDropHandle<()>>,
-    current_mode: AgentMode,
+    /// Shared with the snapshot plugins read.
+    current_mode: Arc<Mutex<AgentMode>>,
+    /// Keeps `maki.session` answering for this session until it closes.
+    _snapshot: RegisteredSession,
     current_model: String,
+    /// `ask`, `yolo`, or the id of a plugin's permission mode. Only ever a
+    /// level its owner confirmed, since the client reads it.
+    permission_level: String,
+    level_gate: LevelGate,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
@@ -119,6 +136,8 @@ struct SessionState {
 struct Server {
     out_tx: UnboundedSender<Value>,
     model_specs: Vec<String>,
+    /// What plugins offered when a session started or a level was last set.
+    permission_modes: Vec<PermissionModeInfo>,
     client_elicits_form: bool,
     /// Clients keep one agent process and open every thread as its own
     /// session on it, so sessions live side by side.
@@ -129,6 +148,8 @@ struct Server {
     stack: ProjectStack,
     /// Runs the sessions of other folders in child processes.
     relay: Relay,
+    /// Weak like every other sender into the loop, so it cannot keep it alive.
+    incoming: WeakUnboundedSender<Incoming>,
 }
 
 /// What every session of the process shares, whatever folder it runs in.
@@ -156,6 +177,17 @@ enum Incoming {
     Line(String),
     Models(Vec<String>),
     Relay(RelayEvent),
+    LevelSwitched(LevelSwitched),
+}
+
+/// A permission level switch whose plugin calls ran off the loop.
+struct LevelSwitched {
+    request: RequestId,
+    sid: SessionId,
+    /// Tells the session apart from a later one reopened under the same id.
+    gate: LevelGate,
+    level: String,
+    outcome: Result<(), String>,
 }
 
 /// Where a `session/new` or `session/load` runs.
@@ -213,11 +245,13 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&stack.model_policy),
+        permission_modes: Vec::new(),
         client_elicits_form: false,
         sessions: Sessions::new(),
         closing: HashMap::new(),
         stack,
         relay,
+        incoming: in_tx.downgrade(),
     };
     let reader_task = tokio::spawn(read_stdin(in_tx));
 
@@ -226,6 +260,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
             Incoming::Line(line) => handle_line(&mut server, &line, &settings).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
             Incoming::Relay(event) => server.relay.on_event(event),
+            Incoming::LevelSwitched(switched) => {
+                let request = switched.request.clone();
+                let result = finish_level_switch(&mut server, switched);
+                server.respond(request, result);
+            }
         }
     }
 
@@ -299,14 +338,20 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         return;
     }
     // Merged even with no session yet, since session/new builds its selector from this list.
-    for (sid, session) in &srv.sessions {
-        let option = methods::model_config_option(&session.current_model, &srv.model_specs);
-        session_update(
-            &srv.out_tx,
-            sid,
-            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
-        );
+    for sid in srv.sessions.keys() {
+        notify_config_options(srv, sid);
     }
+}
+
+/// A client may replace its whole option list with an update, so it always
+/// carries every option.
+fn notify_config_options(srv: &Server, sid: &SessionId) {
+    let options = session_config_options(srv, sid);
+    session_update(
+        &srv.out_tx,
+        sid,
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+    );
 }
 
 async fn handle_line(server: &mut Server, line: &str, settings: &Settings) {
@@ -384,7 +429,10 @@ async fn handle_request(
             None => return,
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw).await,
+        "session/set_config_option" => match handle_set_config(srv, raw, &id).await.transpose() {
+            Some(result) => result,
+            None => return,
+        },
         "session/close" => handle_close(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
@@ -515,9 +563,8 @@ async fn new_session(
     )
     .await;
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(sid.0.as_ref()));
-    let spec = srv.stack.model.spec();
-    let resp = methods::new_session_response(&sid.0)
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    let resp =
+        methods::new_session_response(&sid.0).config_options(session_config_options(srv, &sid));
     Ok(Opened {
         sid,
         response: AgentResponse::NewSessionResponse(resp),
@@ -576,13 +623,21 @@ async fn load_session(
     )
     .await;
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(sid.0.as_ref()));
-    let spec = srv.stack.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    let resp = methods::load_session_response().config_options(session_config_options(srv, &sid));
     Ok(Opened {
         sid,
         response: AgentResponse::LoadSessionResponse(resp),
     })
+}
+
+fn session_config_options(srv: &Server, sid: &SessionId) -> Vec<SessionConfigOption> {
+    let Some(session) = srv.sessions.get(sid) else {
+        return Vec::new();
+    };
+    vec![
+        methods::model_config_option(&session.current_model, &srv.model_specs),
+        methods::permissions_config_option(&session.permission_level, &srv.permission_modes),
+    ]
 }
 
 /// Permissions, where a saved answer lands, and MCP config follow the
@@ -726,6 +781,21 @@ async fn start_session(
     })
     .await;
     let sid = client_id(&handle.session_id);
+    let permission_level = if srv.stack.yolo {
+        methods::PERMISSION_YOLO
+    } else {
+        methods::PERMISSION_ASK
+    }
+    .to_owned();
+    srv.permission_modes = offered_permission_modes(srv.stack.lua_handle.as_ref()).await;
+    let current_mode = Arc::<Mutex<AgentMode>>::default();
+    let snapshot = HeadlessSnapshot::starting_at(initial_cost, srv.stack.model.context_window);
+    let registered = register_snapshot(
+        &srv.stack.session_snapshots,
+        &snapshot,
+        &handle.session_id,
+        &current_mode,
+    );
     // Before the pump starts, so nothing the new run says lands inside the
     // history the client is still rebuilding.
     for update in replay {
@@ -736,6 +806,7 @@ async fn start_session(
         sid.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        snapshot,
         cwd,
         maki_storage::paths::home(),
         project_trusted,
@@ -750,13 +821,30 @@ async fn start_session(
         mcp,
         commands,
         commands_watch: None,
-        current_mode: AgentMode::Build,
+        current_mode,
+        _snapshot: registered,
         current_model: srv.stack.model.spec(),
+        level_gate: Arc::new(AsyncMutex::new(permission_level.clone())),
+        permission_level,
         pending,
         claim,
     };
     srv.sessions.insert(sid.clone(), state);
     sid
+}
+
+fn register_snapshot(
+    sessions: &HeadlessSessions,
+    snapshot: &HeadlessSnapshot,
+    session_id: &SessionRef,
+    current_mode: &Arc<Mutex<AgentMode>>,
+) -> RegisteredSession {
+    let current_mode = Arc::clone(current_mode);
+    let mode = move || match *current_mode.lock().unwrap() {
+        AgentMode::Build => MODE_BUILD,
+        AgentMode::Plan(_) => MODE_PLAN,
+    };
+    sessions.register(session_id.clone(), snapshot, mode)
 }
 
 /// The id the client names a run's session with.
@@ -944,6 +1032,7 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
         commands_watch,
         mcp,
         pending,
+        level_gate,
         ..
     } = state;
     info!(session_id = %handle.session_id, %reason, "closing ACP session");
@@ -964,7 +1053,14 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
     }
     let id = handle.session_id.id();
     let on_session_end = srv.stack.on_session_end.clone();
+    let lua_handle = srv.stack.lua_handle.clone();
     let teardown = tokio::spawn(async move {
+        // A plugin level still on must not outlive its session. The gate waits
+        // out a switch in flight, so this leaves what the plugin really has on.
+        let level = level_gate.lock().await;
+        if let Err(e) = notify_level(lua_handle.as_ref(), &id.to_string(), &level, false).await {
+            warn!(mode = %*level, error = %e, "permission mode handler failed on close");
+        }
         if let Some(hook) = on_session_end {
             hook(id, reason).await;
         }
@@ -1078,7 +1174,7 @@ fn handle_prompt(
         }
         let mut input = AgentInput::from_defaults(
             message,
-            session.current_mode.clone(),
+            session.current_mode.lock().unwrap().clone(),
             images,
             srv.stack.defaults,
             InputSource::Acp,
@@ -1099,7 +1195,7 @@ fn handle_prompt(
         .handle
         .input_tx
         .send(input)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
+        .map_err(|_| AcpError::new(-32603, SESSION_ENDED))?;
     pending.prompt = Some(id.clone());
     Ok(None)
 }
@@ -1112,7 +1208,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     session.handle.switch_mode(new_mode.clone());
-    session.current_mode = new_mode;
+    *session.current_mode.lock().unwrap() = new_mode;
 
     session_update(
         &srv.out_tx,
@@ -1124,35 +1220,193 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(
+    srv: &mut Server,
+    raw: &Value,
+    request: &RequestId,
+) -> Result<Option<AgentResponse>, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
-    let session = open_session(&mut srv.sessions, &req.session_id)?;
-    if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
-        let detail = format!("unknown config option: {}", req.config_id);
+    open_session(&mut srv.sessions, &req.session_id)?;
+    let config_id = req.config_id.0.to_string();
+    if config_id != methods::MODEL_CONFIG_ID && config_id != methods::PERMISSIONS_CONFIG_ID {
+        let detail = format!("unknown config option: {config_id}");
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
     let SessionConfigOptionValue::ValueId { value } = req.value else {
-        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+        let detail = format!("{config_id} must be a value id");
+        return Err(AcpError::invalid_params().data(json_str(&detail)));
     };
-    let spec = value.0.to_string();
+    let value = value.0.to_string();
+    if config_id == methods::PERMISSIONS_CONFIG_ID {
+        set_permission_level(srv, &req.session_id, value, request.clone()).await?;
+        return Ok(None);
+    }
+    set_model(srv, &req.session_id, value).await?;
+    Ok(Some(config_options_response(srv, &req.session_id)))
+}
+
+fn config_options_response(srv: &Server, sid: &SessionId) -> AgentResponse {
+    AgentResponse::SetSessionConfigOptionResponse(SetSessionConfigOptionResponse::new(
+        session_config_options(srv, sid),
+    ))
+}
+
+async fn set_model(srv: &mut Server, sid: &SessionId, spec: String) -> Result<(), AcpError> {
     let model = Model::from_spec_with_policy(&spec, &srv.stack.model_policy)
         .await
         .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
+    let session = open_session(&mut srv.sessions, sid)?;
     session
         .handle
         .model_tx
         .send(model)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.current_model = spec.clone();
+        .map_err(|_| AcpError::new(-32603, SESSION_ENDED))?;
+    session.current_model = spec;
+    Ok(())
+}
 
-    Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
-            &spec,
-            &srv.model_specs,
-        )]),
-    ))
+/// What plugins offer, minus ids that spell a built-in level, which would make
+/// two entries of one value.
+async fn offered_permission_modes(lua_handle: Option<&EventHandle>) -> Vec<PermissionModeInfo> {
+    let Some(lua_handle) = lua_handle else {
+        return Vec::new();
+    };
+    let mut modes = lua_handle.permission_modes().await;
+    modes.retain(|mode| {
+        let builtin = methods::is_builtin_level(&mode.id);
+        if builtin {
+            warn!(mode = %mode.id, "plugin permission mode shadows a built-in level, skipped");
+        }
+        !builtin
+    });
+    modes
+}
+
+/// Tells the plugin that owns `level`. Built-in levels have no owner.
+async fn notify_level(
+    lua_handle: Option<&EventHandle>,
+    session_id: &str,
+    level: &str,
+    selected: bool,
+) -> Result<(), String> {
+    match lua_handle {
+        Some(lua_handle) if !methods::is_builtin_level(level) => {
+            lua_handle
+                .select_permission_mode(level, session_id, selected)
+                .await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The plugin calls can take seconds, so they run off the loop and the
+/// answer comes back through it as [`Incoming::LevelSwitched`].
+async fn set_permission_level(
+    srv: &mut Server,
+    sid: &SessionId,
+    level: String,
+    request: RequestId,
+) -> Result<(), AcpError> {
+    srv.permission_modes = offered_permission_modes(srv.stack.lua_handle.as_ref()).await;
+    if !methods::is_builtin_level(&level)
+        && !srv.permission_modes.iter().any(|mode| mode.id == level)
+    {
+        let detail = format!("unknown permission level: {level}");
+        return Err(AcpError::invalid_params().data(json_str(&detail)));
+    }
+
+    let lua_handle = srv.stack.lua_handle.clone();
+    let incoming = srv.incoming.clone();
+    let session = open_session(&mut srv.sessions, sid)?;
+    let session_id = session.handle.session_id.to_string();
+    let gate = Arc::clone(&session.level_gate);
+    let sid = sid.clone();
+    tokio::spawn(async move {
+        let mut current = gate.lock().await;
+        let outcome = switch_level(lua_handle.as_ref(), &session_id, &current, &level).await;
+        *current = level_in_force(&level, &outcome).to_owned();
+        // Under the gate, so results reach the loop in the order switches ran.
+        if let Some(tx) = incoming.upgrade() {
+            let gate = Arc::clone(&gate);
+            let _ = tx.send(Incoming::LevelSwitched(LevelSwitched {
+                request,
+                sid,
+                gate,
+                level,
+                outcome,
+            }));
+        }
+    });
+    Ok(())
+}
+
+/// Leaving a plugin's level tells its owner first, so two plugin levels never
+/// run at once in a session. A pick that fails may have half turned its plugin
+/// on, so the owner is told to turn off again.
+async fn switch_level(
+    lua_handle: Option<&EventHandle>,
+    session_id: &str,
+    previous: &str,
+    level: &str,
+) -> Result<(), String> {
+    if previous != level
+        && let Err(e) = notify_level(lua_handle, session_id, previous, false).await
+    {
+        warn!(mode = %previous, error = %e, "permission mode handler failed on deselect");
+    }
+    let picked = notify_level(lua_handle, session_id, level, true).await;
+    if picked.is_err()
+        && let Err(e) = notify_level(lua_handle, session_id, level, false).await
+    {
+        warn!(mode = %level, error = %e, "permission mode handler failed to undo a failed pick");
+    }
+    picked
+}
+
+/// A level that fails to take falls back to `ask` rather than to whatever the
+/// client thought it had.
+fn level_in_force<'a>(level: &'a str, outcome: &Result<(), String>) -> &'a str {
+    match outcome {
+        Ok(()) => level,
+        Err(_) => methods::PERMISSION_ASK,
+    }
+}
+
+/// The client is told what is in force either way.
+fn finish_level_switch(
+    srv: &mut Server,
+    switched: LevelSwitched,
+) -> Result<AgentResponse, AcpError> {
+    let LevelSwitched {
+        sid,
+        gate,
+        level,
+        outcome,
+        ..
+    } = switched;
+    let session = srv
+        .sessions
+        .get_mut(&sid)
+        .filter(|session| Arc::ptr_eq(&session.level_gate, &gate))
+        .ok_or_else(|| AcpError::new(-32603, SESSION_ENDED))?;
+    let effective = level_in_force(&level, &outcome);
+    session
+        .handle
+        .permissions
+        .set_session_yolo(Some(effective == methods::PERMISSION_YOLO));
+    session.permission_level = effective.to_owned();
+    notify_config_options(srv, &sid);
+    outcome
+        .map(|()| config_options_response(srv, &sid))
+        .map_err(|e| {
+            let cause = format!("permission level {level}: {e}");
+            // Clients show `message`, not `data`.
+            let mut error = AcpError::internal_error().data(json_str(&cause));
+            error.message = cause;
+            error
+        })
 }
 
 /// `session/close`: the client is done with the session for good. An id we
@@ -1289,6 +1543,7 @@ fn start_event_pump(
     sid: SessionId,
     out_tx: UnboundedSender<Value>,
     pending: PendingState,
+    snapshot: HeadlessSnapshot,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -1302,10 +1557,11 @@ fn start_event_pump(
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
-        {
+        while let Some(envelope) = events.next().await {
+            snapshot.observe(&envelope);
+            let Envelope {
+                event, subagent, ..
+            } = envelope;
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1500,11 +1756,14 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use agent_client_protocol_schema::v1::ErrorCode;
+    use arc_swap::ArcSwap;
+    use maki_agent::agent::{HistorySnapshot, SharedHeader, SharedMessages, publish_live_session};
     use maki_agent::command::{COMPACT_NAME, CommandScope};
     use maki_agent::headless::SessionEnd;
     use maki_agent::mcp::{USAGE_PREFIX, test_support};
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
-    use maki_agent::tools::PermissionScopes;
+    use maki_agent::session::SessionHeader;
+    use maki_agent::tools::{PermissionScopes, ToolRegistry};
     use maki_agent::{
         CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
         TurnCompleteEvent,
@@ -1512,6 +1771,8 @@ mod tests {
     use maki_agent::{McpPromptInfo, McpSnapshot};
     use maki_config::project::TrustQuestion;
     use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
+    use maki_lua::PluginHost;
+    use maki_lua::session_snapshot::NO_CALLING_SESSION_ERR;
     use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
@@ -1564,6 +1825,7 @@ mod tests {
     const REQUEST_ID: i64 = 8;
     const OTHER_SESSIONS_UNTOUCHED: &str = "a request for one session leaves the others alone";
     const MODE_BUILD_ID: &str = "build";
+    const MODE_PLAN_ID: &str = "plan";
     const STOP_CANCELLED: &str = "cancelled";
     const REQUEST_ANSWERED: &str = "the request is answered";
     const PROMPT_ANSWERED_ON_TURN_END: &str = "an accepted prompt is answered when its turn ends";
@@ -1769,6 +2031,8 @@ mod tests {
     /// can see what reached which session.
     struct FixtureSession {
         state: SessionState,
+        /// What the agent publishes for the session while it is open.
+        _published: (SharedMessages, SharedHeader),
         answer_rx: UnboundedReceiver<String>,
         input_rx: UnboundedReceiver<SessionInput>,
         cancel_rx: watch::Receiver<()>,
@@ -1801,7 +2065,14 @@ mod tests {
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
+        let current_mode = Arc::default();
+        let snapshot = fixture_snapshot(
+            &HeadlessSessions::default(),
+            &handle.session_id,
+            &current_mode,
+        );
         FixtureSession {
+            _published: publish_fixture(&handle.session_id),
             state: SessionState {
                 handle,
                 pump: AbortOnDropHandle::new(tokio::spawn(future::ready(()))),
@@ -1809,8 +2080,11 @@ mod tests {
                 commands: Arc::default(),
                 mcp_prompts: McpSnapshotReader::empty(),
                 commands_watch: None,
-                current_mode: AgentMode::Build,
+                current_mode,
+                _snapshot: snapshot,
                 current_model: String::new(),
+                permission_level: methods::PERMISSION_ASK.to_owned(),
+                level_gate: Arc::new(AsyncMutex::new(methods::PERMISSION_ASK.to_owned())),
                 pending: Arc::default(),
                 claim,
             },
@@ -1820,6 +2094,22 @@ mod tests {
             model_rx,
             mode_rx,
         }
+    }
+
+    fn fixture_snapshot(
+        sessions: &HeadlessSessions,
+        id: &SessionRef,
+        current_mode: &Arc<Mutex<AgentMode>>,
+    ) -> RegisteredSession {
+        register_snapshot(sessions, &HeadlessSnapshot::default(), id, current_mode)
+    }
+
+    fn publish_fixture(id: &SessionRef) -> (SharedMessages, SharedHeader) {
+        let header = SessionHeader::of(&StoredSession::new(SELECTED_SPEC, PUMP_CWD));
+        let header: SharedHeader = Arc::new(ArcSwap::from_pointee(header));
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_session(id.id(), &mirror, &header);
+        (mirror, header)
     }
 
     fn test_stack() -> ProjectStack {
@@ -1834,6 +2124,8 @@ mod tests {
             trust_policy: Arc::default(),
             yolo: false,
             on_session_end: None,
+            session_snapshots: HeadlessSessions::default(),
+            lua_handle: None,
         }
     }
 
@@ -1854,10 +2146,12 @@ mod tests {
                 relay: Relay::with_spawner(spawner, out_tx.clone(), sink),
                 out_tx,
                 model_specs: Vec::new(),
+                permission_modes: Vec::new(),
                 client_elicits_form: false,
                 sessions: Sessions::new(),
                 closing: HashMap::new(),
                 stack: test_stack(),
+                incoming: unbounded_channel::<Incoming>().0.downgrade(),
             };
             Self {
                 srv,
@@ -2054,6 +2348,7 @@ mod tests {
             client_id(&session.handle.session_id),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
+            HeadlessSnapshot::default(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -2947,6 +3242,71 @@ mod tests {
         );
     }
 
+    /// Two chats on one plugin host: each answers only for itself, and the one
+    /// opened last never becomes everyone's default, closed or not.
+    #[tokio::test]
+    async fn plugins_read_each_session_by_id_and_never_a_closed_one() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.session_snapshots.provider();
+        let mut first = fixture_session();
+        let mut last = fixture_session();
+        for fixture in [&mut first, &mut last] {
+            fixture.state._snapshot = fixture_snapshot(
+                &srv.stack.session_snapshots,
+                &fixture.state.handle.session_id,
+                &fixture.state.current_mode,
+            );
+        }
+        let (first_id, last_id) = (
+            first.state.handle.session_id.to_string(),
+            last.state.handle.session_id.to_string(),
+        );
+        install(&mut srv, first.state);
+        let last_sid = install(&mut srv, last.state);
+
+        for id in [&first_id, &last_id] {
+            assert_eq!(read(Some(id)).unwrap()["id"], **id);
+        }
+        assert_eq!(read(None).unwrap_err(), NO_CALLING_SESSION_ERR);
+
+        close_session(&mut srv, &last_sid, SessionEndReason::Delete).await;
+        assert!(read(Some(&last_id)).is_err());
+        assert_eq!(read(Some(&first_id)).unwrap()["id"], *first_id);
+
+        close_all_sessions(&mut srv, SessionEndReason::Shutdown).await;
+        assert!(read(Some(&first_id)).is_err());
+    }
+
+    /// The snapshot plugins read and the mode the next prompt runs under are
+    /// one value, so a switch can never reach one and miss the other.
+    #[tokio::test]
+    async fn a_mode_switch_shows_in_what_plugins_read() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.session_snapshots.provider();
+        let mut fixture = fixture_session();
+        fixture.state._snapshot = fixture_snapshot(
+            &srv.stack.session_snapshots,
+            &fixture.state.handle.session_id,
+            &fixture.state.current_mode,
+        );
+        let id = fixture.state.handle.session_id.to_string();
+        let sid = install(&mut srv, fixture.state);
+        let mode = || read(Some(&id)).unwrap()["mode"].clone();
+        assert_eq!(mode(), MODE_BUILD);
+
+        let request = with_params(SetSessionModeRequest::new(sid, MODE_PLAN_ID));
+        handle_request(
+            &mut srv,
+            "session/set_mode",
+            RequestId::Number(REQUEST_ID),
+            &request,
+            &fixture_settings(),
+        )
+        .await;
+
+        assert_eq!(mode(), MODE_PLAN);
+    }
+
     /// The hook can take seconds, so a prompt left for it to answer would
     /// leave the client's turn spinning that long after the user closed it.
     #[tokio::test]
@@ -2986,6 +3346,7 @@ mod tests {
             sid.clone(),
             srv.out_tx.clone(),
             Arc::clone(&srv.sessions[&sid].pending),
+            HeadlessSnapshot::default(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
@@ -3365,6 +3726,340 @@ mod tests {
 
         refresh_models(&mut srv, batch);
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
+    }
+
+    const PLUGIN_LEVEL: &str = "judge";
+    const PLUGIN_LEVEL_NAME: &str = "Judge";
+    const UNKNOWN_LEVEL: &str = "no-such-level";
+    const SELECTED_PREFIX: &str = "/selected-";
+    const DESELECTED_PREFIX: &str = "/deselected-";
+    const SET_LEVEL_ID: i64 = 11;
+    /// Records each call as a command named after it, which is how a test sees
+    /// that the handler ran and with which arguments.
+    const LEVEL_PLUGIN: &str = r#"
+        maki.api.register_permission_mode({
+            id = "judge",
+            name = "Judge",
+            description = "A model answers prompts",
+            on_select = function(session, selected)
+                local prefix = selected and "/selected-" or "/deselected-"
+                maki.api.register_command({ name = prefix .. session, handler = function() end })
+            end,
+        })
+    "#;
+    const PICK_FAILURE: &str = "judge is down";
+    /// Turns itself off fine, which a failed pick must ask it to do.
+    fn failing_level_plugin() -> String {
+        format!(
+            r#"
+            maki.api.register_permission_mode({{
+                id = "judge",
+                on_select = function(session, selected)
+                    if selected then error("{PICK_FAILURE}") end
+                    maki.api.register_command({{ name = "/deselected-" .. session, handler = function() end }})
+                end,
+            }})
+        "#
+        )
+    }
+    /// A pick never comes back, like a plugin stuck on a slow call.
+    const PARKED_LEVEL_PLUGIN: &str = r#"
+        maki.api.register_permission_mode({
+            id = "judge",
+            on_select = function() maki.async.await(1, function(_done) end) end,
+        })
+    "#;
+
+    fn set_level_request(sid: &SessionId, level: &str) -> Value {
+        with_params(SetSessionConfigOptionRequest::new(
+            sid.clone(),
+            methods::PERMISSIONS_CONFIG_ID,
+            level,
+        ))
+    }
+
+    /// Where switch tasks report back, standing in for the loop's channel.
+    fn level_results(srv: &mut Server) -> (UnboundedSender<Incoming>, UnboundedReceiver<Incoming>) {
+        let (tx, rx) = unbounded_channel();
+        srv.incoming = tx.downgrade();
+        (tx, rx)
+    }
+
+    async fn start_level_switch(srv: &mut Server, sid: &SessionId, level: &str) {
+        let answer = handle_set_config(
+            srv,
+            &set_level_request(sid, level),
+            &RequestId::Number(SET_LEVEL_ID),
+        )
+        .await
+        .unwrap();
+        assert!(answer.is_none(), "a level switch is answered once it ran");
+    }
+
+    async fn finish_next_switch(
+        srv: &mut Server,
+        results: &mut UnboundedReceiver<Incoming>,
+    ) -> (SessionId, Result<AgentResponse, AcpError>) {
+        let Some(Incoming::LevelSwitched(switched)) = results.recv().await else {
+            panic!("a switch task reports back to the loop");
+        };
+        assert_eq!(switched.request, RequestId::Number(SET_LEVEL_ID));
+        let sid = switched.sid.clone();
+        (sid, finish_level_switch(srv, switched))
+    }
+
+    async fn set_level(
+        srv: &mut Server,
+        sid: &SessionId,
+        level: &str,
+    ) -> Result<AgentResponse, AcpError> {
+        let (_tx, mut results) = level_results(srv);
+        start_level_switch(srv, sid, level).await;
+        finish_next_switch(srv, &mut results).await.1
+    }
+
+    fn permissions_option(response: &AgentResponse) -> Value {
+        let AgentResponse::SetSessionConfigOptionResponse(resp) = response else {
+            panic!("session/set_config_option must answer SetSessionConfigOptionResponse");
+        };
+        let options = serde_json::to_value(&resp.config_options).unwrap();
+        options
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == methods::PERMISSIONS_CONFIG_ID)
+            .cloned()
+            .expect("the permissions option is part of every answer")
+    }
+
+    fn level_ids(option: &Value) -> Vec<&str> {
+        option["options"]
+            .as_array()
+            .expect("the option is a select")
+            .iter()
+            .filter_map(|o| o["value"].as_str())
+            .collect()
+    }
+
+    fn command_names(host: &PluginHost) -> Vec<String> {
+        host.command_reader()
+            .load()
+            .commands
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect()
+    }
+
+    fn server_with_level_plugin(source: &str) -> (Server, UnboundedReceiver<Value>, PluginHost) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("level_plugin", source).unwrap();
+        let (mut srv, _answers, out_rx) = test_server();
+        srv.stack.lua_handle = Some(host.event_handle());
+        (srv, out_rx, host)
+    }
+
+    fn is_yolo(srv: &Server, sid: &SessionId) -> bool {
+        srv.sessions[sid].handle.permissions.is_yolo()
+    }
+
+    #[test_case(methods::PERMISSION_YOLO, true ; "yolo_turns_the_session_on")]
+    #[test_case(methods::PERMISSION_ASK, false ; "ask_turns_it_back_off")]
+    #[tokio::test]
+    async fn setting_a_builtin_level_drives_yolo_and_announces_it(level: &str, yolo: bool) {
+        let (mut srv, .., mut out_rx) = test_server();
+        let sid = only_sid(&srv);
+        srv.sessions[&sid]
+            .handle
+            .permissions
+            .set_session_yolo(Some(!yolo));
+
+        let response = set_level(&mut srv, &sid, level).await.unwrap();
+
+        assert_eq!(is_yolo(&srv, &sid), yolo);
+        assert_eq!(permissions_option(&response)["currentValue"], level);
+        let update = out_rx.try_recv().expect("the client is told the new level");
+        let announced: Vec<&str> = update["params"]["update"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["id"].as_str())
+            .collect();
+        assert_eq!(
+            announced,
+            [methods::MODEL_CONFIG_ID, methods::PERMISSIONS_CONFIG_ID],
+            "an update carries every option, so none is lost on the client"
+        );
+    }
+
+    #[test_case(methods::PERMISSIONS_CONFIG_ID, UNKNOWN_LEVEL ; "unknown_level")]
+    #[test_case("nonsense", methods::PERMISSION_YOLO ; "unknown_option")]
+    #[tokio::test]
+    async fn an_unknown_option_or_level_is_rejected_and_changes_nothing(
+        config_id: &str,
+        value: &str,
+    ) {
+        let (mut srv, .., out_rx) = test_server();
+        let sid = only_sid(&srv);
+        let request = serde_json::json!({ "params": {
+            "sessionId": sid, "configId": config_id, "value": value,
+        } });
+
+        let err = handle_set_config(&mut srv, &request, &RequestId::Number(SET_LEVEL_ID))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, AcpError::invalid_params().code);
+        assert!(!is_yolo(&srv, &sid));
+        assert!(out_rx.is_empty(), "a rejected request announces nothing");
+    }
+
+    #[tokio::test]
+    async fn plugin_levels_are_offered_and_told_when_picked_and_left() {
+        let (mut srv, mut out_rx, host) = server_with_level_plugin(LEVEL_PLUGIN);
+        let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
+
+        let response = set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap();
+        let option = permissions_option(&response);
+        assert_eq!(option["currentValue"], PLUGIN_LEVEL);
+        assert_eq!(
+            level_ids(&option),
+            [
+                methods::PERMISSION_ASK,
+                methods::PERMISSION_YOLO,
+                PLUGIN_LEVEL
+            ]
+        );
+        let judge = &option["options"][2];
+        assert_eq!(judge["name"], PLUGIN_LEVEL_NAME);
+        assert_eq!(judge["description"], "A model answers prompts");
+        assert!(!is_yolo(&srv, &sid), "a plugin level is not yolo");
+        assert!(command_names(&host).contains(&format!("{SELECTED_PREFIX}{id}")));
+
+        set_level(&mut srv, &sid, methods::PERMISSION_YOLO)
+            .await
+            .unwrap();
+        assert!(is_yolo(&srv, &sid));
+        assert!(command_names(&host).contains(&format!("{DESELECTED_PREFIX}{id}")));
+        assert_eq!(drain(&mut out_rx).len(), 2, "each change is announced once");
+    }
+
+    #[tokio::test]
+    async fn a_failing_plugin_level_is_turned_off_and_falls_back_to_ask() {
+        let (mut srv, mut out_rx, host) = server_with_level_plugin(&failing_level_plugin());
+        let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
+        srv.sessions[&sid]
+            .handle
+            .permissions
+            .set_session_yolo(Some(true));
+
+        let err = set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap_err();
+
+        assert_eq!(err.code, AcpError::internal_error().code);
+        assert!(err.message.contains(PICK_FAILURE), "{}", err.message);
+        assert!(err.data.unwrap().to_string().contains(PICK_FAILURE));
+        assert!(
+            command_names(&host).contains(&format!("{DESELECTED_PREFIX}{id}")),
+            "a pick that failed may have half turned the plugin on"
+        );
+        assert!(
+            !is_yolo(&srv, &sid),
+            "a level that did not take must not leave yolo on"
+        );
+        assert_eq!(srv.sessions[&sid].permission_level, methods::PERMISSION_ASK);
+        let update = out_rx
+            .try_recv()
+            .expect("the client is told what is in force");
+        let option = &update["params"]["update"]["configOptions"][1];
+        assert_eq!(option["currentValue"], methods::PERMISSION_ASK);
+    }
+
+    #[tokio::test]
+    async fn a_parked_plugin_level_holds_back_no_other_session() {
+        let (mut srv, out_rx, _host) = server_with_level_plugin(PARKED_LEVEL_PLUGIN);
+        let parked = only_sid(&srv);
+        let other = install(&mut srv, fixture_session().state);
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &parked, PLUGIN_LEVEL).await;
+        start_level_switch(&mut srv, &other, methods::PERMISSION_YOLO).await;
+        let (sid, response) = finish_next_switch(&mut srv, &mut results).await;
+
+        assert_eq!(sid, other);
+        response.unwrap();
+        assert!(is_yolo(&srv, &other));
+        assert!(!is_yolo(&srv, &parked));
+        assert_eq!(
+            srv.sessions[&parked].permission_level,
+            methods::PERMISSION_ASK,
+            "a level its plugin has not confirmed is not shown"
+        );
+        assert_eq!(out_rx.len(), 1, "only the switch that ran is announced");
+    }
+
+    #[tokio::test]
+    async fn back_to_back_switches_settle_on_the_last_one() {
+        let (mut srv, _out_rx, host) = server_with_level_plugin(LEVEL_PLUGIN);
+        let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &sid, PLUGIN_LEVEL).await;
+        start_level_switch(&mut srv, &sid, methods::PERMISSION_YOLO).await;
+        let first = finish_next_switch(&mut srv, &mut results).await.1.unwrap();
+        let last = finish_next_switch(&mut srv, &mut results).await.1.unwrap();
+
+        assert_eq!(permissions_option(&first)["currentValue"], PLUGIN_LEVEL);
+        assert_eq!(
+            permissions_option(&last)["currentValue"],
+            methods::PERMISSION_YOLO
+        );
+        assert!(is_yolo(&srv, &sid));
+        assert_eq!(
+            srv.sessions[&sid].permission_level,
+            methods::PERMISSION_YOLO
+        );
+        let names = command_names(&host);
+        assert!(names.contains(&format!("{SELECTED_PREFIX}{id}")));
+        assert!(
+            names.contains(&format!("{DESELECTED_PREFIX}{id}")),
+            "the second switch leaves the level the first one picked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_outlives_its_session_leaves_a_reopened_one_alone() {
+        let (mut srv, ..) = test_server();
+        let sid = only_sid(&srv);
+        let (_tx, mut results) = level_results(&mut srv);
+
+        start_level_switch(&mut srv, &sid, methods::PERMISSION_YOLO).await;
+        close_session(&mut srv, &sid, SessionEndReason::Replaced).await;
+        srv.sessions.insert(sid.clone(), fixture_session().state);
+        let err = finish_next_switch(&mut srv, &mut results)
+            .await
+            .1
+            .unwrap_err();
+
+        assert_eq!(err.message, SESSION_ENDED);
+        assert!(
+            !is_yolo(&srv, &sid),
+            "the reopened session keeps its own level"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_leaves_the_plugin_level_it_was_on() {
+        let (mut srv, _out_rx, host) = server_with_level_plugin(LEVEL_PLUGIN);
+        let sid = only_sid(&srv);
+        let id = srv.sessions[&sid].handle.session_id.to_string();
+        set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap();
+
+        close_session(&mut srv, &sid, SessionEndReason::Replaced).await;
+        finish_teardowns(&mut srv).await;
+
+        assert!(command_names(&host).contains(&format!("{DESELECTED_PREFIX}{id}")));
     }
 
     /// Editor clients call `session/list` to offer resuming a session. The

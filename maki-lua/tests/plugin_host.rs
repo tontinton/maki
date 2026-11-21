@@ -6190,6 +6190,7 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 #[test_case::test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
 #[test_case::test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
 #[test_case::test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
+#[test_case::test_case(r#"maki.api.register_permission_mode({ id = "x", on_select = function() end })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "register_permission_mode_with_only_write")]
 #[test_case::test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]
 #[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
 fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
@@ -9376,4 +9377,128 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
+}
+
+const MODE_PLUGIN: &str = "mode_plugin";
+const PERMISSION_MODE_ERR: &str = "register_permission_mode";
+
+/// Each call to `on_select` registers a command named after it, which is how
+/// a test on this side of the channel sees that it ran and with what.
+const MODE_SOURCE: &str = r#"
+    maki.api.register_permission_mode({
+        id = "judge",
+        name = "Judge",
+        description = "A model answers prompts",
+        on_select = function(session, selected)
+            local prefix = selected and "/selected-" or "/deselected-"
+            maki.api.register_command({ name = prefix .. session, handler = function() end })
+        end,
+    })
+    maki.api.register_permission_mode({ id = "bare", on_select = function() error("no way") end })
+"#;
+
+fn mode_host(source: &str) -> PluginHost {
+    let host = PluginHost::start(fresh_registry(), Interaction::None, true).unwrap();
+    host.load_source(MODE_PLUGIN, source).unwrap();
+    host
+}
+
+fn command_names(host: &PluginHost) -> Vec<String> {
+    host.command_reader()
+        .load()
+        .commands
+        .iter()
+        .map(|c| c.name.to_string())
+        .collect()
+}
+
+#[test]
+fn permission_modes_list_in_registration_order_with_their_labels() {
+    let host = mode_host(MODE_SOURCE);
+
+    let modes = runtime().block_on(host.event_handle().permission_modes());
+
+    let listed: Vec<_> = modes
+        .iter()
+        .map(|m| (m.id.as_str(), m.name.as_str(), m.description.as_deref()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("judge", "Judge", Some("A model answers prompts")),
+            ("bare", "bare", None),
+        ],
+        "a mode without a name is labelled by its id"
+    );
+}
+
+#[test_case::test_case(true, "/selected-s1" ; "picked")]
+#[test_case::test_case(false, "/deselected-s1" ; "left")]
+fn select_calls_the_owner_with_the_session_and_the_direction(selected: bool, ran: &str) {
+    let host = mode_host(MODE_SOURCE);
+
+    let answer = runtime().block_on(
+        host.event_handle()
+            .select_permission_mode("judge", "s1", selected),
+    );
+
+    assert_eq!(answer, Ok(()));
+    assert!(command_names(&host).contains(&ran.to_owned()));
+}
+
+#[test]
+fn select_reports_a_handler_error_and_an_unknown_id() {
+    let host = mode_host(MODE_SOURCE);
+    let handle = host.event_handle();
+
+    let failed = runtime().block_on(handle.select_permission_mode("bare", "s1", true));
+    let unknown = runtime().block_on(handle.select_permission_mode("nope", "s1", true));
+
+    assert!(failed.unwrap_err().contains("no way"));
+    assert!(
+        unknown
+            .unwrap_err()
+            .contains("unknown permission mode 'nope'")
+    );
+}
+
+#[test]
+fn registering_an_id_again_replaces_the_mode_and_unloading_drops_it() {
+    let host = mode_host(MODE_SOURCE);
+    host.load_source(
+        "other_plugin",
+        r#"maki.api.register_permission_mode({ id = "judge", name = "Taken over", on_select = function() end })"#,
+    )
+    .unwrap();
+    let handle = host.event_handle();
+
+    let names = |modes: Vec<maki_lua::PermissionModeInfo>| {
+        modes.into_iter().map(|m| m.name).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(runtime().block_on(handle.permission_modes())),
+        ["Taken over", "bare"]
+    );
+
+    host.unload("other_plugin").unwrap();
+    assert_eq!(
+        names(runtime().block_on(handle.permission_modes())),
+        ["bare"]
+    );
+}
+
+#[test_case::test_case("{ on_select = function() end }" ; "missing_id")]
+#[test_case::test_case(r#"{ id = "  ", on_select = function() end }"# ; "blank_id")]
+#[test_case::test_case(r#"{ id = "x" }"# ; "missing_handler")]
+fn a_mode_without_an_id_or_a_handler_throws(spec: &str) {
+    let host = PluginHost::start(fresh_registry(), Interaction::None, true).unwrap();
+
+    let err = host
+        .load_source(
+            MODE_PLUGIN,
+            &format!("maki.api.register_permission_mode({spec})"),
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains(PERMISSION_MODE_ERR), "{err}");
 }

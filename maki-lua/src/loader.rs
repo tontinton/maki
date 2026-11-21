@@ -24,6 +24,7 @@ use tokio::time::timeout_at;
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::permission_mode::PermissionModeInfo;
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
@@ -62,6 +63,7 @@ fn enter_test_runtime() -> Option<EnterGuard<'static>> {
     (!on_workers).then(|| HOST_RUNTIME.enter())
 }
 
+const PLUGINS_UNAVAILABLE_ERR: &str = "plugin host stopped";
 const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
@@ -1188,6 +1190,38 @@ impl EventHandle {
             args,
             depth,
         });
+    }
+
+    /// The levels plugins registered with `maki.api.register_permission_mode`,
+    /// in registration order. Empty once the host has shut down.
+    pub async fn permission_modes(&self) -> Vec<PermissionModeInfo> {
+        let (reply, answer) = oneshot::channel();
+        if self.tx.send(Request::PermissionModes { reply }).is_err() {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
+    /// Tells the plugin that owns {id} the user picked it ({selected}) or
+    /// moved off it, and waits for its handler.
+    pub async fn select_permission_mode(
+        &self,
+        id: &str,
+        session: &str,
+        selected: bool,
+    ) -> Result<(), String> {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(Request::SelectPermissionMode {
+                id: id.to_owned(),
+                session: session.to_owned(),
+                selected,
+                reply,
+            })
+            .map_err(|_| PLUGINS_UNAVAILABLE_ERR.to_owned())?;
+        answer
+            .await
+            .map_err(|_| PLUGINS_UNAVAILABLE_ERR.to_owned())?
     }
 
     pub async fn package_context(&self) -> Result<crate::pack::PackContext, String> {
