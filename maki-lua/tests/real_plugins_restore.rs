@@ -45,13 +45,6 @@ const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
 const TODO_TOOL: &str = "todo_write";
 const TODO_ITEM: &str = "wire the panel";
-/// What a user's `init.lua` does with the action: call it by name, and expect
-/// the `false` that says nothing was hidden, with no error.
-const TODO_TOGGLE_CALLER: &str = r#"
-local ok, err = maki.ui.action('todo_write.toggle')
-assert(err == nil, err)
-assert(ok == false, tostring(ok))
-"#;
 /// What a user's `init.lua` does with the action while a panel is shown: call
 /// it by name, and expect the `true` that says the key was consumed, with no
 /// error and no permission prompt.
