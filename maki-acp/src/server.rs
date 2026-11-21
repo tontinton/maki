@@ -36,7 +36,7 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
 use maki_lua::session_snapshot::{
-    HeadlessMeta, HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, RegisteredSession,
+    HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, RegisteredSession,
 };
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -739,8 +739,6 @@ async fn start_session(
         &srv.stack.session_snapshots,
         &snapshot,
         &handle.session_id,
-        &cwd,
-        srv.stack.model.spec(),
         &plan_mode,
     );
     // Before the pump starts, so nothing the new run says lands inside the
@@ -783,16 +781,9 @@ fn register_snapshot(
     sessions: &HeadlessSessions,
     snapshot: &HeadlessSnapshot,
     session_id: &SessionRef,
-    cwd: &Path,
-    model: String,
     plan_mode: &Arc<AtomicBool>,
 ) -> RegisteredSession {
     let plan_mode = Arc::clone(plan_mode);
-    let meta = HeadlessMeta {
-        id: session_id.to_string(),
-        cwd: cwd.display().to_string(),
-        model,
-    };
     let mode = move || {
         if plan_mode.load(Ordering::Relaxed) {
             MODE_PLAN
@@ -800,7 +791,7 @@ fn register_snapshot(
             MODE_BUILD
         }
     };
-    sessions.register(session_id.id(), snapshot, meta, mode)
+    sessions.register(session_id.clone(), snapshot, mode)
 }
 
 /// The id the client names a run's session with.
@@ -1549,10 +1540,13 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use agent_client_protocol_schema::v1::ErrorCode;
+    use arc_swap::ArcSwap;
+    use maki_agent::agent::{HistorySnapshot, SharedHeader, SharedMessages, publish_live_session};
     use maki_agent::command::{COMPACT_NAME, CommandScope};
     use maki_agent::headless::SessionEnd;
     use maki_agent::mcp::{USAGE_PREFIX, test_support};
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::session::SessionHeader;
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
@@ -1819,6 +1813,8 @@ mod tests {
     /// can see what reached which session.
     struct FixtureSession {
         state: SessionState,
+        /// What the agent publishes for the session while it is open.
+        _published: (SharedMessages, SharedHeader),
         answer_rx: UnboundedReceiver<String>,
         input_rx: UnboundedReceiver<SessionInput>,
         cancel_rx: watch::Receiver<()>,
@@ -1853,6 +1849,7 @@ mod tests {
         };
         let snapshot = fixture_snapshot(&HeadlessSessions::default(), &handle.session_id);
         FixtureSession {
+            _published: publish_fixture(&handle.session_id),
             state: SessionState {
                 handle,
                 pump: AbortOnDropHandle::new(tokio::spawn(future::ready(()))),
@@ -1876,14 +1873,15 @@ mod tests {
     }
 
     fn fixture_snapshot(sessions: &HeadlessSessions, id: &SessionRef) -> RegisteredSession {
-        register_snapshot(
-            sessions,
-            &HeadlessSnapshot::default(),
-            id,
-            Path::new(PUMP_CWD),
-            SELECTED_SPEC.to_owned(),
-            &Arc::default(),
-        )
+        register_snapshot(sessions, &HeadlessSnapshot::default(), id, &Arc::default())
+    }
+
+    fn publish_fixture(id: &SessionRef) -> (SharedMessages, SharedHeader) {
+        let header = SessionHeader::of(&StoredSession::new(SELECTED_SPEC, PUMP_CWD));
+        let header: SharedHeader = Arc::new(ArcSwap::from_pointee(header));
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_session(id.id(), &mirror, &header);
+        (mirror, header)
     }
 
     fn test_stack() -> ProjectStack {

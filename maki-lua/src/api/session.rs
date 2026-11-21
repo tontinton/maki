@@ -1345,6 +1345,7 @@ mod tests {
     use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
     use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
+    use maki_storage::id::SessionRef;
     use maki_storage::sessions::{SessionClaim, StoredMode, StoredSubagent, StoredThinking};
     use tempfile::TempDir;
     use tokio::sync::mpsc::UnboundedSender;
@@ -1359,8 +1360,8 @@ mod tests {
     use crate::plugin_permissions::denied_error;
     use crate::runtime::{TaskCell, TaskHandle};
     use crate::session_snapshot::{
-        HeadlessMeta, HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN,
-        NO_CALLING_SESSION_ERR, RegisteredSession, STATUS_IDLE, STATUS_STORED,
+        HeadlessSessions, HeadlessSnapshot, MODE_BUILD, MODE_PLAN, NO_CALLING_SESSION_ERR,
+        RegisteredSession, STATUS_IDLE, STATUS_STORED,
     };
     use mlua::Value;
     use serde_json::json;
@@ -1469,13 +1470,17 @@ mod tests {
         sessions
     }
 
-    fn register(sessions: &HeadlessSessions, id: MakiId) -> RegisteredSession {
-        let meta = HeadlessMeta {
-            id: id.to_string(),
-            cwd: FACTS_CWD.to_owned(),
-            model: MODEL.to_owned(),
-        };
-        sessions.register(id, &HeadlessSnapshot::default(), meta, || MODE_BUILD)
+    /// Registered and published, the way an open ACP session is.
+    fn register(
+        sessions: &HeadlessSessions,
+        id: MakiId,
+    ) -> (RegisteredSession, (History, SharedHeader)) {
+        let live = live_unsaved(id, Vec::new());
+        let registered =
+            sessions.register(SessionRef::from(id), &HeadlessSnapshot::default(), || {
+                MODE_BUILD
+            });
+        (registered, live)
     }
 
     async fn current_and_read(lua: &Lua) -> (Pair<String>, Pair<String>) {
@@ -2896,10 +2901,8 @@ mod tests {
     #[tokio::test]
     async fn headless_new_without_a_driver_session_lands_where_maki_runs() {
         let (lua, _dir) = headless();
-        let open = MakiId::generate();
-        let _live = live_unsaved(open, Vec::new());
         let sessions = acp(&lua);
-        let _registered = register(&sessions, open);
+        let _registered = register(&sessions, MakiId::generate());
 
         let id: String = eval(
             &lua,
