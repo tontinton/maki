@@ -88,10 +88,12 @@ pub enum ExtractedCommand {
     Interrupt(Vec<AgentInput>),
     /// Carries the guidance from `/compact <instructions>`, for this one
     /// summary. {reason} tells a typed `/compact` from a plugin's
-    /// `maki.session.request_compact`.
+    /// `maki.session.request_compact`, and only the plugin may ask for
+    /// {carry_turns} complete turns to stay out of the summary verbatim.
     Compact {
         instructions: Option<String>,
         reason: CompactReason,
+        carry_turns: usize,
     },
 }
 

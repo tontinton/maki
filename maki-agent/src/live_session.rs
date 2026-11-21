@@ -73,9 +73,12 @@ struct Mailbox {
 }
 
 /// A compaction a plugin queued through `maki.session.request_compact`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CompactRequest {
     pub instructions: Option<String>,
+    /// Newest complete user turns to keep out of the summary, verbatim.
+    /// Zero summarizes the whole history, like `/compact`.
+    pub carry_turns: usize,
 }
 
 /// How a notice names a task: its tool, plus the call's summary when that
@@ -426,9 +429,9 @@ impl SessionMailbox {
     /// sits unclaimed, a repeat request fails.
     pub fn request_compact(
         session_id: MakiId,
-        instructions: Option<String>,
+        request: CompactRequest,
     ) -> Result<(), MailboxError> {
-        Self::open(session_id)?.queue_compact(CompactRequest { instructions })
+        Self::open(session_id)?.queue_compact(request)
     }
 
     /// [`Self::request_compact`] for a live subagent of `session_id`, whose
@@ -436,14 +439,14 @@ impl SessionMailbox {
     pub fn request_compact_task(
         session_id: MakiId,
         task_id: &str,
-        instructions: Option<String>,
+        request: CompactRequest,
     ) -> Result<(), MailboxError> {
         let tasks = lock(&LIVE_TASKS);
         let entry = tasks
             .get(task_id)
             .filter(|entry| entry.parent == session_id)
             .ok_or_else(|| MailboxError::Task(task_id.to_owned()))?;
-        entry.mailbox.queue_compact(CompactRequest { instructions })
+        entry.mailbox.queue_compact(request)
     }
 
     fn queue_compact(&self, request: CompactRequest) -> Result<(), MailboxError> {
@@ -1484,7 +1487,14 @@ mod tests {
     fn request_compact_queues_one_claimable_request() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        SessionMailbox::request_compact(
+            id,
+            CompactRequest {
+                instructions: Some(COMPACT_INSTRUCTIONS.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             mailbox.take_compact().unwrap().instructions.as_deref(),
             Some(COMPACT_INSTRUCTIONS)
@@ -1496,13 +1506,26 @@ mod tests {
     fn request_compact_rejects_a_second_request_until_claimed() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::request_compact(id, None).unwrap();
+        SessionMailbox::request_compact(id, CompactRequest::default()).unwrap();
         assert!(matches!(
-            SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())),
+            SessionMailbox::request_compact(
+                id,
+                CompactRequest {
+                    instructions: Some(COMPACT_INSTRUCTIONS.to_owned()),
+                    ..Default::default()
+                }
+            ),
             Err(MailboxError::AlreadyPending)
         ));
         mailbox.take_compact().unwrap();
-        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        SessionMailbox::request_compact(
+            id,
+            CompactRequest {
+                instructions: Some(COMPACT_INSTRUCTIONS.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             mailbox.take_compact().unwrap().instructions.as_deref(),
             Some(COMPACT_INSTRUCTIONS)
@@ -1513,14 +1536,14 @@ mod tests {
     fn request_compact_rejects_a_dead_session() {
         let missing = MakiId::generate();
         assert!(matches!(
-            SessionMailbox::request_compact(missing, None),
+            SessionMailbox::request_compact(missing, CompactRequest::default()),
             Err(MailboxError::Session(id)) if id == missing
         ));
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         mailbox.close();
         assert!(matches!(
-            SessionMailbox::request_compact(id, None),
+            SessionMailbox::request_compact(id, CompactRequest::default()),
             Err(MailboxError::Session(_))
         ));
     }
@@ -1532,16 +1555,23 @@ mod tests {
         let task_id = "task-1";
         let subagent = SessionMailbox::register(MakiId::generate());
         subagent.track_task(task_id, parent);
-        SessionMailbox::request_compact_task(parent, task_id, Some(COMPACT_INSTRUCTIONS.into()))
-            .unwrap();
+        SessionMailbox::request_compact_task(
+            parent,
+            task_id,
+            CompactRequest {
+                instructions: Some(COMPACT_INSTRUCTIONS.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             subagent.take_compact().unwrap().instructions.as_deref(),
             Some(COMPACT_INSTRUCTIONS)
         );
-        assert!(
-            matches!(SessionMailbox::request_compact_task(parent, "untracked", None),
-                Err(MailboxError::Task(t)) if t == "untracked")
-        );
+        assert!(matches!(
+            SessionMailbox::request_compact_task(parent, "untracked", CompactRequest::default()),
+            Err(MailboxError::Task(t)) if t == "untracked"
+        ));
         parent_mailbox.close();
     }
 }

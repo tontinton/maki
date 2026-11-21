@@ -79,6 +79,9 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    /// Newest complete user turns to keep out of the summary, verbatim. Only
+    /// a plugin's request asks for more than zero.
+    pub(crate) carry_turns: usize,
     pub(crate) reason: CompactReason,
     /// The session's workflow mode when it was asked for: the frame left
     /// behind must carry the tools the next run sends.
@@ -273,6 +276,7 @@ impl InterruptSource for QueueReceiver {
             QueueRun::Compact(compaction) => ExtractedCommand::Compact {
                 instructions: compaction.instructions,
                 reason: compaction.reason,
+                carry_turns: compaction.carry_turns,
             },
             QueueRun::Messages(run) => {
                 ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
@@ -366,6 +370,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            carry_turns: 0,
             reason: CompactReason::Manual,
             workflow: false,
         })

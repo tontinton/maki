@@ -277,6 +277,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            carry_turns: 0,
             reason: CompactReason::Manual,
             workflow: self.state.workflow,
         }));

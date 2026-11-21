@@ -208,6 +208,55 @@ pub(super) struct Compacted {
     pub carried: usize,
 }
 
+/// Whether the message opens a user turn: the user speaking, not the host
+/// passing something in and not a tool result answering the last call. Only a
+/// turn start is a safe place to cut the transcript.
+fn opens_turn(message: &Message) -> bool {
+    message.role == Role::User
+        && !message.is_from_host()
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// How many trailing messages the last `carry_turns` complete user turns
+/// cover, so a compaction can keep them verbatim.
+///
+/// A turn starts at a user message and runs through every assistant and tool
+/// message that answers it, so a cut on a turn start never leaves a tool call
+/// without its result. `answered` is where input no turn has answered yet
+/// begins: a turn that does not end before it does not count. Host messages
+/// like context updates open no turn.
+///
+/// One turn always stays behind for the summary, since a compaction that
+/// summarizes nothing would pay for a summary the model made up. Asking for
+/// more turns than the history holds therefore carries all but the oldest.
+pub(super) fn carried_len(history: &[Message], carry_turns: usize, answered: usize) -> usize {
+    if carry_turns == 0 {
+        return 0;
+    }
+    let answered = answered.min(history.len());
+    let complete = history[..answered]
+        .iter()
+        .filter(|message| opens_turn(message))
+        .count();
+    let mut remaining = carry_turns.min(complete.saturating_sub(1));
+    if remaining == 0 {
+        return 0;
+    }
+    for (index, message) in history[..answered].iter().enumerate().rev() {
+        if !opens_turn(message) {
+            continue;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return history.len() - index;
+        }
+    }
+    0
+}
+
 /// Replaces `history` with a summary of itself, retrying on overflow by
 /// pruning what it sends, and once on an empty summary.
 ///
@@ -418,6 +467,9 @@ fn finish_compact(
 ///
 /// An empty history ends at once: summarizing nothing would pay for a summary
 /// the model made up.
+///
+/// `carry_turns` keeps that many of the newest complete user turns out of the
+/// summary, verbatim, see [`carried_len`]. Zero summarizes all of it.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
@@ -431,6 +483,7 @@ pub async fn compact(
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
+    carry_turns: usize,
     retry: RetryPolicy,
     reason: CompactReason,
     ledger: &RunLedger,
@@ -483,7 +536,7 @@ pub async fn compact(
         hooks,
         config,
         steer.instructions.as_deref(),
-        0,
+        carried_len(history.as_slice(), carry_turns, history.len()),
         retry,
         ledger,
     )
@@ -818,6 +871,60 @@ mod tests {
         }
     }
 
+    /// One answered turn: the prompt, a tool call, its result, then the
+    /// answer. The result is a user message too, and must not read as a turn
+    /// start.
+    fn turn(prompt: &str) -> Vec<Message> {
+        let call = format!("{prompt}-call");
+        vec![
+            Message::user(prompt.to_owned()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(call.clone(), "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result(call, "ok", false)],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("{prompt} answered"),
+                }],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn turns(prompts: &[&str]) -> Vec<Message> {
+        prompts.iter().flat_map(|prompt| turn(prompt)).collect()
+    }
+
+    const TURN_PROMPTS: [&str; 5] = ["one", "two", "three", "four", "five"];
+
+    /// Every turn here is four messages, tool result included.
+    #[test_case(0, 0 ; "default_carries_nothing")]
+    #[test_case(4, 16 ; "four_turns_with_tool_rounds")]
+    #[test_case(9, 16 ; "asking_for_more_than_there_is_keeps_one_for_the_summary")]
+    fn carried_len_counts_complete_turns(carry_turns: usize, expected: usize) {
+        let history = turns(&TURN_PROMPTS);
+        assert_eq!(carried_len(&history, carry_turns, history.len()), expected);
+    }
+
+    /// Input no turn has answered yet is not a turn of its own, and a cut on a
+    /// turn start always takes it along.
+    #[test]
+    fn carried_len_rides_along_with_the_unanswered_tail() {
+        let mut history = turns(&TURN_PROMPTS[..2]);
+        let answered = history.len();
+        history.push(Message::user("still pending".into()));
+
+        assert_eq!(carried_len(&history, 1, answered), 5);
+        assert_eq!(carried_len(&history, 2, answered), 5);
+    }
+
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
     const POST: &str = "Re-read plan.md and agent.md";
@@ -937,6 +1044,7 @@ mod tests {
         gauge: &mut ContextGauge,
         config: &AgentConfig,
         instructions: Option<&str>,
+        carry_turns: usize,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
         let (raw_tx, _rx) = unbounded_channel();
@@ -954,6 +1062,7 @@ mod tests {
             &test_hooks(&registry, None, &model, cancel),
             config,
             instructions,
+            carry_turns,
             RetryPolicy::default(),
             CompactReason::Manual,
             &RunLedger::default(),
@@ -1007,6 +1116,7 @@ mod tests {
             &mut ContextGauge::default(),
             &AgentConfig::default(),
             None,
+            0,
             &CancelToken::none(),
         )
         .await
@@ -1046,6 +1156,7 @@ mod tests {
             &mut gauge,
             &AgentConfig::default(),
             None,
+            0,
             &CancelToken::none(),
         )
         .await
@@ -1100,6 +1211,7 @@ mod tests {
             &hooks,
             &AgentConfig::default(),
             None,
+            0,
             RetryPolicy::default(),
             CompactReason::Manual,
             &RunLedger::default(),
@@ -1187,6 +1299,7 @@ mod tests {
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
             None,
+            0,
             RetryPolicy::default(),
             CompactReason::Manual,
             &RunLedger::default(),
@@ -1249,6 +1362,7 @@ mod tests {
             &mut ContextGauge::default(),
             &AgentConfig::default(),
             None,
+            0,
             &cancel,
         )
         .await
@@ -1292,6 +1406,7 @@ mod tests {
             &test_hooks(&registry, None, &model, cancel),
             &AgentConfig::default(),
             None,
+            0,
             RetryPolicy::default(),
             CompactReason::Manual,
             ledger,
@@ -1442,6 +1557,7 @@ mod tests {
             &mut ContextGauge::default(),
             &config,
             Some(REQUEST_EXTRA),
+            0,
             &CancelToken::none(),
         )
         .await
@@ -1457,6 +1573,49 @@ mod tests {
             &history.as_slice().last().unwrap().content[0],
             ContentBlock::Text { text } if text == POST
         ));
+    }
+
+    /// What a plugin asked to keep stays byte for byte, tool rounds included;
+    /// only the turns before them go into the summary.
+    #[tokio::test]
+    async fn compact_keeps_the_requested_turns_verbatim() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(turns(&TURN_PROMPTS));
+
+        summarize(
+            &provider,
+            &mut history,
+            &mut ContextGauge::default(),
+            &AgentConfig::default(),
+            None,
+            4,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests.lock().unwrap();
+        let summarized: Vec<_> = requests[0]
+            .iter()
+            .filter_map(|message| message.user_text())
+            .collect();
+        assert!(
+            summarized.contains(&"one"),
+            "the oldest turn is what a summary still reads: {summarized:?}"
+        );
+        for carried in &TURN_PROMPTS[1..] {
+            assert!(
+                !summarized.contains(carried),
+                "a carried turn must not reach the summarizer: {carried}"
+            );
+        }
+        drop(requests);
+
+        assert_eq!(
+            history.as_slice()[2..],
+            turns(&TURN_PROMPTS[1..]),
+            "the kept turns must come back exactly as they were"
+        );
     }
 
     const LAYER_EXTRA: &str = "Name every file you touched";
@@ -1495,6 +1654,7 @@ mod tests {
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
             instructions,
+            0,
             RetryPolicy::default(),
             reason,
             &RunLedger::default(),

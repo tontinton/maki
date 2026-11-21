@@ -806,6 +806,7 @@ async fn compact_session(
         &hooks,
         config,
         guidance,
+        0,
         timeouts.retry,
         CompactReason::Manual,
         &ledger,

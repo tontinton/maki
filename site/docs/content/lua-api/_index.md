@@ -5875,6 +5875,11 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
     the `data.id` that `TurnComplete` reports.
   - `instructions` (`string?`) guidance for this one summary, like
     `/compact <text>`.
+  - `carry_turns` (`integer?`) keep the newest `carry_turns` complete user
+    turns verbatim instead of summarizing them. A turn runs from the
+    user message through every tool call it answers, so the kept part
+    never starts mid-turn, and at least one turn is always summarized.
+    Defaults to 0, which summarizes all of it like `/compact`.
 
 **Returns:** (`boolean|nil`, `string|nil`) true once queued, or nil and an error.
 
@@ -5884,6 +5889,7 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 maki.session.request_compact({
   session = ctx:session_id(),
   instructions = "keep the failing test names",
+  carry_turns = 4,
 })
 ```
 

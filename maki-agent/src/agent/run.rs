@@ -1179,7 +1179,11 @@ impl<'h> Agent<'h> {
         let pending = self.mailbox.as_ref().and_then(|m| m.take_compact());
         if let Some(request) = pending
             && self
-                .run_compaction(CompactReason::Requested, request.instructions.as_deref())
+                .run_compaction(
+                    CompactReason::Requested,
+                    request.instructions.as_deref(),
+                    request.carry_turns,
+                )
                 .await?
         {
             return Ok(());
@@ -1201,6 +1205,7 @@ impl<'h> Agent<'h> {
         &mut self,
         reason: CompactReason,
         instructions: Option<&str>,
+        carry_turns: usize,
     ) -> Result<bool, AgentError> {
         let CompactionPlan::Proceed(steer) =
             compaction::steer_compaction(&self.hooks(), &self.config, reason, instructions, false)
@@ -1208,7 +1213,7 @@ impl<'h> Agent<'h> {
         else {
             return Ok(false);
         };
-        self.do_compact(steer).await?;
+        self.do_compact(steer, carry_turns).await?;
         Ok(true)
     }
 
@@ -1241,17 +1246,28 @@ impl<'h> Agent<'h> {
                     context_size: self.gauge.size(),
                     context_window: self.model.context_window,
                 })?;
-                self.do_compact(steer).await
+                self.do_compact(steer, 0).await
             }
         }
     }
 
-    async fn do_compact(&mut self, steer: CompactSteer) -> Result<(), AgentError> {
+    async fn do_compact(
+        &mut self,
+        steer: CompactSteer,
+        carry_turns: usize,
+    ) -> Result<(), AgentError> {
         // Compaction replaces the whole transcript, so input no turn has
         // answered yet would be summarized away before the model ever saw it,
         // images and all. `carry_from` is where that input starts: the run's
-        // own prompt, plus anything queued in since the last turn ended.
-        let carry_len = self.history.len().saturating_sub(self.carry_from);
+        // own prompt, plus anything queued in since the last turn ended. A
+        // plugin asking to keep `carry_turns` complete turns carries those
+        // too, always from the start of a turn.
+        let unanswered = self.history.len().saturating_sub(self.carry_from);
+        let carry_len = unanswered.max(compaction::carried_len(
+            self.history.as_slice(),
+            carry_turns,
+            self.carry_from,
+        ));
         let context_size_before = self.gauge.size();
         // Asked for before the transcript goes, while a cancel can still end
         // the run with nothing changed. Past the summary the frame is gone,
@@ -1375,7 +1391,11 @@ impl<'h> Agent<'h> {
             ExtractedCommand::Compact {
                 instructions,
                 reason,
-            } => self.run_compaction(reason, instructions.as_deref()).await,
+                carry_turns,
+            } => {
+                self.run_compaction(reason, instructions.as_deref(), carry_turns)
+                    .await
+            }
         }
     }
 }
@@ -1495,6 +1515,7 @@ mod tests {
     use super::compaction::FIELD_CONTINUE;
     use super::testing::{agent_params, fixed_context, sync_builder};
     use super::*;
+    use crate::CompactRequest;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::history::USER_CANCEL_MARKER;
@@ -2963,6 +2984,7 @@ mod tests {
         let compact = vec![ExtractedCommand::Compact {
             instructions: None,
             reason: CompactReason::Manual,
+            carry_turns: 0,
         }];
         agent.interrupt_source = Some(MockInterruptSource::new(compact));
     }
@@ -3701,6 +3723,7 @@ mod tests {
         vec![ExtractedCommand::Compact {
             instructions: None,
             reason: CompactReason::Manual,
+            carry_turns: 0,
         }],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
@@ -3736,7 +3759,7 @@ mod tests {
     async fn mailbox_compact_request_compacts_before_the_first_request() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::request_compact(id, None).unwrap();
+        SessionMailbox::request_compact(id, CompactRequest::default()).unwrap();
         let mut history = History::new(vec![Message::user("go".into())]);
         let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![
@@ -3758,6 +3781,82 @@ mod tests {
                 AgentEvent::CompactionDone { .. }
             ]
         ));
+    }
+
+    const TURNS: [&str; 3] = ["one", "two", "three"];
+
+    /// A plugin's `carry_turns` keeps the newest turns out of the summary,
+    /// with the input this run has not answered yet riding behind them.
+    #[tokio::test]
+    async fn a_requested_compaction_carries_the_turns_it_was_asked_to() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(
+            id,
+            CompactRequest {
+                carry_turns: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut history = History::new(
+            TURNS
+                .iter()
+                .map(|turn| Message::user((*turn).into()))
+                .collect(),
+        );
+        let provider = MockProvider::new(vec![
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+        agent.mailbox = Some(mailbox.clone());
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert!(mailbox.take_compact().is_none());
+        assert!(matches!(
+            compaction_events(&drain_events(&mut event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
+        let prompt = default_input().message;
+        {
+            let requests = requests.lock().unwrap();
+            let summarized: Vec<_> = requests[0]
+                .messages
+                .iter()
+                .filter_map(|message| serde_json::from_value::<Message>(message.clone()).ok())
+                .filter(|message| message.role == Role::User)
+                .filter_map(|message| message.user_text().map(str::to_owned))
+                .collect();
+            assert_eq!(
+                summarized.first().map(String::as_str),
+                Some(TURNS[0]),
+                "only the oldest turn may reach the summarizer: {summarized:?}"
+            );
+            for carried in [TURNS[1], TURNS[2], prompt.as_str()] {
+                assert!(
+                    !summarized.iter().any(|text| text == carried),
+                    "a carried message must not reach the summarizer: {carried}"
+                );
+            }
+        }
+
+        let kept: Vec<_> = history.as_slice()[2..]
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .filter_map(|message| message.user_text())
+            .collect();
+        assert_eq!(
+            kept,
+            [TURNS[1], TURNS[2], prompt.as_str()],
+            "the last two turns and the unanswered prompt stay in the transcript"
+        );
     }
 
     /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
@@ -3871,7 +3970,7 @@ mod tests {
         agent.opts.fast = true;
         agent.carry_from = agent.history.len();
 
-        let _ = agent.do_compact(CompactSteer::default()).await;
+        let _ = agent.do_compact(CompactSteer::default(), 0).await;
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), attempts as usize);
@@ -4861,7 +4960,7 @@ mod tests {
     /// The mock holds one response, so a run that went on anyway would panic
     /// on its second request.
     #[test_case(ExtractedCommand::Interrupt(vec![AgentInput { message: BLOCKED.into(), ..default_input() }]) ; "dropped_interrupt")]
-    #[test_case(ExtractedCommand::Compact { instructions: None, reason: CompactReason::Manual } ; "skipped_compact")]
+    #[test_case(ExtractedCommand::Compact { instructions: None, reason: CompactReason::Manual, carry_turns: 0 } ; "skipped_compact")]
     #[tokio::test]
     async fn queued_command_that_lands_nothing_ends_the_run(cmd: ExtractedCommand) {
         let mut history = History::new(Vec::new());
@@ -5711,10 +5810,13 @@ mod tests {
         agent.carry_from = agent.history.len();
 
         agent
-            .do_compact(CompactSteer {
-                continue_text: Some(KEEP_GOING.into()),
-                ..Default::default()
-            })
+            .do_compact(
+                CompactSteer {
+                    continue_text: Some(KEEP_GOING.into()),
+                    ..Default::default()
+                },
+                0,
+            )
             .await
             .unwrap();
 
@@ -5776,7 +5878,7 @@ mod tests {
         agent.carry_from = 1;
 
         for _ in 0..compactions {
-            agent.do_compact(CompactSteer::default()).await.unwrap();
+            agent.do_compact(CompactSteer::default(), 0).await.unwrap();
         }
 
         let messages = agent.history.as_slice();

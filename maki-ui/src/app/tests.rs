@@ -13518,8 +13518,14 @@ fn a_requested_compaction_wins_its_single_taker(status: Status, claimed: bool) {
     let mut app = test_app();
     app.status = status;
     let mailbox = hold_mailbox(&mut app);
-    SessionMailbox::request_compact(app.state.session.id, Some(COMPACT_INSTRUCTIONS.into()))
-        .unwrap();
+    SessionMailbox::request_compact(
+        app.state.session.id,
+        maki_agent::CompactRequest {
+            instructions: Some(COMPACT_INSTRUCTIONS.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let claim = app.take_requested_compact();
 
