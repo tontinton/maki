@@ -994,7 +994,8 @@ lua_table! {
     ///    prompts and modals, then the focused split, then Maki's pickers.
     ///    They take every key, except the plan form and the `/` command list,
     ///    which pass on the keys they do not use. The focused window runs its
-    ///    buffer's bindings, then its `win:recv`.
+    ///    buffer's bindings, then its `win:recv`. A hidden focused window, or
+    ///    one sized to nothing, takes no keys here.
     /// 3. Windows on screen, front first: each one's buffer bindings, then
     ///    the keys it claimed with the `keys` option of `maki.ui.open_win`.
     /// 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a

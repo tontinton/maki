@@ -7735,21 +7735,29 @@ fn permission_answers_before_the_plan_form_once_the_float_closes() {
     assert_eq!(app.state.mode, Mode::Plan);
 }
 
-/// A focused `below` split, like the question form, sits beside the prompt
-/// rather than over it, so the prompt still answers `y`.
+/// A focused side split sits beside the prompt rather than over it, and a
+/// `below` split, like the question form, is taken out of the layout while the
+/// prompt is up (see `permission_prompt_takes_bottom_precedence_over_below_split`),
+/// so either way the prompt still answers `y`.
 #[test]
 fn a_focused_split_does_not_take_keys_from_the_permission_prompt() {
-    let mut app = test_app();
-    let mut answer_rx = answer_channel(&mut app);
-    open_split_window(&mut app, Split::Below);
-    open_permission_prompt(&mut app);
+    for split in [Split::Below, Split::Left] {
+        let mut app = test_app();
+        let mut answer_rx = answer_channel(&mut app);
+        open_split_window(&mut app, split);
+        open_permission_prompt(&mut app);
 
-    assert!(app.holds_keyboard(KeyboardOwner::FocusedSplit));
-    assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission);
-    press(&mut app, KeyCode::Char('y'));
-    assert!(!app.permission_prompt.is_open());
-    assert!(answer_rx.try_recv().is_ok());
-    assert_eq!(app.keyboard_owner(), KeyboardOwner::FocusedSplit);
+        assert!(app.holds_keyboard(KeyboardOwner::FocusedSplit), "{split:?}");
+        assert_eq!(app.keyboard_owner(), KeyboardOwner::Permission, "{split:?}");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!app.permission_prompt.is_open(), "{split:?}");
+        assert!(answer_rx.try_recv().is_ok(), "{split:?}");
+        assert_eq!(
+            app.keyboard_owner(),
+            KeyboardOwner::FocusedSplit,
+            "{split:?}"
+        );
+    }
 }
 
 /// `win:hide()` keeps the focus, but a float nobody can see must not eat the
