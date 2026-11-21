@@ -85,12 +85,13 @@ struct FloatWindow {
     /// Set by [`render_window`] while the frame paints this window into a
     /// rect with cells in it, and moved to `on_screen` when the frame ends.
     painting: bool,
-    /// Whether the last frame really put this window on screen. `visible` is
-    /// the plugin's own switch and says nothing about geometry: a
-    /// plugin-supplied width or height of zero paints nothing, and a claim on
-    /// a window nobody can see is a key taken from the user with no footer to
-    /// tell them where it went.
-    on_screen: bool,
+    /// Whether the last frame really put this window on screen, `None` until
+    /// a frame has ended since it opened or was last shown. `visible` is the
+    /// plugin's own switch and says nothing about geometry: a plugin-supplied
+    /// width or height of zero paints nothing, and a claim on a window nobody
+    /// can see is a key taken from the user with no footer to tell them where
+    /// it went.
+    on_screen: Option<bool>,
     event_tx: UnboundedSender<WinEvent>,
     cmd_rx: UnboundedReceiver<WinCommand>,
 }
@@ -285,7 +286,7 @@ impl FloatManager {
             visible,
             opened_focused: focus,
             painting: false,
-            on_screen: false,
+            on_screen: None,
             event_tx,
             cmd_rx,
         };
@@ -346,6 +347,9 @@ impl FloatManager {
                         win.set_cursor(row);
                     }
                     Ok(WinCommand::SetVisible(v)) => {
+                        if v && !win.visible {
+                            win.on_screen = None;
+                        }
                         win.visible = v;
                     }
                     Ok(WinCommand::Close) | Err(TryRecvError::Disconnected) => {
@@ -404,6 +408,15 @@ impl FloatManager {
         self.windows.iter().find(|w| w.id == fid)
     }
 
+    /// Whether the focused window is visible and the last frame painted it,
+    /// or no frame has had the chance to yet. `win:hide()` and
+    /// `visible = false` keep the focus, so focus alone would let a window
+    /// nobody can see eat the keys meant for a prompt on screen.
+    pub fn focused_on_screen(&self) -> bool {
+        self.focused()
+            .is_some_and(|w| w.visible && w.on_screen != Some(false))
+    }
+
     pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {
         self.focused().map(|w| Arc::clone(w.buf.buf()))
     }
@@ -423,7 +436,7 @@ impl FloatManager {
         self.windows
             .iter()
             .rev()
-            .filter(|w| w.on_screen)
+            .filter(|w| w.on_screen == Some(true))
             .map(|w| (w.id, Arc::clone(w.buf.buf())))
             .collect()
     }
@@ -512,7 +525,7 @@ impl FloatManager {
         }
 
         for win in &mut self.windows {
-            win.on_screen = std::mem::take(&mut win.painting);
+            win.on_screen = Some(std::mem::take(&mut win.painting));
         }
         self.focused_caret = std::mem::take(&mut self.painting_caret);
 
@@ -2066,7 +2079,7 @@ mod tests {
     fn hiding_a_window_takes_it_off_the_screen_and_out_of_the_claim() {
         let mut mgr = FloatManager::new();
         let (mut events, cmd_tx) = open_claiming(&mut mgr, &["<Esc>"], 50);
-        assert!(mgr.windows[0].on_screen, "{EXPECT_PAINTED}");
+        assert_eq!(mgr.windows[0].on_screen, Some(true), "{EXPECT_PAINTED}");
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
@@ -2079,7 +2092,11 @@ mod tests {
             );
         });
 
-        assert!(!mgr.windows[0].on_screen, "{EXPECT_HIDDEN_UNPAINTED}");
+        assert_eq!(
+            mgr.windows[0].on_screen,
+            Some(false),
+            "{EXPECT_HIDDEN_UNPAINTED}"
+        );
         assert!(!claimed(&mut mgr, press("<Esc>")));
         assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
@@ -2669,7 +2686,7 @@ mod tests {
             visible: true,
             opened_focused: true,
             painting: false,
-            on_screen: false,
+            on_screen: None,
             event_tx,
             cmd_rx,
         }
@@ -3105,7 +3122,7 @@ mod tests {
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
 
         assert_eq!(draw_one_frame(&mut mgr, area), 0, "{EXPECT_NO_ROOM}");
-        assert!(!mgr.windows[0].on_screen, "{EXPECT_NO_PAINT}");
+        assert_eq!(mgr.windows[0].on_screen, Some(false), "{EXPECT_NO_PAINT}");
         assert!(!claimed(&mut mgr, press("<Tab>")), "{EXPECT_NO_CLAIM}");
         assert!(!took_a_key(&mut events), "{EXPECT_NO_CLAIM}");
 
@@ -3117,7 +3134,11 @@ mod tests {
             split != Split::None,
             "showing it asks for room again, except a float which never does"
         );
-        assert!(mgr.windows[0].on_screen, "showing it paints it again");
+        assert_eq!(
+            mgr.windows[0].on_screen,
+            Some(true),
+            "showing it paints it again"
+        );
         assert!(claimed(&mut mgr, press("<Tab>")), "and its claim is back");
         assert!(took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
     }
