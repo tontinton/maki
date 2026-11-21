@@ -14,7 +14,7 @@ use maki_storage::sessions::StoredMode;
 use serde::Serialize;
 
 use crate::EventHandle;
-use crate::api::session::SessionSnapshotFn;
+use crate::api::session::{SessionSnapshotFn, not_live};
 
 pub const MODE_BUILD: &str = "build";
 pub const MODE_PLAN: &str = "plan";
@@ -234,7 +234,7 @@ impl HeadlessSnapshot {
                 && want != meta.id
                 && (own.is_none() || want.parse::<MakiId>().ok() != own)
             {
-                return Err(format!("session {want} not live"));
+                return Err(not_live(want));
             }
             let mode = mode();
             let totals = lock(&totals);
@@ -274,7 +274,7 @@ impl HeadlessSnapshot {
         let totals = Arc::clone(&self.0);
         Arc::new(move || {
             let id = session.id();
-            let header = live_header(id).ok_or_else(|| format!("session {session} not live"))?;
+            let header = live_header(id).ok_or_else(|| not_live(&session))?;
             let mut snapshot = SessionSnapshot::live_headless(id, Arc::unwrap_or_clone(header));
             let totals = lock(&totals);
             snapshot.id = session.to_string();
@@ -304,12 +304,12 @@ impl HeadlessSessions {
         let providers = Arc::clone(&self.0);
         Box::new(move |id| {
             let want = id.ok_or_else(|| NO_CALLING_SESSION_ERR.to_owned())?;
-            let not_live = || format!("session {want} not live");
-            let session = want.parse::<MakiId>().map_err(|_| not_live())?;
+            let unknown = || not_live(want);
+            let session = want.parse::<MakiId>().map_err(|_| unknown())?;
             let provider = lock(&providers)
                 .get(&session)
                 .cloned()
-                .ok_or_else(not_live)?;
+                .ok_or_else(unknown)?;
             provider()
         })
     }
@@ -463,11 +463,16 @@ mod tests {
         let register =
             || sessions.register(session.clone(), &HeadlessSnapshot::default(), || MODE_BUILD);
         let old = register();
-        let _new = register();
+        let new = register();
 
         drop(old);
 
         assert!(read(Some(session.as_str())).is_ok());
+        drop(new);
+        assert_eq!(
+            read(Some(session.as_str())).unwrap_err(),
+            not_live(&session)
+        );
     }
 
     /// The window and cost are the pump's tally, the rest what the session
@@ -526,7 +531,8 @@ mod tests {
         let read = HeadlessSnapshot::default().provider(meta(hex), || MODE_BUILD);
 
         assert!(read(Some(&id.to_string())).is_ok());
-        assert!(read(Some(&MakiId::generate().to_string())).is_err());
+        let stranger = MakiId::generate().to_string();
+        assert_eq!(read(Some(&stranger)).unwrap_err(), not_live(&stranger));
     }
 
     #[test]

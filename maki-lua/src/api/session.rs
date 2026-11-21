@@ -7,6 +7,7 @@
 //! block's `source`, which is a `maki.image.Image` sharing the payload.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
@@ -96,7 +97,7 @@ fn runs_on_enter(message: &Message) -> bool {
         })
 }
 
-pub(crate) fn not_live(session: MakiId) -> String {
+pub(crate) fn not_live(session: impl Display) -> String {
     format!("{NOT_LIVE_ERR}: {session}")
 }
 
