@@ -104,6 +104,7 @@ fn load_config(
     // A turn cap would cut an interactive session short, so
     // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
     config.agent.max_turns = cli.max_turns;
+    config.agent.max_budget_usd = cli.max_budget_usd;
     config.validate()?;
     Ok(config)
 }
