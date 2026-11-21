@@ -273,21 +273,18 @@ They follow the tool slot contract. `ctx` carries `session_id`, `task_id` (set
 inside a subagent), `model`, `context_size`, `context_window`, and
 `deadline_ms`.
 
-A layer on any of them costs `agent`, `session_read` and `session_write`. Each
-slot can hand it text the user or the model wrote, which `session_read` guards,
-and steering what happens next costs what sending a prompt costs. The chain
-gets 30 seconds, then the loop carries on without it.
+A layer on any of them needs `agent`, `session_read` and `session_write`,
+because every slot can hand it text the user or the model wrote, and steering
+the agent costs what sending a prompt does. A plugin without all three has its
+layer skipped. The chain gets 30 seconds, then the loop carries on without it.
 
-Every layer shares the same `defer`, `continue`, and `instructions` strings, so
+Layers share the same `defer`, `continue`, and `instructions` strings, so
 assigning one erases what another layer wrote. Append instead, and allow for
 `nil`:
 
 ```lua
 value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
 ```
-
-One defer is granted between two compactions, so layers that want to add a
-nudge share the one turn instead of each getting their own.
 
 ### agent.user_message
 
@@ -300,10 +297,6 @@ the transcript marks it as rewritten. Return `nil, reason` to drop it: the model
 never sees it, the user sees `reason`, and `TurnEnd` reports `"dropped"`. A
 rewrite with no text and no images also drops it.
 
-The session title comes from what the user typed if the new text still holds
-it whole, as when a layer adds context around it. Otherwise it comes from the
-new text, so a redacted secret stays out of the title.
-
 ```lua
 maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
   if msg.text:find("AKIA%u%u%u%u") then
@@ -313,32 +306,33 @@ maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
 end)
 ```
 
-A model's output arrives at `TurnComplete` as `data.message`, once per
-response. A notification cannot change what was said, so redirect a message
-with `agent.user_message` or a tool result with a `tool.*` layer instead.
+The session title uses what the user typed if the rewrite still contains it
+whole, as when a layer wraps context around it. Otherwise the title comes from
+the rewrite, so a redacted secret stays out of it.
+
+No slot rewrites the model's own replies. To watch them, listen to
+[`TurnComplete`](/docs/lua-api/#maki-api-create_autocmd). It fires once per
+model response, before that response's tool calls run, and `data.message`
+needs `session_read`:
 
 ```lua
 maki.api.create_autocmd("TurnComplete", {
   callback = function(ev)
     local msg = ev.data.message
     if not msg or ev.data.id then return end
-    for i, block in ipairs(msg.content) do
+    for _, block in ipairs(msg.content) do
       local text = block.text or block.thinking
-      if text and text:find("AKIA[A-Z][A-Z][A-Z][A-Z]") then
-        maki.log.warn(("block %d held a secret"):format(i))
+      if text and text:find("AKIA%u%u%u%u") then
+        maki.log.warn("a model reply holds an AWS key")
       end
     end
   end,
 })
 ```
 
-`TurnComplete` fires once per model response, before that response's tool
-calls run. `data.message` is the same table a `maki.session.messages()` entry
-is, so a null arrives as `maki.NIL` and an image block carries an image handle.
-It includes the `tool_use` blocks. A response that calls tools starts another
-turn. It also fires for a compaction's summary request, where `data.message`
-holds the summary, and nothing in the payload says so. `data.id` marks a
-subagent's response.
+`data.id` is set on a subagent's response, so this handler watches only the
+main session. The message has the shape of a
+[`maki.session.messages`](/docs/lua-api/#maki-session-messages) entry.
 
 ### agent.stop
 
@@ -364,24 +358,28 @@ A run continues at most 3 times in a row, so a layer that always answers
 
 `reason` is `"auto"` (the context crossed its threshold), `"overflow"` (the
 provider rejected the prompt as too long), `"manual"` (`/compact`), or
-`"requested"` (a plugin called `maki.session.request_compact`). `usable` is
-the token budget `context_size` is measured against. `request_instructions`
-is what the user typed after `/compact`, or the plugin's `instructions`.
+`"requested"` (a plugin called
+[`maki.session.request_compact`](/docs/lua-api/#maki-session-request_compact)).
+`usable` is the token budget `context_size` is measured against.
+`request_instructions` is what the user typed after `/compact`, or the
+`instructions` the plugin passed.
 
 Return a table with any of:
 
 - `skip = true`: skip this compaction, same as `nil, reason`. An overflow
   cannot be skipped, because the run cannot go on without compacting.
-- `defer = text`: skip this automatic compaction once. `text` becomes the
-  model's next message, so the model gets one turn to save state with tools.
-  A defer buys one turn, so the next automatic compaction goes ahead even
-  when the save turn ended the run. The host refuses a defer when the window
-  has no room for the save turn. It works in subagent runs too. It does
-  nothing for `"manual"`, `"overflow"` and `"requested"`, and it wins over
-  `skip`.
+- `defer = text`: put off an automatic compaction by one turn. `text` becomes
+  the model's next message, so the model can save its state with tools before
+  the summary.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
 - `continue`: text appended to the message the agent resumes with.
+
+A granted `defer` wins over `skip`. Maki grants one defer between two
+compactions, so the next automatic compaction cannot be deferred again, even
+when the save turn ended the run. Maki ignores `defer` for the other three
+reasons, and when the window has no room left for the save turn. Subagents
+honor it too.
 
 ### agent.compact.prepare
 

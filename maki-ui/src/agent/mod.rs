@@ -1,5 +1,5 @@
 mod agent_loop;
-mod model_slots;
+pub(crate) mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;
 

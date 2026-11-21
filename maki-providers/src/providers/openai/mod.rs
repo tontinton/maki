@@ -24,7 +24,7 @@ const AUTH_NOTE: &str = "(also supports OAuth via `maki auth login openai`)";
 
 const OAUTH_NOTE: &str = r#"`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
 
-With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. A model the list has not picked up yet still works when named with `--model`, since every request on this login goes to the Codex backend."#;
+With ChatGPT OAuth the model list comes from the Codex backend's `/models` endpoint. A model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend reports. When that request fails, the picker falls back to the table above. A model missing from the list still works if you type its id into `/model` or pass it to `--model`."#;
 
 /// Routing to the native OpenAI provider would take its Codex responses-API
 /// path for `gpt-*-codex` models and bypass the gateway, so Aperture has no

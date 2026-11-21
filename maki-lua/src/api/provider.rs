@@ -975,8 +975,8 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
 /// Read the credentials this plugin stored for one of its providers. Returns
 /// nil when nothing was stored yet, for example before the first login.
 ///
-/// Reading the store yields, so this cannot run in a callback that must not
-/// yield, like a `table.sort` comparator or a metamethod.
+/// Reading the store yields, so this fails in a callback that cannot yield,
+/// like a `table.sort` comparator or a metamethod.
 ///
 /// @param slug string A provider slug this plugin registered.
 /// @return (table?, string?) The stored credentials, or nil plus an error.

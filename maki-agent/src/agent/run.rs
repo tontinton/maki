@@ -13,7 +13,8 @@ use tracing::{debug, error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
+    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
+    forgive_refused_images, model_registry, refuse_sent_images,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
@@ -74,6 +75,7 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
+const IMAGES_WITHHELD: &str = "The server refused the request, retrying without its images:";
 
 fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
@@ -342,11 +344,14 @@ impl<'h> Agent<'h> {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole or a run already cancelled sends nothing,
+            // A burst dropped whole or a run cancelled by now sends nothing,
             // so it must not rebuild the frame either. The next run sees the
-            // same change.
-            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
-                self.refresh_frame().await?;
+            // same change. The input still lands.
+            if kept.is_some() && prompt.is_none() {
+                match self.refresh_frame().await {
+                    Err(AgentError::Cancelled) => {}
+                    refreshed => refreshed?,
+                }
             }
             let kept = kept.map(|text| {
                 self.history.offer_title_source(&message, &text);
@@ -556,7 +561,12 @@ impl<'h> Agent<'h> {
     /// host prompt text can't be told in a message, so they start a new frame,
     /// and the user hears that the cache is gone.
     async fn refresh_frame(&mut self) -> Result<(), AgentError> {
-        let candidate = (self.context)(&self.model, self.workflow).await;
+        let build = (self.context)(&self.model, self.workflow);
+        let candidate = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         self.prompt_facts.clone_from(&candidate.facts);
         if fit_frame(self.history, candidate, self.mcp.as_ref(), &self.model) == FrameFit::Rebuilt {
             info!(session = ?self.session_id, model = %self.model.id, "frame fingerprint changed, rebuilt the frame");
@@ -606,7 +616,10 @@ impl<'h> Agent<'h> {
         {
             return;
         }
-        let candidate = (self.context)(&current.model, self.workflow).await;
+        let build = (self.context)(&current.model, self.workflow);
+        let Ok(candidate) = self.cancel.race(build).await else {
+            return;
+        };
         let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
         if self
             .history
@@ -709,6 +722,7 @@ impl<'h> Agent<'h> {
             Ok(r) => {
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
+                accept_sent_images(&self.model, self.history.as_slice());
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -733,6 +747,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_thinking_unbound() => {
                 return self.recover_unbound_thinking(e);
+            }
+            Err(StreamError::Refused(e)) => {
+                return self.recover_refused_body(e);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -983,6 +1000,30 @@ impl<'h> Agent<'h> {
         Ok(TurnOutcome::Continue)
     }
 
+    /// A server that refuses a body refuses it again on every later turn, and
+    /// the session is stuck. Each server explains the cause in its own words,
+    /// but images are the usual reason (a model that claims vision it lacks,
+    /// a format it cannot read, a size limit), and they are the one part of a
+    /// request we can drop without breaking it. So we blame images this model
+    /// never took, newest first, and retry without them. Only the wire loses
+    /// them, history keeps the pixels. Each round blames at least one more
+    /// image, so this ends. Once a retry is refused with nothing left to
+    /// blame, our guess was wrong, so we take the blame back and show the
+    /// real error.
+    fn recover_refused_body(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        let withheld = refuse_sent_images(&self.model, self.history.as_slice());
+        if withheld == 0 {
+            let restored = forgive_refused_images(&self.model, self.history.as_slice());
+            error!(error = %err, model = %self.model.id, self.num_turns, restored, "stream_message failed");
+            return Err(err);
+        }
+        warn!(session = ?self.session_id, model = %self.model.id, withheld, error = %err, "server refused a request with images, retrying without them");
+        self.event_tx.send(AgentEvent::Notice {
+            text: format!("{IMAGES_WITHHELD} {}", err.user_message()),
+        })?;
+        Ok(TurnOutcome::Continue)
+    }
+
     async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
         if self.reauth_attempts >= MAX_REAUTH_ATTEMPTS {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
@@ -1212,6 +1253,15 @@ impl<'h> Agent<'h> {
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
         let context_size_before = self.gauge.size();
+        // Asked for before the transcript goes, while a cancel can still end
+        // the run with nothing changed. Past the summary the frame is gone,
+        // and a run stopping there would leave the gauge at the old size.
+        let build = (self.context)(&self.model, self.workflow);
+        let next = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -1252,7 +1302,8 @@ impl<'h> Agent<'h> {
         self.defer_pins = false;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
-        self.refresh_frame().await?;
+        self.prompt_facts.clone_from(&next.facts);
+        fit_frame(self.history, next, self.mcp.as_ref(), &self.model);
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
         if let Some(text) = &steer.continue_text {
@@ -1419,6 +1470,7 @@ pub(crate) mod testing {
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
+    use std::future::pending;
     use std::iter;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1428,8 +1480,9 @@ mod tests {
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::test_support::isolated_home;
     use maki_providers::{
-        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
-        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, ImageMediaType, Message, Model, ModelPricing, ProviderEvent,
+        RequestOptions, Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        adapt_images_for_model,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
@@ -2901,6 +2954,11 @@ mod tests {
             .collect()
     }
 
+    const RUN_START_BUILDS: u32 = 1;
+    const REQUESTS_BEFORE_THE_SUMMARY: usize = 2;
+    const UNPAID_SUMMARY_MSG: &str =
+        "a compaction cancelled before it starts must not send the summary request";
+
     fn with_compact(agent: &mut Agent<'_>) {
         let compact = vec![ExtractedCommand::Compact {
             instructions: None,
@@ -2967,8 +3025,10 @@ mod tests {
         assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
     }
 
+    #[test_case(false ; "before_the_run")]
+    #[test_case(true ; "during_the_build")]
     #[tokio::test]
-    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one(during_build: bool) {
         let rebuilt = |events: &[Envelope]| {
             events.iter().any(|e| {
                 matches!(
@@ -2983,9 +3043,22 @@ mod tests {
         *h.world.tool.lock().unwrap() = "reloaded";
 
         let (trigger, cancel) = CancelToken::new();
-        trigger.cancel();
+        let fire = trigger.handle();
         let (reason, events) = h
-            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .run(default_input(), Vec::new(), |agent| {
+                agent.cancel = cancel;
+                if during_build {
+                    agent.context = Arc::new(move |_, _| {
+                        let fire = fire.clone();
+                        Box::pin(async move {
+                            fire.fire();
+                            pending().await
+                        })
+                    });
+                } else {
+                    fire.fire();
+                }
+            })
             .await;
         assert_eq!(reason, DoneReason::Cancelled);
         assert!(!rebuilt(&events));
@@ -3319,6 +3392,48 @@ mod tests {
             "{STALE_THINKING_MSG}"
         );
         assert!(updates(&h.history).is_empty());
+    }
+
+    /// Once the transcript is summarized its frame is gone, and a run that
+    /// stopped there would keep the old size on the gauge, for the next run to
+    /// compact the summary again. So the cancel has to end it before that.
+    #[tokio::test]
+    async fn a_cancel_during_the_context_build_stops_the_compaction_before_it_starts() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let frame = h.history.frame().cloned();
+
+        let (trigger, cancel) = CancelToken::new();
+        let fire = trigger.handle();
+        let world = h.world.builder();
+        let builds = AtomicU32::new(0);
+        let replies = vec![thought_response(), summary_response()];
+        let (reason, events) = h
+            .run(default_input(), replies, |agent| {
+                with_compact(agent);
+                agent.cancel = cancel;
+                agent.context = Arc::new(move |model, workflow| {
+                    let build = world(model, workflow);
+                    if builds.fetch_add(1, Ordering::Relaxed) < RUN_START_BUILDS {
+                        return build;
+                    }
+                    let fire = fire.clone();
+                    Box::pin(async move {
+                        fire.fire();
+                        pending().await
+                    })
+                });
+            })
+            .await;
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(compaction_events(&events).is_empty());
+        assert_eq!(h.history.frame().cloned(), frame);
+        assert_eq!(
+            h.requests.lock().unwrap().len(),
+            REQUESTS_BEFORE_THE_SUMMARY,
+            "{UNPAID_SUMMARY_MSG}"
+        );
     }
 
     /// The prompt a compaction builds can't say plan mode either. If the
@@ -4065,6 +4180,157 @@ mod tests {
             )),
             "{message}"
         );
+    }
+
+    const IMAGE_REFUSED_MESSAGE: &str = "could not process image";
+    const PARTIAL_REPLY: &str = "Looking at the";
+    const GOOD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const BAD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    /// Refuses with `status` every request that carries the `refused` image,
+    /// or every request at all when `always` is set. With `mid_stream` the
+    /// error comes after a bit of reply, like an error frame in the middle of
+    /// a stream.
+    struct ImageRefusingProvider {
+        status: u16,
+        refused: &'static str,
+        always: bool,
+        mid_stream: bool,
+    }
+
+    impl ImageRefusingProvider {
+        fn refusing(refused: &'static str) -> Self {
+            Self {
+                status: 400,
+                refused,
+                always: false,
+                mid_stream: false,
+            }
+        }
+    }
+
+    impl Provider for ImageRefusingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let refused = self.always || carries_image(messages, self.refused);
+            if refused && self.mid_stream {
+                let _ = events.send(ProviderEvent::TextDelta {
+                    text: PARTIAL_REPLY.into(),
+                });
+            }
+            Box::pin(async move {
+                if refused {
+                    Err(AgentError::api(self.status, IMAGE_REFUSED_MESSAGE))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn carries_image(messages: &[Message], data: &str) -> bool {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Image { source } if *source.data == *data))
+    }
+
+    fn image_input(data: &str) -> AgentInput {
+        AgentInput {
+            images: vec![ImageSource::new(ImageMediaType::Png, data.into())],
+            ..default_input()
+        }
+    }
+
+    #[test_case(400, false, false, true,  true  ; "retries_without_the_image")]
+    #[test_case(400, true,  false, false, true  ; "refused_without_it_gives_it_back")]
+    #[test_case(403, true,  false, false, false ; "forbidden_leaves_it_alone")]
+    #[test_case(400, false, true,  false, false ; "error_mid_reply_leaves_it_alone")]
+    #[tokio::test]
+    async fn refused_body_recovery(
+        status: u16,
+        always: bool,
+        mid_stream: bool,
+        recovers: bool,
+        notices: bool,
+    ) {
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        let provider = ImageRefusingProvider {
+            status,
+            always,
+            mid_stream,
+            ..ImageRefusingProvider::refusing(BAD_PNG)
+        };
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+
+        let recovered = agent.run(image_input(BAD_PNG)).await.is_ok();
+        drop(agent);
+
+        assert_eq!(recovered, recovers);
+        assert!(
+            carries_image(history.as_slice(), BAD_PNG),
+            "history keeps the pixels"
+        );
+        assert_eq!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::Notice { text } if text.starts_with(IMAGES_WITHHELD)
+            )),
+            notices
+        );
+        let next = adapt_images_for_model(&default_model(), history.as_slice()).await;
+        assert_eq!(
+            carries_image(&next, BAD_PNG),
+            !recovers,
+            "only a recovery keeps the image off the wire"
+        );
+    }
+
+    /// The user pastes a screenshot under a model without vision, then
+    /// switches to one that claims vision but cannot read it. Nothing new is
+    /// left to blame, so the older image takes the blame, but never the one
+    /// this model took before.
+    #[tokio::test]
+    async fn an_older_image_is_blamed_when_nothing_new_is_left() {
+        let text_only = Model {
+            supports_vision_override: Some(false),
+            ..default_model()
+        };
+        let switched = Model {
+            id: SWITCHED_MODEL.into(),
+            ..default_model()
+        };
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &switched);
+        for (model, input) in [
+            (&switched, image_input(GOOD_PNG)),
+            (&text_only, image_input(BAD_PNG)),
+            (&switched, default_input()),
+        ] {
+            let (mut agent, _event_rx) = make_agent_with(
+                Arc::new(ImageRefusingProvider::refusing(BAD_PNG)),
+                model.clone(),
+                &mut history,
+            );
+            assert!(agent.run(input).await.is_ok());
+        }
+
+        let next = adapt_images_for_model(&switched, history.as_slice()).await;
+        assert!(carries_image(&next, GOOD_PNG));
+        assert!(!carries_image(&next, BAD_PNG));
     }
 
     const QUEUED_INPUT: &str = "actually, check the other module first";

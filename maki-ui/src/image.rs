@@ -1,5 +1,5 @@
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,6 +9,7 @@ use maki_agent::{ImageMediaType, ImageSource};
 
 pub(crate) const MAX_IMAGE_PIXELS: usize = 8_000_000;
 pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const FILE_TOO_LARGE_MSG: &str = "Image file exceeds 20MB limit";
 
 const IMAGE_EXTENSIONS: &[(&str, ImageMediaType)] = &[
     ("png", ImageMediaType::Png),
@@ -60,9 +61,19 @@ fn unquote_shell_path(s: &str) -> Option<String> {
 }
 
 pub fn load_file_image(path: &Path, media_type: ImageMediaType) -> Result<ImageSource, String> {
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let read_err = |e: io::Error| format!("{}: {e}", path.display());
+    let limit = MAX_IMAGE_BYTES as u64;
+    let file = File::open(path).map_err(read_err)?;
+    let len = file.metadata().map_err(read_err)?.len();
+    if len > limit {
+        return Err(FILE_TOO_LARGE_MSG.into());
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_err)?;
     if bytes.len() > MAX_IMAGE_BYTES {
-        return Err("Image file exceeds 20MB limit".into());
+        return Err(FILE_TOO_LARGE_MSG.into());
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(ImageSource::new(media_type, Arc::from(b64)))
@@ -97,9 +108,14 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, S
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const SMALL_IMAGE_BYTES: u64 = 13;
+    const IMAGE_FILE_NAME: &str = "test.png";
 
     #[test_case("file:///home/user/photo.png",      "/home/user/photo.png",  ImageMediaType::Png  ; "file_uri_png")]
     #[test_case("file:///home/user/photo.jpg",      "/home/user/photo.jpg",  ImageMediaType::Jpeg ; "file_uri_jpg")]
@@ -161,15 +177,12 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn load_file_image_valid() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.png");
-        fs::write(&path, b"fake png data").unwrap();
-        let result = load_file_image(&path, ImageMediaType::Png);
-        assert!(result.is_ok());
-        let source = result.unwrap();
-        assert_eq!(source.media_type, ImageMediaType::Png);
-        assert!(!source.data.is_empty());
+    #[test_case(SMALL_IMAGE_BYTES          => Ok(ImageMediaType::Png)       ; "small_file_loads")]
+    #[test_case(MAX_IMAGE_BYTES as u64 + 1 => Err(FILE_TOO_LARGE_MSG.into()) ; "over_limit_rejected")]
+    fn load_file_image_checks_size(len: u64) -> Result<ImageMediaType, String> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(IMAGE_FILE_NAME);
+        File::create(&path).unwrap().set_len(len).unwrap();
+        load_file_image(&path, ImageMediaType::Png).map(|source| source.media_type)
     }
 }

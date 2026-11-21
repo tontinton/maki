@@ -222,6 +222,7 @@ fn build_app_with_session(
         tab,
         dir,
         Arc::new(ArcSwapOption::empty()),
+        Arc::default(),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
         lua_commands,
@@ -234,11 +235,11 @@ fn build_app_with_session(
         permissions,
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),
-        Arc::new(maki_config::ModelPolicy::default()),
     )
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
+    let _runtime = enter_runtime();
     StorageWriter::new(dir, unbounded_channel().0)
 }
 
@@ -882,6 +883,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 
 #[test]
 fn paste_file_path_triggers_image_load() {
+    let _runtime = enter_runtime();
     let mut app = test_app();
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
     assert!(!app.paste_rx.is_empty());
@@ -890,6 +892,7 @@ fn paste_file_path_triggers_image_load() {
 
 #[test]
 fn paste_loads_every_image_path_in_the_text() {
+    let _runtime = enter_runtime();
     let mut app = test_app();
     app.update(Msg::Paste(
         "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
@@ -9961,7 +9964,7 @@ fn restored_and_switched_thinking_selects_a_declared_picker_row(
 #[test_case("off", ThinkingConfig::Off)]
 #[test_case("low", ThinkingConfig::Effort(Effort::Low))]
 fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
-    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let (_tmp, dir, writer, mut app) = tempdir_app();
     app.set_thinking("high").unwrap();
     let mut model = app.state.model.clone();
     model.thinking_override = Some(ThinkingSupport::No);
@@ -9976,7 +9979,8 @@ fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: Thinki
 
     assert_eq!(app.state.thinking, expected);
     assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
-    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
+    drain_writer(app, writer);
+    assert_eq!(read_thinking(&dir), Some(expected.into()));
 }
 
 #[test_case(StoredThinking::Adaptive)]

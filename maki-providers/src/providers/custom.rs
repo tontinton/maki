@@ -571,6 +571,29 @@ mod tests {
         assert_eq!(model.max_output_tokens, Some(expected_output));
     }
 
+    #[test_case(Some(true), Some(false), true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), true ; "image_discovery_keeps_vision_on")]
+    fn discovered_vision_flows_into_custom_model(
+        declared: Option<bool>,
+        discovered: Option<bool>,
+        expected: bool,
+    ) {
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}");
+        let model_id = "vllm-model";
+        crate::model_registry::set_known_models(
+            &slug,
+            vec![ModelInfo {
+                supports_vision: discovered,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].supports_vision = declared;
+        let model = model_from_def(&def, openai_spec(), &slug, model_id);
+        assert_eq!(model.supports_vision(), expected);
+    }
+
     const ENDPOINT_INPUT_PRICE: f64 = 0.5;
     const ENDPOINT_OUTPUT_PRICE: f64 = 1.5;
     const DECLARED_INPUT_PRICE: f64 = 3.0;

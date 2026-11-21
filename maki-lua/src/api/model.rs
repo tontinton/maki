@@ -257,9 +257,7 @@ mod tests {
     use crate::api::util::command::{NO_UI_ERR, UI_DROPPED_ERR, UiReply};
     use crate::api::util::convert::lua_to_json;
     use maki_providers::model_registry;
-    use maki_storage::StateDir;
     use serde_json::{Value as Json, json};
-    use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::mpsc::unbounded_channel;
@@ -270,18 +268,14 @@ mod tests {
 
     /// Assignments live in a process-global registry, so a test that needs one
     /// writes it and hands back the pair used to clear it afterwards. `unset`
-    /// only removes a matching spec, hence the spec is returned with the dir.
+    /// only removes a matching spec, hence the spec is returned with the tier.
     fn assign_tier(spec: &str, tier: ModelTier) -> (Lua, ModelTier, String) {
-        let dir = TempDir::new().unwrap();
-        let storage = StateDir::from_path(dir.path().to_path_buf());
-        model_registry::set_and_persist(spec.into(), tier, &storage);
+        model_registry::set(spec.into(), tier);
         (lua_with_model(None), tier, spec.into())
     }
 
     fn clear_tier(tier: ModelTier, spec: String) {
-        let dir = TempDir::new().unwrap();
-        let storage = StateDir::from_path(dir.path().to_path_buf());
-        model_registry::unset_and_persist(&spec, tier, &storage);
+        model_registry::unset(&spec, tier);
     }
 
     fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {

@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use maki_config::ModelPolicy;
 use maki_providers::Model;
 use maki_providers::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::models_cache::ModelList;
 use maki_providers::provider::ProviderStatus;
 use maki_providers::spec::{Build, ProviderRegistry};
+use maki_storage::model::with_recent;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -154,19 +156,43 @@ impl PickerItem for ModelEntry {
     }
 }
 
+/// The recent models and the unfolded providers, one copy for every tab's
+/// picker. A new tab opens without reading them from disk, and lists what
+/// another tab changed.
+#[derive(Default)]
+pub struct PickerMemory {
+    recents: ArcSwap<Vec<String>>,
+    /// Providers listed with their models. Every other one is folded.
+    expanded: ArcSwap<BTreeSet<String>>,
+}
+
+impl PickerMemory {
+    pub fn new(recents: Vec<String>, expanded: BTreeSet<String>) -> Self {
+        Self {
+            recents: ArcSwap::from_pointee(recents),
+            expanded: ArcSwap::from_pointee(expanded),
+        }
+    }
+
+    pub fn record_recent(&self, spec: &str, policy: &ModelPolicy) {
+        if policy.allows(spec) {
+            self.recents
+                .store(Arc::new(with_recent(&self.recents.load(), spec)));
+        }
+    }
+}
+
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<ModelList>>,
     available: Watch<ModelList>,
-    recents: Vec<String>,
+    memory: Arc<PickerMemory>,
     current_spec: String,
     needs_rebuild: bool,
     /// Entry to restore on refresh: `(was_recent, spec)`. Seeded from the
     /// preselection at open so it survives the background list arriving, and
     /// moved by user navigation.
     anchor: Option<(bool, String)>,
-    /// Providers listed with their models. Every other one is folded.
-    expanded: BTreeSet<String>,
 }
 
 impl ModelPicker {
@@ -175,25 +201,25 @@ impl ModelPicker {
             picker: ListPicker::new().with_footer(FOOTER),
             models,
             available: Watch::default(),
-            recents: Vec::new(),
+            memory: Arc::default(),
             current_spec: String::new(),
             needs_rebuild: false,
             anchor: None,
-            expanded: BTreeSet::new(),
         }
     }
 
-    pub fn set_expanded(&mut self, expanded: BTreeSet<String>) {
-        self.expanded = expanded;
-        self.needs_rebuild = true;
+    pub fn sharing(mut self, memory: Arc<PickerMemory>) -> Self {
+        self.memory = memory;
+        self
     }
 
-    pub fn expanded_providers(&self) -> &BTreeSet<String> {
-        &self.expanded
+    pub fn expanded_providers(&self) -> Arc<BTreeSet<String>> {
+        self.memory.expanded.load_full()
     }
 
+    #[cfg(test)]
     pub fn set_recents(&mut self, recents: Vec<String>) {
-        self.recents = recents;
+        self.memory.recents.store(Arc::new(recents));
         self.needs_rebuild = true;
     }
 
@@ -257,7 +283,7 @@ impl ModelPicker {
             })
         };
         let mut entries = Vec::new();
-        for spec in &self.recents {
+        for spec in self.memory.recents.load().iter() {
             if retired(spec) {
                 continue;
             }
@@ -285,9 +311,10 @@ impl ModelPicker {
                 groups.entry((display, slug.clone())).or_default();
             }
         }
+        let expanded = self.memory.expanded.load();
         for ((display, slug), mut models) in groups {
             let status = list.and_then(|l| l.providers.get(&slug));
-            let hidden = !self.expanded.contains(&slug);
+            let hidden = !expanded.contains(&slug);
             entries.push(provider_row(slug, display, models.len(), status));
             models.sort_by(|a, b| b.free.cmp(&a.free).then_with(|| a.id.cmp(&b.id)));
             entries.extend(
@@ -360,9 +387,11 @@ impl ModelPicker {
     }
 
     fn toggle_fold(&mut self, slug: String) -> ModelPickerAction {
-        if !self.expanded.remove(&slug) {
-            self.expanded.insert(slug.clone());
+        let mut expanded = BTreeSet::clone(&self.memory.expanded.load());
+        if !expanded.remove(&slug) {
+            expanded.insert(slug.clone());
         }
+        self.memory.expanded.store(Arc::new(expanded));
         // Following the provider row keeps the cursor on it, so the next press
         // undoes this one.
         self.anchor = Some((false, slug));
@@ -371,7 +400,7 @@ impl ModelPicker {
     }
 
     fn toggle_all_folds(&mut self) -> ModelPickerAction {
-        self.expanded = if self.expanded.is_empty() {
+        let expanded = if self.memory.expanded.load().is_empty() {
             self.available
                 .get()
                 .iter()
@@ -382,6 +411,7 @@ impl ModelPicker {
         } else {
             BTreeSet::new()
         };
+        self.memory.expanded.store(Arc::new(expanded));
         if let Some(entry) = self.picker.selected_item().filter(|e| !e.is_recent()) {
             self.anchor = Some((false, entry.provider.clone()));
         }
@@ -586,9 +616,8 @@ mod tests {
     /// A picker with every test provider unfolded, for tests about which model
     /// the cursor lands on.
     fn unfolded(models: Arc<ArcSwapOption<ModelList>>) -> ModelPicker {
-        let mut p = ModelPicker::new(models);
-        p.set_expanded(BTreeSet::from([PROVIDER.to_owned(), ZAI.to_owned()]));
-        p
+        let expanded = BTreeSet::from([PROVIDER.to_owned(), ZAI.to_owned()]);
+        ModelPicker::new(models).sharing(Arc::new(PickerMemory::new(Vec::new(), expanded)))
     }
 
     fn rendered(p: &mut ModelPicker) -> String {
@@ -627,6 +656,7 @@ mod tests {
 
     const FOLD_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
     const KEPT_OPEN: &str = "the fold is not a choice, so the picker stays up";
+    const SHARED_BY_TABS: &str = "every tab's picker lists the one set of recents and folds";
     const PROVIDER: &str = "anthropic";
     const ZAI: &str = "zai";
 
@@ -666,8 +696,8 @@ mod tests {
         assert!(matches!(action, ModelPickerAction::Folded));
         assert!(p.is_open(), "{KEPT_OPEN}");
         assert_eq!(
-            p.expanded_providers(),
-            &BTreeSet::from([PROVIDER.to_owned()])
+            *p.expanded_providers(),
+            BTreeSet::from([PROVIDER.to_owned()])
         );
         let _ = p.refresh();
         assert!(lists_models_of(&p, PROVIDER), "its models come out");
@@ -686,7 +716,7 @@ mod tests {
         p.open(FOLD_SPEC);
 
         p.handle_key(key(KeyCode::Char('%')));
-        assert_eq!(p.expanded_providers(), &BTreeSet::from([ZAI.to_owned()]));
+        assert_eq!(*p.expanded_providers(), BTreeSet::from([ZAI.to_owned()]));
         let _ = p.refresh();
         assert_eq!(
             p.picker.selected_item().map(|e| e.spec.as_str()),
@@ -705,12 +735,47 @@ mod tests {
             ModelPickerAction::Folded
         ));
         assert_eq!(
-            p.expanded_providers(),
-            &BTreeSet::from([PROVIDER.to_owned(), ZAI.to_owned()])
+            *p.expanded_providers(),
+            BTreeSet::from([PROVIDER.to_owned(), ZAI.to_owned()])
         );
 
         p.handle_key(key(FOLD_ALL_KEY));
         assert!(p.expanded_providers().is_empty());
+    }
+
+    fn pick_recent(p: &mut ModelPicker) {
+        p.set_recents(vec![FOLD_SPEC.into()]);
+    }
+
+    fn unfold_provider(p: &mut ModelPicker) {
+        p.open("");
+        select_provider(p, PROVIDER);
+        p.handle_key(key(FOLD_KEY));
+    }
+
+    fn lists_recent(p: &ModelPicker) -> bool {
+        p.load_entries()
+            .iter()
+            .any(|e| e.is_recent() && e.spec == FOLD_SPEC)
+    }
+
+    fn lists_provider_models(p: &ModelPicker) -> bool {
+        lists_models_of(p, PROVIDER)
+    }
+
+    #[test_case(pick_recent,     lists_recent          ; "a_pick")]
+    #[test_case(unfold_provider, lists_provider_models ; "a_fold")]
+    fn another_tab_lists_what_one_tab_changed(
+        change: fn(&mut ModelPicker),
+        lists_change: fn(&ModelPicker) -> bool,
+    ) {
+        let memory = Arc::<PickerMemory>::default();
+        let mut first = ModelPicker::new(test_models()).sharing(Arc::clone(&memory));
+        let mut second = ModelPicker::new(test_models()).sharing(memory);
+
+        change(&mut first);
+        second.open("");
+        assert!(lists_change(&second), "{SHARED_BY_TABS}");
     }
 
     fn reported(specs: &[&str], status: ProviderStatus) -> Arc<ArcSwapOption<ModelList>> {

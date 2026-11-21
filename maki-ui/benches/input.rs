@@ -2,6 +2,7 @@
 //! entry points the event loop uses.
 
 use std::hint::black_box;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
@@ -15,6 +16,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use tempfile::TempDir;
+use tokio::runtime::Runtime;
 
 const SIZES: &[usize] = &[1_000, 10_000, 50_000];
 const MARKED_LINES: usize = 10_000;
@@ -31,6 +33,9 @@ const AREA: Rect = Rect::new(0, 0, 120, 40);
 const SAMPLES: usize = 10;
 const TYPED: char = 'x';
 const UNDO: KeyEvent = KeyEvent::new(key::UNDO.code, key::UNDO.modifiers);
+const NO_RUNTIME: &str = "tokio runtime for the app's storage writer";
+
+static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect(NO_RUNTIME));
 
 /// A bit of everything a prompt tends to hold. The quote is wider than the
 /// terminal, so wrapping gets measured too.
@@ -81,6 +86,7 @@ struct Fixture {
 impl Fixture {
     fn empty() -> Self {
         let storage = TempDir::new().unwrap();
+        let _runtime = RUNTIME.enter();
         Self {
             app: bench_support::app(StateDir::from_path(storage.path().to_path_buf())),
             terminal: Terminal::new(TestBackend::new(AREA.width, AREA.height)).unwrap(),
