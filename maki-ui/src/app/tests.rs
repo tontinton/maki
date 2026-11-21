@@ -7682,7 +7682,7 @@ fn permission_waits_for_a_focused_window(focused: bool) {
 }
 
 #[test]
-fn focused_window_yields_to_permission_before_plan_form() {
+fn permission_answers_before_the_plan_form_once_the_float_closes() {
     let mut app = test_app();
     let mut answer_rx = answer_channel(&mut app);
     open_plan_form(&mut app);
