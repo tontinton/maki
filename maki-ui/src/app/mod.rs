@@ -804,9 +804,9 @@ impl App {
     fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
         match owner {
             KeyboardOwner::FocusedFloat => {
-                Overlay::is_open(&self.float_mgr) && Overlay::is_modal(&self.float_mgr)
+                self.float_mgr.focused_on_screen() && Overlay::is_modal(&self.float_mgr)
             }
-            KeyboardOwner::FocusedSplit => Overlay::is_open(&self.float_mgr),
+            KeyboardOwner::FocusedSplit => self.float_mgr.focused_on_screen(),
             KeyboardOwner::PlanForm => self.plan_form_active(),
             KeyboardOwner::Queue => self.queue_focused(),
             KeyboardOwner::Chat => true,
