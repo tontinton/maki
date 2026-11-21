@@ -1401,7 +1401,11 @@ fn finish_level_switch(
     outcome
         .map(|()| config_options_response(srv, &sid))
         .map_err(|e| {
-            AcpError::internal_error().data(json_str(&format!("permission level {level}: {e}")))
+            let cause = format!("permission level {level}: {e}");
+            // Clients show `message`, not `data`.
+            let mut error = AcpError::internal_error().data(json_str(&cause));
+            error.message = cause;
+            error
         })
 }
 
@@ -3743,16 +3747,21 @@ mod tests {
             end,
         })
     "#;
+    const PICK_FAILURE: &str = "judge is down";
     /// Turns itself off fine, which a failed pick must ask it to do.
-    const FAILING_LEVEL_PLUGIN: &str = r#"
-        maki.api.register_permission_mode({
-            id = "judge",
-            on_select = function(session, selected)
-                if selected then error("judge is down") end
-                maki.api.register_command({ name = "/deselected-" .. session, handler = function() end })
-            end,
-        })
-    "#;
+    fn failing_level_plugin() -> String {
+        format!(
+            r#"
+            maki.api.register_permission_mode({{
+                id = "judge",
+                on_select = function(session, selected)
+                    if selected then error("{PICK_FAILURE}") end
+                    maki.api.register_command({{ name = "/deselected-" .. session, handler = function() end }})
+                end,
+            }})
+        "#
+        )
+    }
     /// A pick never comes back, like a plugin stuck on a slow call.
     const PARKED_LEVEL_PLUGIN: &str = r#"
         maki.api.register_permission_mode({
@@ -3937,7 +3946,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_plugin_level_is_turned_off_and_falls_back_to_ask() {
-        let (mut srv, mut out_rx, host) = server_with_level_plugin(FAILING_LEVEL_PLUGIN);
+        let (mut srv, mut out_rx, host) = server_with_level_plugin(&failing_level_plugin());
         let sid = only_sid(&srv);
         let id = srv.sessions[&sid].handle.session_id.to_string();
         srv.sessions[&sid]
@@ -3948,7 +3957,8 @@ mod tests {
         let err = set_level(&mut srv, &sid, PLUGIN_LEVEL).await.unwrap_err();
 
         assert_eq!(err.code, AcpError::internal_error().code);
-        assert!(err.data.unwrap().to_string().contains("judge is down"));
+        assert!(err.message.contains(PICK_FAILURE), "{}", err.message);
+        assert!(err.data.unwrap().to_string().contains(PICK_FAILURE));
         assert!(
             command_names(&host).contains(&format!("{DESELECTED_PREFIX}{id}")),
             "a pick that failed may have half turned the plugin on"
