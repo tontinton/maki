@@ -197,8 +197,8 @@ impl Totals {
             } => {
                 self.num_turns += *num_turns;
                 self.stop_reason = Some(*reason);
-                // Only a stop cancels a run here, and its answer is cut short.
-                self.is_error |= *reason == DoneReason::Cancelled;
+                // A stop or a spent budget cuts the answer short.
+                self.is_error |= matches!(reason, DoneReason::Cancelled | DoneReason::MaxBudget);
                 let run_text = mem::take(&mut self.run_text);
                 if !run_text.is_empty() {
                     self.result_text = run_text;
@@ -620,11 +620,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_run_cut_short_by_a_stop_is_an_error() {
+    #[test_case(DoneReason::Cancelled ; "stopped")]
+    #[test_case(DoneReason::MaxBudget ; "budget_spent")]
+    fn a_run_cut_short_is_an_error(reason: DoneReason) {
         let mut totals = Totals::default();
         assert!(totals.fold(&text_delta(FIRST_ANSWER), None));
-        assert!(totals.fold(&run_done(DoneReason::Cancelled), None));
+        assert!(totals.fold(&run_done(reason), None));
 
         assert!(totals.is_error);
         assert_eq!(totals.result_text, FIRST_ANSWER);

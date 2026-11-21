@@ -174,6 +174,10 @@ pub struct Cli {
     #[arg(long)]
     pub max_turns: Option<u32>,
 
+    /// Stop once the session has spent this many USD
+    #[arg(long, value_name = "USD", value_parser = parse_budget_usd)]
+    pub max_budget_usd: Option<f64>,
+
     /// Replace the main agent's system prompt
     #[arg(long)]
     pub system_prompt: Option<String>,
@@ -234,8 +238,6 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub json_schema: Option<String>,
     #[arg(long, hide = true)]
-    pub max_budget_usd: Option<String>,
-    #[arg(long, hide = true)]
     pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
@@ -243,6 +245,13 @@ pub struct Cli {
     /// Initial prompt (reads stdin if piped)
     #[arg(value_name = "PROMPT")]
     pub initial_prompt: Option<String>,
+}
+
+fn parse_budget_usd(value: &str) -> Result<f64> {
+    match value.parse::<f64>() {
+        Ok(limit) if limit.is_finite() && limit > 0.0 => Ok(limit),
+        _ => bail!("`{value}` is not a positive dollar amount"),
+    }
 }
 
 impl Cli {
@@ -260,7 +269,6 @@ impl Cli {
             ("max-thinking-tokens", self.max_thinking_tokens.is_some()),
             ("effort", self.effort.is_some()),
             ("json-schema", self.json_schema.is_some()),
-            ("max-budget-usd", self.max_budget_usd.is_some()),
             ("thinking", self.thinking.is_some()),
             ("thinking-display", self.thinking_display.is_some()),
         ];
@@ -320,7 +328,7 @@ impl Cli {
     /// `--verbose` stay out, because Claude Code wrappers pass them on every
     /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
     /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
-    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+    fn scoped_flags(&self) -> [ScopedFlag; 6] {
         let host_prompt = self.host_prompt();
         [
             ScopedFlag {
@@ -336,6 +344,11 @@ impl Cli {
             ScopedFlag {
                 name: "max-turns",
                 set: self.max_turns.is_some(),
+                paths: &[RunPath::Print, RunPath::Sdk],
+            },
+            ScopedFlag {
+                name: "max-budget-usd",
+                set: self.max_budget_usd.is_some(),
                 paths: &[RunPath::Print, RunPath::Sdk],
             },
             ScopedFlag {
@@ -670,6 +683,23 @@ mod tests {
         assert!(Cli::try_parse_from(["maki", "-p", "--background-timeout", &too_long]).is_err());
     }
 
+    #[test_case("0" ; "zero")]
+    #[test_case("-1" ; "negative")]
+    #[test_case("NaN" ; "nan")]
+    #[test_case("inf" ; "infinite")]
+    #[test_case("five" ; "not_a_number")]
+    fn max_budget_usd_must_be_a_positive_amount(value: &str) {
+        assert!(Cli::try_parse_from(["maki", "-p", "--max-budget-usd", value]).is_err());
+    }
+
+    #[test]
+    fn max_budget_usd_reaches_the_config() {
+        assert_eq!(
+            parse(&["-p", "--max-budget-usd", "1.25"]).max_budget_usd,
+            Some(1.25)
+        );
+    }
+
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap()
     }
@@ -681,6 +711,8 @@ mod tests {
     #[test_case(&["--append-system-prompt", APPEND, "prompt"], None ; "prompt_append")]
     #[test_case(&["--system-prompt", "", "models"], None ; "empty_is_unset")]
     #[test_case(&["-p", "--max-turns", "3"], None ; "print_max_turns")]
+    #[test_case(&["-p", "--max-budget-usd", "0.50"], None ; "print_max_budget_usd")]
+    #[test_case(&["--max-budget-usd", "0.50"], Some("max-budget-usd") ; "tui_max_budget_usd")]
     #[test_case(&["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"], None ; "claude_agent_sdk_flags")]
     #[test_case(&["--append-system-prompt", APPEND, "models"], Some("append-system-prompt") ; "models_append")]
     #[test_case(&["--append-system-prompt", APPEND, "prompt", "research"], Some("append-system-prompt") ; "subagent_prompt_append")]
