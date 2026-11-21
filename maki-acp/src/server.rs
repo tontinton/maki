@@ -3867,12 +3867,7 @@ mod tests {
         let response = set_level(&mut srv, &sid, level).await.unwrap();
 
         assert_eq!(is_yolo(&srv, &sid), yolo);
-        let option = permissions_option(&response);
-        assert_eq!(option["currentValue"], level);
-        assert_eq!(
-            level_ids(&option),
-            [methods::PERMISSION_ASK, methods::PERMISSION_YOLO]
-        );
+        assert_eq!(permissions_option(&response)["currentValue"], level);
         let update = out_rx.try_recv().expect("the client is told the new level");
         let announced: Vec<&str> = update["params"]["update"]["configOptions"]
             .as_array()
@@ -3907,24 +3902,6 @@ mod tests {
         assert_eq!(err.code, AcpError::invalid_params().code);
         assert!(!is_yolo(&srv, &sid));
         assert!(out_rx.is_empty(), "a rejected request announces nothing");
-    }
-
-    #[tokio::test]
-    async fn each_session_keeps_its_own_level() {
-        let (mut srv, ..) = test_server();
-        let first = only_sid(&srv);
-        let second = install(&mut srv, fixture_session().state);
-
-        set_level(&mut srv, &first, methods::PERMISSION_YOLO)
-            .await
-            .unwrap();
-
-        assert!(is_yolo(&srv, &first));
-        assert!(!is_yolo(&srv, &second));
-        assert_eq!(
-            srv.sessions[&second].permission_level,
-            methods::PERMISSION_ASK
-        );
     }
 
     #[tokio::test]
@@ -4002,6 +3979,7 @@ mod tests {
         assert_eq!(sid, other);
         response.unwrap();
         assert!(is_yolo(&srv, &other));
+        assert!(!is_yolo(&srv, &parked));
         assert_eq!(
             srv.sessions[&parked].permission_level,
             methods::PERMISSION_ASK,
