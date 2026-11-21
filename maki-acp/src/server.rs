@@ -171,13 +171,6 @@ impl Server {
     fn respond(&self, id: RequestId, result: Result<AgentResponse, AcpError>) {
         send(&self.out_tx, Response::new(id, result));
     }
-
-    fn level_owners(&self) -> LevelOwners {
-        LevelOwners {
-            lua_handle: self.stack.lua_handle.clone(),
-            modes: self.permission_modes.clone(),
-        }
-    }
 }
 
 enum Incoming {
@@ -1066,12 +1059,12 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
     }
     let id = handle.session_id.id();
     let on_session_end = srv.stack.on_session_end.clone();
-    let owners = srv.level_owners();
+    let lua_handle = srv.stack.lua_handle.clone();
     let teardown = tokio::spawn(async move {
         // A plugin level still on must not outlive its session. The gate waits
         // out a switch in flight, so this leaves what the plugin really has on.
         let level = level_gate.lock().await;
-        if let Err(e) = owners.notify(&id.to_string(), &level, false).await {
+        if let Err(e) = notify_level(lua_handle.as_ref(), &id.to_string(), &level, false).await {
             warn!(mode = %*level, error = %e, "permission mode handler failed on close");
         }
         if let Some(hook) = on_session_end {
@@ -1288,7 +1281,7 @@ async fn offered_permission_modes(lua_handle: Option<&EventHandle>) -> Vec<Permi
     };
     let mut modes = lua_handle.permission_modes().await;
     modes.retain(|mode| {
-        let builtin = mode.id == methods::PERMISSION_ASK || mode.id == methods::PERMISSION_YOLO;
+        let builtin = methods::is_builtin_level(&mode.id);
         if builtin {
             warn!(mode = %mode.id, "plugin permission mode shadows a built-in level, skipped");
         }
@@ -1297,23 +1290,20 @@ async fn offered_permission_modes(lua_handle: Option<&EventHandle>) -> Vec<Permi
     modes
 }
 
-/// Who to tell about a level. Built-in levels have no owner.
-struct LevelOwners {
-    lua_handle: Option<EventHandle>,
-    modes: Vec<PermissionModeInfo>,
-}
-
-impl LevelOwners {
-    async fn notify(&self, session_id: &str, level: &str, selected: bool) -> Result<(), String> {
-        let (Some(lua_handle), true) = (
-            &self.lua_handle,
-            self.modes.iter().any(|mode| mode.id == level),
-        ) else {
-            return Ok(());
-        };
-        lua_handle
-            .select_permission_mode(level, session_id, selected)
-            .await
+/// Tells the plugin that owns `level`. Built-in levels have no owner.
+async fn notify_level(
+    lua_handle: Option<&EventHandle>,
+    session_id: &str,
+    level: &str,
+    selected: bool,
+) -> Result<(), String> {
+    match lua_handle {
+        Some(lua_handle) if !methods::is_builtin_level(level) => {
+            lua_handle
+                .select_permission_mode(level, session_id, selected)
+                .await
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1326,13 +1316,14 @@ async fn set_permission_level(
     request: RequestId,
 ) -> Result<(), AcpError> {
     srv.permission_modes = offered_permission_modes(srv.stack.lua_handle.as_ref()).await;
-    let builtin = level == methods::PERMISSION_ASK || level == methods::PERMISSION_YOLO;
-    if !builtin && !srv.permission_modes.iter().any(|mode| mode.id == level) {
+    if !methods::is_builtin_level(&level)
+        && !srv.permission_modes.iter().any(|mode| mode.id == level)
+    {
         let detail = format!("unknown permission level: {level}");
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
-    let owners = srv.level_owners();
+    let lua_handle = srv.stack.lua_handle.clone();
     let incoming = srv.incoming.clone();
     let session = open_session(&mut srv.sessions, sid)?;
     let session_id = session.handle.session_id.to_string();
@@ -1340,7 +1331,7 @@ async fn set_permission_level(
     let sid = sid.clone();
     tokio::spawn(async move {
         let mut current = gate.lock().await;
-        let outcome = switch_level(&owners, &session_id, &current, &level).await;
+        let outcome = switch_level(lua_handle.as_ref(), &session_id, &current, &level).await;
         *current = level_in_force(&level, &outcome).to_owned();
         // Under the gate, so results reach the loop in the order switches ran.
         if let Some(tx) = incoming.upgrade() {
@@ -1361,19 +1352,19 @@ async fn set_permission_level(
 /// run at once in a session. A pick that fails may have half turned its plugin
 /// on, so the owner is told to turn off again.
 async fn switch_level(
-    owners: &LevelOwners,
+    lua_handle: Option<&EventHandle>,
     session_id: &str,
     previous: &str,
     level: &str,
 ) -> Result<(), String> {
     if previous != level
-        && let Err(e) = owners.notify(session_id, previous, false).await
+        && let Err(e) = notify_level(lua_handle, session_id, previous, false).await
     {
         warn!(mode = %previous, error = %e, "permission mode handler failed on deselect");
     }
-    let picked = owners.notify(session_id, level, true).await;
+    let picked = notify_level(lua_handle, session_id, level, true).await;
     if picked.is_err()
-        && let Err(e) = owners.notify(session_id, level, false).await
+        && let Err(e) = notify_level(lua_handle, session_id, level, false).await
     {
         warn!(mode = %level, error = %e, "permission mode handler failed to undo a failed pick");
     }

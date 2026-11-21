@@ -99,6 +99,10 @@ pub fn permissions_config_option(
     )
 }
 
+pub fn is_builtin_level(level: &str) -> bool {
+    level == PERMISSION_ASK || level == PERMISSION_YOLO
+}
+
 pub fn mode_id_to_agent_mode(mode_id: &str) -> Option<maki_agent::AgentMode> {
     match mode_id {
         MODE_BUILD => Some(maki_agent::AgentMode::Build),
