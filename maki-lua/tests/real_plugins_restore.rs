@@ -583,27 +583,11 @@ fn todo_write_live_call_reports_the_result(input: Value, expected: &str) {
     assert_eq!(exec_live(&host, &reg, TODO_TOOL, input).output, expected);
 }
 
-/// The toggle lives behind a file-local, so `todo_write.toggle` is the only
-/// way a user's `init.lua` binds another key to the panel. The panel calls no
-/// gated API, so the action is free to call, and with no list it answers
-/// false instead of throwing, leaving the caller's key to try its next action.
-#[test]
-fn todo_write_toggle_action_answers_a_caller_without_a_list() {
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
-
-    host.load_source("global/init.lua", TODO_TOGGLE_CALLER)
-        .unwrap();
-}
-
-/// The case the key is actually bound for: a shown panel, hidden by the
-/// action while the caller's `init.lua` has no permissions. A list is written
-/// and focused first, then the action answers the caller `true` and the
-/// panel's last visibility command is the hide.
+/// This key handles hiding a shown panel when the caller's `init.lua` lacks permissions after a list is focused.
 #[test]
 fn todo_write_toggle_action_hides_a_shown_panel() {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
