@@ -343,23 +343,14 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     }
 }
 
-fn config_options(srv: &Server, session: &SessionState) -> Vec<SessionConfigOption> {
-    vec![
-        methods::model_config_option(&session.current_model, &srv.model_specs),
-        methods::permissions_config_option(&session.permission_level, &srv.permission_modes),
-    ]
-}
-
 /// A client may replace its whole option list with an update, so it always
 /// carries every option.
 fn notify_config_options(srv: &Server, sid: &SessionId) {
-    let Some(session) = srv.sessions.get(sid) else {
-        return;
-    };
+    let options = session_config_options(srv, sid);
     session_update(
         &srv.out_tx,
         sid,
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options(srv, session))),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
     );
 }
 
@@ -640,10 +631,13 @@ async fn load_session(
 }
 
 fn session_config_options(srv: &Server, sid: &SessionId) -> Vec<SessionConfigOption> {
-    srv.sessions
-        .get(sid)
-        .map(|session| config_options(srv, session))
-        .unwrap_or_default()
+    let Some(session) = srv.sessions.get(sid) else {
+        return Vec::new();
+    };
+    vec![
+        methods::model_config_option(&session.current_model, &srv.model_specs),
+        methods::permissions_config_option(&session.permission_level, &srv.permission_modes),
+    ]
 }
 
 /// Permissions, where a saved answer lands, and MCP config follow the
