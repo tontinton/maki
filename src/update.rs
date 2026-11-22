@@ -78,6 +78,9 @@ pub enum UpdateError {
 
     #[error("failed to check latest version: {0}")]
     VersionCheck(#[from] VersionError),
+
+    #[error("maki was installed through an external package manager and cannot {0} itself")]
+    Disabled(&'static str),
 }
 
 async fn fetch_script() -> Result<String, UpdateError> {
@@ -220,6 +223,10 @@ async fn prompt_yes(install_dir: &Path) -> bool {
 }
 
 pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
+    if version::UPDATE_DISABLED {
+        return Err(UpdateError::Disabled("update"));
+    }
+
     let latest = version::fetch_latest().await?;
     if !version::is_newer(&latest, version::CURRENT) {
         println!("Already up to date (v{})", version::CURRENT);
@@ -270,6 +277,10 @@ pub async fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateErro
 }
 
 pub fn rollback() -> Result<(), UpdateError> {
+    if version::UPDATE_DISABLED {
+        return Err(UpdateError::Disabled("roll back"));
+    }
+
     let exe_path = current_exe_resolved()?;
     let backup_path = backup_path()?;
 
