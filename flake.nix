@@ -89,6 +89,7 @@
               commonArgs // { buildPhaseCargoCommand = "cargoWithProfile build --locked"; }
             );
             cargoExtraArgs = "--package ${packageName}";
+            MAKI_DISABLE_UPDATE = "1";
           }
         );
 
