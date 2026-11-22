@@ -928,6 +928,18 @@ fn clipboard_text_lands_in_input_and_clears_flash() {
     assert_eq!(app.status_bar.flash_text(), None);
 }
 
+#[test_case(Ok(()), FLASH_COPIED ; "success_flashes_copied")]
+#[test_case(Err("boom".into()), "Copy failed: boom" ; "failure_is_surfaced")]
+fn custom_clipboard_command_result_lands_on_tick(result: Result<(), String>, expected: &str) {
+    let mut app = test_app();
+    let (tx, rx) = oneshot::channel();
+    app.copy_rx.push(rx);
+    tx.send(result).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+    assert_eq!(app.status_bar.flash_text(), Some(expected));
+    assert!(app.copy_rx.is_empty());
+}
+
 #[test]
 fn submit_during_streaming_queues_message() {
     let mut app = test_app();

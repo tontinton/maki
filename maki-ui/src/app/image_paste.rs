@@ -40,7 +40,8 @@ fn pick_paste(
 /// Runs a blocking read on its own thread: a clipboard owner may be slow or
 /// hung, and the UI thread must not wait on it, nor the blocking pool keep a
 /// thread for a read that never returns.
-pub(super) fn spawn_read<T: Send + 'static>(
+/// `pub(crate)` because `clipboard::ClipboardState` uses it for a copy command.
+pub(crate) fn spawn_read<T: Send + 'static>(
     read: impl FnOnce() -> T + Send + 'static,
 ) -> Receiver<T> {
     let (tx, rx) = oneshot::channel();
