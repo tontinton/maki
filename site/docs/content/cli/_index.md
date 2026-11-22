@@ -193,6 +193,12 @@ maki rollback          # previous version
 
 Uses the same install locations as the install scripts.
 
+Packagers can turn both commands off, along with the startup check for a new version, by setting `MAKI_DISABLE_UPDATE` at build time to anything but empty or `0`. They then exit with an error that points to the package manager.
+
+```bash
+MAKI_DISABLE_UPDATE=1 cargo build --release
+```
+
 ### `maki acp`
 
 ```bash

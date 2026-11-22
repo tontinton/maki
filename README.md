@@ -125,6 +125,8 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/tontint
 
 Then set an API key for one of the [providers](#supported-providers) and run `maki` in your project. Config lives in `~/.config/maki/init.lua`, the [Quick Start](https://maki.sh/docs/quick-start/) goes through the rest.
 
+Packaging maki? Build with `MAKI_DISABLE_UPDATE=1` to turn off self-update, see [`maki update`](https://maki.sh/docs/cli/#maki-update-maki-rollback).
+
 ## ACP
 
 Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed](https://zed.dev/)'s `settings.json`:
