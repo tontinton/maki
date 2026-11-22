@@ -9,6 +9,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = "maki";
 
+/// Set `MAKI_DISABLE_UPDATE` at build time to anything but empty or `0` to turn off
+/// self-update, rollback and the startup version check, e.g. in distro packages.
+pub const UPDATE_DISABLED: bool = is_disable_flag(option_env!("MAKI_DISABLE_UPDATE"));
+
 #[derive(Debug, thiserror::Error)]
 pub enum VersionError {
     #[error("HTTP request failed: {0}")]
@@ -19,6 +23,13 @@ pub enum VersionError {
     InvalidResponse(&'static str),
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+const fn is_disable_flag(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(v.as_bytes(), [] | [b'0']),
+        None => false,
+    }
 }
 
 pub fn is_newer(latest: &str, current: &str) -> bool {
@@ -84,5 +95,14 @@ mod tests {
     #[test_case("1.0.0-rc1", "0.9.0", false ; "prerelease_ignored")]
     fn is_newer_cases(latest: &str, current: &str, expected: bool) {
         assert_eq!(is_newer(latest, current), expected);
+    }
+
+    #[test_case(None, false ; "unset")]
+    #[test_case(Some(""), false ; "empty")]
+    #[test_case(Some("0"), false ; "zero")]
+    #[test_case(Some("1"), true ; "one")]
+    #[test_case(Some("true"), true ; "word")]
+    fn is_disable_flag_cases(value: Option<&str>, expected: bool) {
+        assert_eq!(is_disable_flag(value), expected);
     }
 }
