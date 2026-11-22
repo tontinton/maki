@@ -11,6 +11,10 @@ pub fn latest_version() -> Option<&'static str> {
 }
 
 pub fn spawn_check() {
+    if version::UPDATE_DISABLED {
+        return;
+    }
+
     tokio::spawn(async {
         match version::fetch_latest().await {
             Ok(v) if is_newer(&v, CURRENT) => {
