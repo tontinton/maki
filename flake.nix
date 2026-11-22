@@ -117,6 +117,8 @@
       gitDepHashes = {
         "git+https://github.com/crossterm-rs/crossterm?rev=94ed7154e35d24a2f643c61760e1eb05b8ca9e63#94ed7154e35d24a2f643c61760e1eb05b8ca9e63" =
           "sha256-r2Xsxw8+eqESsJKaax5pb/rIWshkoqi5E81Dkh8snZ8=";
+        "git+https://github.com/pulldown-cmark/pulldown-cmark?rev=1c1a3123207d9e07fdfcf3d3418a047907185afb#1c1a3123207d9e07fdfcf3d3418a047907185afb" =
+          "sha256-J1v1U9kLBnflh44QgA+Wk1aj3HhGqi6tg6I2B3ViUjI=";
         "git+https://github.com/tontinton/syntect?rev=01df275f6f25da670e5ba5b7128cb89d03795119#01df275f6f25da670e5ba5b7128cb89d03795119" =
           "sha256-ZszhXL+Bd0zZGOfOodvP4z6dLD3jJr3pO07riwFUC70=";
       };
