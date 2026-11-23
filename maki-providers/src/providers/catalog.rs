@@ -45,9 +45,12 @@ use crate::{
 
 const MESSAGES_PATH: &str = "/messages";
 
-/// Priced per subscription, so every model in it reads as free. The `zai` entry
-/// carries the pay as you go rates for the same models.
-const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai-coding-plan"];
+/// models.dev ids for a subscription route to a provider we ship, keyed to its
+/// slug. The plan prepaid every model, so its zero rates are never read, and it
+/// is never served on its own. Its limits and modalities still describe a model
+/// the route serves first (glm-5.4 launched on the coding plan alone), until
+/// the provider's own entry lists it.
+const PLAN_CATALOG_IDS: &[(&str, &str)] = &[("zai-coding-plan", "zai")];
 
 /// models.dev ids for providers we ship a client for under another name, so
 /// their metadata lands under the slug a model spec is written with.
@@ -394,6 +397,9 @@ pub(crate) struct CatalogData {
     /// still the only source that keeps up with what they release, so a model
     /// missing from our static tables can read its rates and limits here.
     builtin_models: HashMap<String, HashMap<String, CatalogMeta>>,
+    /// [`PLAN_CATALOG_IDS`] rows under their provider's slug, rates dropped.
+    /// Read only for a model the provider's own entry misses.
+    plan_models: HashMap<String, HashMap<String, CatalogMeta>>,
     pub(crate) state_dir: StateDir,
 }
 
@@ -402,6 +408,7 @@ impl CatalogData {
         Self {
             providers: HashMap::new(),
             builtin_models: HashMap::new(),
+            plan_models: HashMap::new(),
             state_dir,
         }
     }
@@ -409,8 +416,25 @@ impl CatalogData {
     fn from_index(index: schema::CatalogIndex, state_dir: &StateDir) -> Self {
         let mut providers = HashMap::new();
         let mut builtin_models = HashMap::new();
+        let mut plan_models = HashMap::new();
 
         for (provider_id, provider) in index {
+            if let Some(slug) = plan_slug(&provider_id) {
+                let models = parse_models(&provider.models)
+                    .into_iter()
+                    .map(|(id, meta)| {
+                        (
+                            id,
+                            CatalogMeta {
+                                pricing: None,
+                                ..meta
+                            },
+                        )
+                    })
+                    .collect();
+                plan_models.insert(slug.to_string(), models);
+                continue;
+            }
             let slug = builtin_slug(&provider_id);
             // maki brings its own client for these, so the catalog only lends
             // metadata, like the limits that keep requests inside the context.
@@ -450,6 +474,7 @@ impl CatalogData {
         Self {
             providers,
             builtin_models,
+            plan_models,
             state_dir: state_dir.clone(),
         }
     }
@@ -463,6 +488,7 @@ impl CatalogData {
             .get(slug)
             .and_then(|data| data.models.get(model_id))
             .or_else(|| self.builtin_models.get(slug)?.get(model_id))
+            .or_else(|| self.plan_models.get(slug)?.get(model_id))
     }
 
     pub(crate) fn lookup(
@@ -680,6 +706,13 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
     }
 }
 
+fn plan_slug(catalog_id: &str) -> Option<&'static str> {
+    PLAN_CATALOG_IDS
+        .iter()
+        .find(|(id, _)| *id == catalog_id)
+        .map(|(_, slug)| *slug)
+}
+
 fn builtin_slug(catalog_id: &str) -> &str {
     BUILTIN_CATALOG_IDS
         .iter()
@@ -695,8 +728,8 @@ fn is_servable(provider_id: &str, npm: &str, has_api: bool) -> bool {
         debug!(provider = %provider_id, npm, "skipping provider: unsupported npm package");
         return false;
     }
-    if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id) {
-        debug!(provider = %provider_id, "skipping provider: blocked");
+    if plan_slug(provider_id).is_some() {
+        debug!(provider = %provider_id, "skipping provider: prepaid plan route");
         return false;
     }
     if !has_api {
@@ -1152,6 +1185,7 @@ mod tests {
     /// Nothing like any real rate, so whichever source a model read is obvious.
     const STALE_CATALOG_PRICE: f64 = 99.0;
     const ZAI_PLAN_ID: &str = "zai-coding-plan";
+    const ZAI_SLUG: &str = "zai";
     const PAID_INPUT_PRICE: f64 = 1.0;
     const PAID_CONTEXT: u32 = 128_000;
     const PAID_OUTPUT: u32 = 64_000;
@@ -2005,21 +2039,41 @@ mod tests {
         assert!(data.provider(catalog_id).is_none());
     }
 
-    /// Its models are covered by the pay as you go `zai` entry, and are priced
-    /// at zero here because the plan already paid for them.
+    /// The plan prepaid its models, so it is never served and its zeros never
+    /// price anything. Its limits still describe a model only the plan lists,
+    /// and the provider's own entry wins wherever it has the model.
     #[test]
-    fn plan_priced_provider_is_dropped_entirely() {
+    fn plan_route_lends_limits_but_never_rates() {
         let (_tmp, state_dir) = temp_state_dir();
-        let index = single_provider_catalog(
-            ZAI_PLAN_ID,
-            "@ai-sdk/openai-compatible",
-            Some("https://api.z.ai/api/coding/paas/v4"),
-        );
+        let plan_rows = HashMap::from([
+            (UNLISTED_MODEL.into(), documented_row(true)),
+            (LISTED_MODEL.into(), documented_row(true)),
+        ]);
+        let own_rows = HashMap::from([(
+            LISTED_MODEL.into(),
+            priced_row(PAID_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        let mut index = catalog_index(ZAI_PLAN_ID, CHAT_NPM, Some(CATALOG_API_URL), plan_rows);
+        index.extend(catalog_index(
+            ZAI_SLUG,
+            CHAT_NPM,
+            Some(CATALOG_API_URL),
+            own_rows,
+        ));
         let data = CatalogData::from_index(index, &state_dir);
 
         assert!(data.provider(ZAI_PLAN_ID).is_none());
         assert!(data.model_meta(ZAI_PLAN_ID, UNLISTED_MODEL).is_none());
-        assert!(data.model_meta("zai", UNLISTED_MODEL).is_none());
+        let lent = data.model_meta(ZAI_SLUG, UNLISTED_MODEL).unwrap();
+        assert_eq!(lent.context, Some(UNLISTED_CONTEXT));
+        assert_eq!(lent.supports_vision, Some(true));
+        assert!(lent.pricing.is_none());
+        let own = data.model_meta(ZAI_SLUG, LISTED_MODEL).unwrap();
+        assert_eq!(
+            own.pricing.as_ref().map(|pricing| pricing.input),
+            Some(PAID_INPUT_PRICE)
+        );
+        assert_eq!(own.context, None, "the provider's own row is the answer");
     }
 
     /// A rename only helps when the catalog id is not a slug we ship.

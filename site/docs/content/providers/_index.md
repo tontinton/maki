@@ -216,19 +216,22 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
+| Medium | **glm-5.3-flash** (default) | $0.15 / $0.50 | 1000K ctx / 131K out |
+| Medium | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
-| Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5-code | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | glm-5.4 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | **glm-5.3** (default) | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
 | Strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
-Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
+Defaults: glm-5.3 (strong), glm-5.3-flash (medium), glm-4.7-flash (weak)
+
+The model list comes from the `/models` endpoint of the plan you log in with, so a model Z.AI adds shows up without a Maki update. A model missing from the table above reads its limits, vision and rates from models.dev, and its tier from the closest row (`glm-5.5` is strong like `glm-5`). The coding plan's models.dev entry lends limits and vision to a model only that plan serves so far, and never its zero rates.
 
 ### Opencode Zen
 
@@ -545,8 +548,8 @@ Current plans:
 |----------|------|--------------|
 | Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-large-4` |
 | Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
-| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
-| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
+| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.3` |
+| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5.4` |
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
