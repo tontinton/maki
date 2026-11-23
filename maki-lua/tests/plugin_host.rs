@@ -9351,8 +9351,13 @@ maki.api.register_tool({{
 const PAST_BOUND_LINES: usize = 2 * 16 * 1024 * 1024 / PADDED_LINE_BYTES;
 #[cfg(unix)]
 const PADDED_LINE_BYTES: usize = 4096;
+/// Never reached: 32 MiB through a pipe is ~13k thread handoffs, each
+/// waiting for a CPU when CI runs 64 tests on 4 cores, so any real deadline
+/// fails a correct queue under load. A queue that never frees its readers
+/// hangs instead, for nextest's slow-timeout to report. The largest integer
+/// a Luau number holds exactly.
 #[cfg(unix)]
-const PAST_BOUND_WAIT_MS: u64 = 20_000;
+const PAST_BOUND_WAIT_MS: u64 = 1 << 53;
 
 #[cfg(unix)]
 #[test]
