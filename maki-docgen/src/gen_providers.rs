@@ -19,6 +19,7 @@ const PLUGIN_PROVIDER_EXAMPLE: &str =
 const PLUGIN_PROVIDER_MANIFEST: &str =
     include_str!("../../maki-lua/tests/fixtures/provider_plugin/plugin.toml");
 
+const UNKNOWN_PRICING: &str = "unknown";
 const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
 
 const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
@@ -507,9 +508,10 @@ fn tier_label(tier: ModelTier) -> &'static str {
 }
 
 fn format_pricing(entry: &ModelEntry) -> String {
-    entry.pricing.as_ref().map_or_else(String::new, |pricing| {
-        format!("${:.2} / ${:.2}", pricing.input, pricing.output)
-    })
+    entry.pricing.as_ref().map_or_else(
+        || UNKNOWN_PRICING.into(),
+        |pricing| format!("${:.2} / ${:.2}", pricing.input, pricing.output),
+    )
 }
 
 fn format_context(entry: &ModelEntry) -> String {

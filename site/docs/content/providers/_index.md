@@ -227,7 +227,7 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 | Medium | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 | Strong | glm-5-code | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.4 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5.4 | unknown | 1000K ctx / 131K out |
 | Strong | **glm-5.3** (default) | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |

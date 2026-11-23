@@ -5,7 +5,8 @@
 # `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
 # wrong number, but it beats the zero an unpriced model gets, which renders as
 # free. GLM-5.4 has no published per-token API price yet (coding plan only),
-# so its row borrows GLM-5.3's rates for now.
+# so its row states none: models.dev supplies the rate once pay-as-you-go
+# lists it, and until then its price is unknown.
 #
 # Defaults: glm-5.3 strong, the multimodal glm-5.3-flash medium, the free
 # glm-4.7-flash weak. glm-5.4 is coding-plan only for now, so it is that
@@ -34,7 +35,6 @@ vision = true
 default = false
 max_output_tokens = 131072
 context_window = 1000000
-pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.26 }
 
 [[model]]
 prefixes = ["glm-5.3"]
