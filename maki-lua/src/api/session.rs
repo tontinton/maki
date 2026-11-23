@@ -163,8 +163,13 @@ async fn list(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResu
 /// Lists the sessions currently running in this UI. Status is "working",
 /// "needs_input", or "idle". Background work a turn moved out keeps the
 /// session "working" until its result is in, with no "idle" in between.
+/// A "needs_input" session has `attention`, text that says what it waits
+/// on, like "Permission requested: bash". The wording can change between
+/// releases, so show it and do not parse it. Other sessions have none.
+/// `resumable` is true once the session has a transcript `maki -r <id>` can
+/// open.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, status, attention, resumable, updated_at, focused}`, or nil and an error.
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]

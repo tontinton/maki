@@ -85,7 +85,6 @@ use maki_storage::model::{persist_expanded_providers, persist_thinking};
 use maki_storage::sessions::StoredThinking;
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal::BlockedKind;
 use ratatui::layout::{Position, Rect};
 use strum::{EnumIter, IntoEnumIterator};
 use tokio::sync::oneshot;
@@ -424,41 +423,57 @@ impl InputWriter {
     }
 }
 
+/// What a session waits on the user for. The one list of prompts: the
+/// `needs_input` status, the notifier, the OSC 7501 report and the `attention`
+/// plugins read all come from [`App::attention`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Attention {
+    Permission { tool: Option<String> },
+    Authentication,
+    PackReview,
+    PlanReady,
+    Question,
+}
+
+impl Attention {
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Permission { .. } => "Permission requested",
+            Self::Authentication => "Authentication required",
+            Self::PackReview => "Package review",
+            Self::PlanReady => "Plan ready",
+            Self::Question => "Question requested",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Permission { tool: Some(tool) } => format!("Permission requested: {tool}"),
+            Self::Permission { tool: None } => "Permission requested".into(),
+            Self::Authentication => "Authentication required".into(),
+            Self::PackReview => "Package changes to review".into(),
+            Self::PlanReady => "Plan ready".into(),
+            Self::Question => "Question requested".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
     TurnComplete { response: Option<String> },
-    PermissionRequested { tool: Option<String> },
-    AuthenticationRequired,
-    QuestionRequested,
-    PlanReady,
-    PackReview,
+    Attention(Attention),
     AgentError { message: String },
 }
 impl Notification {
     /// Prompts blocking the agent outrank turn completions.
     pub(crate) fn is_urgent(&self) -> bool {
-        self.blocked_kind().is_some()
-    }
-
-    /// The OSC 7501 kinds stop at permission, question and auth, so the plan
-    /// menu passes as a question and the package review as a permission.
-    pub(crate) fn blocked_kind(&self) -> Option<BlockedKind> {
-        match self {
-            Self::PermissionRequested { .. } | Self::PackReview => Some(BlockedKind::Permission),
-            Self::QuestionRequested | Self::PlanReady => Some(BlockedKind::Question),
-            Self::AuthenticationRequired => Some(BlockedKind::Auth),
-            Self::TurnComplete { .. } | Self::AgentError { .. } => None,
-        }
+        matches!(self, Self::Attention(_))
     }
 
     pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::TurnComplete { .. } => "Turn complete",
-            Self::PermissionRequested { .. } => "Permission requested",
-            Self::AuthenticationRequired => "Authentication required",
-            Self::QuestionRequested => "Question requested",
-            Self::PlanReady => "Plan ready",
-            Self::PackReview => "Package review",
+            Self::Attention(attention) => attention.reason(),
             Self::AgentError { .. } => "Agent error",
         }
     }
@@ -468,14 +483,7 @@ impl Notification {
             Self::TurnComplete { response } => response
                 .clone()
                 .unwrap_or_else(|| "Agent turn complete".into()),
-            Self::PermissionRequested { tool: Some(tool) } => {
-                format!("Permission requested: {tool}")
-            }
-            Self::PermissionRequested { tool: None } => "Permission requested".into(),
-            Self::AuthenticationRequired => "Authentication required".into(),
-            Self::QuestionRequested => "Question requested".into(),
-            Self::PlanReady => "Plan ready".into(),
-            Self::PackReview => "Package changes to review".into(),
+            Self::Attention(attention) => attention.message(),
             Self::AgentError { message } => message.clone(),
         }
     }
@@ -2595,25 +2603,26 @@ impl App {
         self.attention().is_some()
     }
 
-    pub(crate) fn attention(&self) -> Option<Notification> {
+    /// The most pressing prompt first. A permission prompt has a tool blocked
+    /// on it, and a plan form only waits once its turn is over, while the
+    /// package review takes the keys as soon as it opens.
+    pub(crate) fn attention(&self) -> Option<Attention> {
         if let Some(tool) = self.permission_prompt.tool() {
             let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
                 .then(|| normalize_preview(&tool.to_string()))
                 .flatten();
-            return Some(Notification::PermissionRequested { tool });
+            return Some(Attention::Permission { tool });
         }
         if self.turn_awaits_auth() {
-            return Some(Notification::AuthenticationRequired);
+            return Some(Attention::Authentication);
         }
         if self.pack_review.is_open() {
-            return Some(Notification::PackReview);
+            return Some(Attention::PackReview);
         }
         if self.status != Status::Streaming && self.plan_form_open() {
-            return Some(Notification::PlanReady);
+            return Some(Attention::PlanReady);
         }
-        self.float_mgr
-            .needs_input()
-            .then_some(Notification::QuestionRequested)
+        self.float_mgr.needs_input().then_some(Attention::Question)
     }
 
     pub fn has_modal_overlay(&self) -> bool {

@@ -7666,9 +7666,13 @@ fn a_primary_paste_waits_behind_held_keys(paste_bound: bool) {
 }
 
 fn open_permission_prompt(app: &mut App) {
+    ask_tool_permission(app, "bash");
+}
+
+pub(crate) fn ask_tool_permission(app: &mut App, tool: &str) {
     app.permission_prompt.push(
         "perm-1".into(),
-        ToolKey::native("bash"),
+        ToolKey::native(tool),
         vec!["execute".into()],
         None,
         ProjectAnswers::Saved,
@@ -7819,6 +7823,10 @@ fn a_focused_float_sized_to_nothing_leaves_the_keys_to_the_permission_prompt() {
     assert!(!took_a_key(&mut events));
     assert!(!app.permission_prompt.is_open());
     assert!(answer_rx.try_recv().is_ok());
+}
+
+pub(crate) fn answer_permission(app: &mut App) {
+    app.permission_prompt.handle_key(key(KeyCode::Char('y')));
 }
 
 fn open_alert(app: &mut App) {
@@ -10734,7 +10742,7 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
 fn a_package_review_waits_on_the_user_while_a_turn_streams() {
     let mut app = streaming_app();
     open_pack_review(&mut app);
-    assert_eq!(app.attention(), Some(Notification::PackReview));
+    assert_eq!(app.attention(), Some(Attention::PackReview));
 }
 
 #[test]
@@ -10750,7 +10758,7 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
 
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
     assert!(app.awaiting_input());
-    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
+    assert_eq!(app.attention(), Some(Attention::Question));
 
     cmd_tx
         .send(maki_lua::WinCommand::SetVisible(false))
@@ -10761,7 +10769,7 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
 
     cmd_tx.send(maki_lua::WinCommand::SetVisible(true)).unwrap();
     let _ = app.float_mgr.tick();
-    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
+    assert_eq!(app.attention(), Some(Attention::Question));
 
     cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
     let _ = app.float_mgr.tick();
@@ -11326,12 +11334,12 @@ fn turn_response_stops_after_bounded_large_input() {
 
 #[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", false ; "turn_response")]
 #[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", false ; "turn_fallback")]
-#[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", true ; "permission_tool")]
-#[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", true ; "permission_fallback")]
-#[test_case(Notification::AuthenticationRequired, "Authentication required", true ; "authentication")]
-#[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
-#[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
-#[test_case(Notification::PackReview, "Package changes to review", true ; "pack_review")]
+#[test_case(Notification::Attention(Attention::Permission { tool: Some("bash".into()) }), "Permission requested: bash", true ; "permission_tool")]
+#[test_case(Notification::Attention(Attention::Permission { tool: None }), "Permission requested", true ; "permission_fallback")]
+#[test_case(Notification::Attention(Attention::Authentication), "Authentication required", true ; "authentication")]
+#[test_case(Notification::Attention(Attention::Question), "Question requested", true ; "question")]
+#[test_case(Notification::Attention(Attention::PlanReady), "Plan ready", true ; "plan")]
+#[test_case(Notification::Attention(Attention::PackReview), "Package changes to review", true ; "pack_review")]
 #[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
 fn notification_message_and_urgency(
     notification: Notification,
@@ -11359,7 +11367,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
     );
     assert_eq!(
         app.attention(),
-        Some(Notification::PermissionRequested {
+        Some(Attention::Permission {
             tool: Some("bash".into())
         })
     );
@@ -11373,17 +11381,14 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         ProjectAnswers::Saved,
         None,
     );
-    assert_eq!(
-        app.attention(),
-        Some(Notification::PermissionRequested { tool: None })
-    );
+    assert_eq!(app.attention(), Some(Attention::Permission { tool: None }));
 }
 
 #[test]
 fn attention_classifies_auth_and_ready_plan() {
     let mut app = test_app();
     app.chats[MAIN_CHAT].auth_parked = true;
-    assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
+    assert_eq!(app.attention(), Some(Attention::Authentication));
 
     app.chats[MAIN_CHAT].auth_parked = false;
     app.state.mode = Mode::Plan;
@@ -11392,7 +11397,7 @@ fn attention_classifies_auth_and_ready_plan() {
     app.status = Status::Streaming;
     assert_eq!(app.attention(), None);
     app.status = Status::Idle;
-    assert_eq!(app.attention(), Some(Notification::PlanReady));
+    assert_eq!(app.attention(), Some(Attention::PlanReady));
 
     app.plan_form.hide();
     assert_eq!(app.attention(), None);
@@ -11424,7 +11429,7 @@ fn plan_form_on_a_subtask_leaves_keys_alone_but_still_wants_attention() {
     let parallel = app.plan_form.parallel();
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     assert_eq!(app.plan_form.parallel(), parallel);
-    assert_eq!(app.attention(), Some(Notification::PlanReady));
+    assert_eq!(app.attention(), Some(Attention::PlanReady));
 }
 
 fn tool_use_msg(id: &str) -> Message {
