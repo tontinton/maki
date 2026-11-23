@@ -48,6 +48,9 @@ const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
 const LOSSY_TEXT: &str = "caf\u{fffd}";
 const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
 const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const HTML_TYPE: &str = "text/html; charset=utf-8";
+const PAGE_BODY: &str = "body";
+const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
 const LATIN1_E_ACUTE: u8 = 0xe9;
 const BINARY_TYPE: &str = "application/pdf";
 const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
@@ -526,6 +529,15 @@ fn webfetch_decodes_legacy_bytes_for_display(
         output.as_deref().map(str::trim).map_err(String::as_str),
         expected
     );
+}
+
+#[test]
+fn webfetch_markdown_drops_scripts_and_styles() {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(HTML_TYPE, SCRIPTED_PAGE);
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.trim(), PAGE_BODY);
 }
 
 #[test_case::test_case("text" ; "stripped_html")]
