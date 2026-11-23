@@ -395,6 +395,15 @@ mod tests {
         )
     }
 
+    /// No published per-token price, so the row states none, and the model is
+    /// neither free nor metered until models.dev prices it.
+    #[test]
+    fn unpriced_row_is_unknown_rather_than_free() {
+        let model = Model::from_spec("zai/glm-5.4").unwrap();
+        assert!(model.pricing.is_zero());
+        assert_eq!(model.free(), None);
+    }
+
     /// Both plans share these, so each must be callable by a pay-as-you-go
     /// key: the coding-plan-only glm-5.4 is none of them.
     #[test_case(ModelTier::Strong, "zai/glm-5.3" ; "strong_default")]

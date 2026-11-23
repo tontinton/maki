@@ -351,8 +351,8 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 
 /// Whether a curated row names *this* model rather than merely sharing a prefix
 /// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
-/// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
-/// has never been checked against.
+/// their base row, which also means an uncurated `glm-5.5` rides whichever
+/// `glm-` row the provider tabulated as its fallback.
 fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
     entry.prefixes.iter().any(|prefix| {
         model_id
