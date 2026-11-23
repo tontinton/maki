@@ -633,8 +633,14 @@ impl Provider for CompatProvider {
                 if !resolved.is_empty() {
                     auth.base_url = Some(resolved);
                 }
-                let mut body =
-                    responses::build_body(model, messages, system, tools, self.replay_reasoning);
+                let mut body = responses::build_body(
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    self.replay_reasoning,
+                    responses::SystemChannel::Instructions,
+                );
                 if let Some(thinking) = &self.openai.thinking {
                     thinking.apply_responses(&mut body, &ctx);
                 }

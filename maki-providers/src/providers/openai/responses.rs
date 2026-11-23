@@ -25,23 +25,54 @@ use crate::{
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
 
+pub(crate) enum SystemChannel {
+    Instructions,
+    DeveloperMessage,
+}
+
+/// GPT-6.2 and later append top-level `instructions` after `input` and bill
+/// them at the uncached rate on every request, so a stable system prompt
+/// belongs in a leading `developer` message instead, where the prefix cache
+/// picks it up from the second step on (see the "Using GPT-6.2" guide and
+/// opencode PR anomalyco/opencode#64542 for the measurements).
 pub(crate) fn build_body(
     model: &Model,
     messages: &[Message],
     system: &str,
     tools: &Value,
     replay_reasoning: bool,
+    system_channel: SystemChannel,
 ) -> Value {
-    let input = convert_input(messages, replay_reasoning);
+    let mut input = convert_input(messages, replay_reasoning);
+    let send_instructions = match system_channel {
+        SystemChannel::Instructions => true,
+        SystemChannel::DeveloperMessage => {
+            if !system.is_empty()
+                && let Value::Array(items) = &mut input
+            {
+                items.insert(
+                    0,
+                    json!({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": system}]
+                    }),
+                );
+            }
+            false
+        }
+    };
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
         "model": model.id,
-        "instructions": system,
         "input": input,
         "stream": true,
         "store": false,
     });
+    if send_instructions {
+        body["instructions"] = json!(system);
+    }
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
@@ -589,6 +620,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_body_leads_the_input_with_the_system_developer_message() {
+        let model = Model::from_spec(GPT_SPEC).unwrap();
+        let messages = vec![Message::user(USER_PROMPT.to_string())];
+        let body = build_body(
+            &model,
+            &messages,
+            SYSTEM_PROMPT,
+            &json!([]),
+            false,
+            SystemChannel::DeveloperMessage,
+        );
+
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]
+            })
+        );
+        assert_eq!(body["input"][1]["role"], "user");
+        assert!(body.get("instructions").is_none());
+    }
+
+    #[test]
+    fn build_body_keeps_the_instructions_wire_for_unswitched_backends() {
+        let model = Model::from_spec(GPT_SPEC).unwrap();
+        let messages = vec![Message::user(USER_PROMPT.to_string())];
+        let body = build_body(
+            &model,
+            &messages,
+            SYSTEM_PROMPT,
+            &json!([]),
+            false,
+            SystemChannel::Instructions,
+        );
+
+        assert_eq!(body["instructions"], json!(SYSTEM_PROMPT));
+        assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn build_body_skips_the_developer_message_without_a_system_prompt() {
+        let model = Model::from_spec(GPT_SPEC).unwrap();
+        let messages = vec![Message::user(USER_PROMPT.to_string())];
+        let body = build_body(
+            &model,
+            &messages,
+            "",
+            &json!([]),
+            false,
+            SystemChannel::DeveloperMessage,
+        );
+
+        assert_eq!(body["input"][0]["role"], "user");
+        assert!(body.get("instructions").is_none());
+    }
+
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, mut rx) = unbounded_channel();
         let result = parse_sse(sse_body(sse.as_bytes()), &tx).await;
@@ -597,6 +687,10 @@ mod tests {
 
     const COPILOT_NANO_AIU: u64 = 375_000;
     const COPILOT_USD: f64 = 0.00000375;
+
+    const GPT_SPEC: &str = "openai/gpt-5.5";
+    const SYSTEM_PROMPT: &str = "You are maki, an interactive CLI coding agent.";
+    const USER_PROMPT: &str = "hello";
 
     #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "completed")]
     #[test_case("response.incomplete", "incomplete", StopReason::MaxTokens, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "incomplete")]
