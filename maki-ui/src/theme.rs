@@ -300,6 +300,11 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
     load_from(user_themes_dir().as_deref(), name)
 }
 
+/// Keeps the current theme when {name} does not load.
+pub fn switch_to(name: &str) -> Result<(), String> {
+    load_by_name(name).map(set)
+}
+
 fn load_from(user_dir: Option<&Path>, name: &str) -> Result<Theme, String> {
     let theme = if let Some(path) = user_dir.map(|dir| dir.join(format!("{name}.toml")))
         && path.is_file()
@@ -361,7 +366,7 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
-    current().name.clone()
+    current().name().to_owned()
 }
 
 /// One list of names feeds both the span lookup and what Lua sees, so a name a
@@ -995,6 +1000,10 @@ impl Theme {
             .or_else(|| load_from(user_dir, DEFAULT_THEME).ok())
             .unwrap_or_else(|| load_from(None, DEFAULT_THEME).expect(BUNDLED_DEFAULT_THEME_LOADS))
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
@@ -1265,9 +1274,19 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
     #[test]
     fn current_theme_name_follows_the_set_theme() {
         for name in [DEFAULT_THEME, ZENBURN] {
-            set(load_by_name(name).expect(name));
+            switch_to(name).expect(name);
             assert_eq!(current_theme_name(), name);
+            assert_eq!(maki_highlight::ui_theme_name().as_deref(), Some(name));
         }
+    }
+
+    #[test]
+    fn switch_to_an_unknown_theme_keeps_the_current_one() {
+        switch_to(ZENBURN).expect(ZENBURN);
+        let before = generation();
+        assert!(switch_to(UNKNOWN_THEME).is_err());
+        assert_eq!(current_theme_name(), ZENBURN);
+        assert_eq!(generation(), before);
     }
 
     #[test_case(BROKEN_TOML, None, DEFAULT_THEME, DEFAULT_BG ; "nothing_saved")]

@@ -87,6 +87,7 @@ return {
   ["maki.ui.input_decorate"] = true,
   ["maki.ui.input_edit"] = true,
   ["maki.ui.input_submit"] = true,
+  ["maki.ui.set_theme"] = true,
   ["maki.version.cmp"] = true,
   ["maki.version.eq"] = true,
   ["maki.version.ge"] = true,

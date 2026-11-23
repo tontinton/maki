@@ -22,7 +22,7 @@ use crate::api::util::command::{
     ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 use crate::plugin_permissions::{PluginReach, SENDS_PROMPT, require};
@@ -314,6 +314,20 @@ fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
             store.create_live()
         }
     })
+}
+
+/// Returns the name of the current theme, the one `maki.ui.set_theme` or
+/// `/theme` last switched to.
+///
+/// @return (string|nil) The theme name. Nil until the UI has applied a theme,
+///   so while plugins load at startup and without a UI.
+/// @example
+/// if maki.ui.get_theme() == "catppuccin_latte" then
+///   maki.ui.flash("light theme")
+/// end
+#[lua_fn]
+fn get_theme(_lua: &Lua) -> LuaResult<Option<String>> {
+    Ok(maki_highlight::ui_theme_name())
 }
 
 /// Looks up a color the syntax theme names, such as "background",
@@ -770,6 +784,34 @@ fn status_segment(lua: &Lua, #[ctx] plugin: Arc<str>, opts: Option<Table>) -> Lu
     }
     publish_hint_snapshot(lua);
     Ok(())
+}
+
+/// Switches the UI to the theme named {name}, one of the names `/theme`
+/// lists. Unlike picking it in `/theme`, the switch is not saved, so the next
+/// start uses `ui.theme` or the theme last picked there.
+///
+/// It waits for the UI to switch, so while your plugin loads it returns `nil`
+/// and an error.
+///
+/// @param name string Theme name, e.g. `"dracula"`.
+/// @return (boolean|nil, string|nil) `true`, or nil and an error when the theme does not load or there is no UI.
+/// @example
+/// maki.keymap.set("n", "<M-t>", function()
+///   local light = maki.ui.get_theme() == "catppuccin_latte"
+///   maki.ui.set_theme(light and "catppuccin_mocha" or "catppuccin_latte")
+/// end)
+#[lua_fn]
+async fn set_theme(
+    _lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    name: String,
+) -> LuaResult<Pair<bool>> {
+    let reply = ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::SetTheme {
+        name,
+        reply_tx,
+    })
+    .await;
+    Ok(pair(try_pair!(reply).map(|()| true)))
 }
 
 /// Runs a built-in or plugin action by name, and returns whether it handled
@@ -1497,8 +1539,9 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
-    ///   on a built-in name return `nil, "no interactive UI attached"`.
+    /// - `input`, `input_edit`, `input_decorate`, `input_submit`, `set_theme`,
+    ///   and `action` on a built-in name return
+    ///   `nil, "no interactive UI attached"`.
     ///   Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
@@ -1653,9 +1696,9 @@ lua_table! {
     /// draft across chat switches, go away when the plugin unloads, and are
     /// not saved.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
+        buf, get_theme, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual set_mode, manual set_cursor_shape, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual set_cursor_shape, manual set_theme, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_rules, manual input_decorate,
         manual input_edit, manual input_submit, manual chat_item, manual status_segment,
     ]
@@ -1676,6 +1719,7 @@ pub(crate) fn create_ui_table(
     set_cursor_shape__register(&t, lua, Arc::clone(&plugin))?;
     chat_item__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     status_segment__register(&t, lua, Arc::clone(&plugin))?;
+    set_theme__register(&t, lua, ui_action_tx.clone())?;
     action__register(
         &t,
         lua,
@@ -1909,6 +1953,9 @@ mod tests {
 
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
+    const KNOWN_THEME: &str = "zenburn";
+    const UNKNOWN_THEME: &str = "no_such_theme";
+    const UNKNOWN_THEME_ERR: &str = "theme not found";
 
     fn footer_entry(lua: &Lua, key: &str, label: &str) -> Table {
         let t = lua.create_table().unwrap();
@@ -3066,6 +3113,7 @@ mod tests {
 
     #[test_case(r#"ui.input_decorate({ ns = "a", marks = {}, version = 0, session_id = "s" })"# ; "input_decorate")]
     #[test_case(r#"ui.input_submit({ version = 0, session_id = "s" })"# ; "input_submit")]
+    #[test_case(r#"ui.set_theme("dracula")"# ; "set_theme")]
     #[tokio::test]
     async fn without_a_ui_answers_the_error_slot(call: &str) {
         let lua = lua_with_ui(None);
@@ -3196,6 +3244,34 @@ mod tests {
         let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\"")).await;
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
+    }
+
+    /// Stands in for the UI, which loads only {KNOWN_THEME}.
+    fn ui_with_themes() -> Lua {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        std::thread::spawn(move || {
+            while let Some(UiAction::SetTheme { name, reply_tx }) = rx.blocking_recv() {
+                let loaded = (name == KNOWN_THEME)
+                    .then_some(())
+                    .ok_or_else(|| UNKNOWN_THEME_ERR.to_owned());
+                let _ = reply_tx.send(loaded);
+            }
+        });
+        lua_with_ui(Some(tx))
+    }
+
+    #[test_case(KNOWN_THEME, serde_json::json!(true), None ; "known_theme")]
+    #[test_case(UNKNOWN_THEME, serde_json::Value::Null, Some(UNKNOWN_THEME_ERR) ; "unknown_theme")]
+    #[tokio::test]
+    async fn set_theme_answers_what_the_ui_did(
+        name: &str,
+        expected: serde_json::Value,
+        expected_err: Option<&str>,
+    ) {
+        let lua = ui_with_themes();
+        let (val, err) = eval(&lua, &format!("return ui.set_theme('{name}')")).await;
+        assert_eq!(val, expected);
+        assert_eq!(err.as_deref(), expected_err);
     }
 
     /// An action is priced like the API doing the same thing, so binding a

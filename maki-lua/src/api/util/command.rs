@@ -858,6 +858,11 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u32,
     },
+    /// `Err` says why the theme did not load.
+    SetTheme {
+        name: String,
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
     /// `reply_tx` answers whether the action did anything, which is what lets
     /// a key handler try one action and fall back to another.
     Builtin {
