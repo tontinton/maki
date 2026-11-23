@@ -499,7 +499,7 @@ mod tests {
             !specs.iter().any(|s| s.starts_with("opencode/")),
             "builtin slug must be skipped in custom listing: {specs:?}"
         );
-        assert!(specs.contains(&"my-custom/real-model".to_string()));
+        assert!(specs.iter().any(|spec| spec == "my-custom/real-model"));
 
         // Resolution owns the builtin slug regardless of the providers.toml entry.
         let model = Model::from_spec("opencode/shadow-model").unwrap();
