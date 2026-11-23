@@ -10,7 +10,7 @@ use maki_agent::tools::{
 };
 use maki_agent::{AgentEvent, AgentSeed, TaskLabel, ToolPart};
 use maki_config::{AgentConfig, ToolOutputLines};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::SessionRef;
 use mlua::{
     AnyUserData, Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods,
     Value as LuaValue,
@@ -254,8 +254,8 @@ impl LuaCtx {
         }
     }
 
-    pub(crate) fn session(&self) -> Option<MakiId> {
-        self.session_id.as_ref().map(SessionRef::id)
+    pub(crate) fn session(&self) -> Option<SessionRef> {
+        self.session_id.clone()
     }
 
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.

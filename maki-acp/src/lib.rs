@@ -18,6 +18,7 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::{AgentConfig, CancelToken, HostPrompt, SessionEndReason};
 use maki_config::project::TrustMode;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig};
+use maki_lua::headless::HeadlessHost;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -46,6 +47,9 @@ pub struct ProjectStack {
     /// exits. The hook answers with a future so its wait rides the executor
     /// instead of holding stdin for the whole `SessionEnd` grace period.
     pub on_session_end: Option<SessionEndHook>,
+    /// What `maki.session` answers from for each open session. Tests leave
+    /// it disconnected.
+    pub plugins: HeadlessHost,
 }
 
 pub struct AcpParams {
