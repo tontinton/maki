@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{Cursor, IsTerminal, stdout};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,16 +9,13 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use maki_highlight::pool::{Job, job_thread};
 use maki_providers::ImageSource;
 use ratatui::layout::Size;
-use ratatui_image::{
-    FontSize,
-    picker::{Picker, ProtocolType},
-    sliced::SlicedProtocol,
-};
+use ratatui_image::{FontSize, picker::Picker, sliced::SlicedProtocol};
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::oneshot::{self, Receiver};
 
 use crate::image::{MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
 use crate::repaint::Dirty;
+use crate::terminal;
 
 const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
@@ -40,10 +36,10 @@ pub(crate) fn generation() -> u64 {
 }
 
 pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
-    if !stdout().is_terminal() {
+    if !inline_images || !stdout().is_terminal() {
         return None;
     }
-    let protocol = protocol_from_env(inline_images, |key| env::var(key).ok())?;
+    let protocol = terminal::caps().image_protocol?;
     let font = crossterm::terminal::window_size()
         .ok()
         .filter(|size| size.columns > 0 && size.rows > 0)
@@ -54,35 +50,6 @@ pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
     let mut picker = Picker::from_fontsize(font);
     picker.set_protocol_type(protocol);
     Some(picker)
-}
-
-/// An allowlist rather than trusting what the terminal advertises: one that
-/// claims graphics it does not have paints escape bytes all over the UI. When
-/// the guess is wrong anyway, `ui.inline_images = false` is the way out. An
-/// unrecognized `TERM_PROGRAM` (tmux and some shell configs set it) falls
-/// through to `TERM`, which kitty sets itself and forwards over ssh.
-fn protocol_from_env(
-    inline_images: bool,
-    get: impl Fn(&str) -> Option<String>,
-) -> Option<ProtocolType> {
-    if !inline_images {
-        return None;
-    }
-    if ["TMUX", "STY", "ZELLIJ"]
-        .iter()
-        .any(|key| get(key).is_some())
-    {
-        return None;
-    }
-    match get("TERM_PROGRAM").as_deref() {
-        Some("ghostty" | "kitty") => return Some(ProtocolType::Kitty),
-        Some("iTerm.app" | "WezTerm") => return Some(ProtocolType::Iterm2),
-        _ => {}
-    }
-    match get("TERM").as_deref() {
-        Some("xterm-kitty" | "xterm-ghostty") => Some(ProtocolType::Kitty),
-        _ => None,
-    }
 }
 
 enum ImageState {
@@ -258,7 +225,7 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::oneshot;
 
-    use super::{ImageState, InlineImage, encode, protocol_from_env};
+    use super::{ImageState, InlineImage, encode};
     use crate::repaint::Dirty;
 
     const EXPECTED_IDLE: &str = "nothing to encode with, so the image must stay idle";
@@ -267,35 +234,6 @@ mod tests {
     const MALFORMED_IMAGE: &[u8] = b"not an image";
     const IMAGE_WIDTH: u16 = 4;
     const IMAGE_HEIGHT: u16 = 6;
-    const TERM_PROGRAM: &str = "TERM_PROGRAM";
-    const TERM: &str = "TERM";
-    const KITTY_PROGRAM: &str = "kitty";
-    const KITTY_TERM: &str = "xterm-kitty";
-    const UNKNOWN_PROGRAM: &str = "unknown";
-
-    fn protocol(inline_images: bool, env: &[(&str, &str)]) -> Option<ProtocolType> {
-        protocol_from_env(inline_images, |key| {
-            env.iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| (*value).into())
-        })
-    }
-
-    #[test_case(&[(TERM_PROGRAM, "iTerm.app")], Some(ProtocolType::Iterm2); "known_terminal")]
-    #[test_case(&[(TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "known_term")]
-    #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "unsupported_program_falls_back_to_term")]
-    #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, "xterm-256color")], None; "unsupported_program_and_term")]
-    #[test_case(&[], None; "missing_env")]
-    #[test_case(&[(TERM_PROGRAM, KITTY_PROGRAM), ("TMUX", "mux")], None; "multiplexer")]
-    fn protocol_env_uses_safe_fallback(env: &[(&str, &str)], expected: Option<ProtocolType>) {
-        assert_eq!(protocol(true, env), expected);
-    }
-
-    #[test_case(&[(TERM_PROGRAM, KITTY_PROGRAM)]; "term_program")]
-    #[test_case(&[(TERM, KITTY_TERM)]; "term")]
-    fn disabled_inline_images_yields_no_protocol(env: &[(&str, &str)]) {
-        assert_eq!(protocol(false, env), None);
-    }
 
     #[test_case(false; "valid_png")]
     #[test_case(true; "malformed_image")]
