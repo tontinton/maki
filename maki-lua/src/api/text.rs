@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 
+use htmd::HtmlToMarkdown;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -23,19 +24,34 @@ thread_local! {
 /// Invalid UTF-8 becomes U+FFFD.
 ///
 /// @param html string HTML source text.
+/// @param opts table? `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
 /// @return (string?, string?) Markdown text on success, or nil plus an error message.
 /// @example
 /// local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
+///
+/// local article = maki.text.html_to_markdown(page, { skip_tags = { "script", "style", "nav" } })
 #[lua_fn]
-async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
+async fn html_to_markdown(
+    _lua: Lua,
+    html: LuaString,
+    opts: Option<Table>,
+) -> LuaResult<Pair<String>> {
     let html = html.to_string_lossy();
+    let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
     Ok(pair(
-        spawn_blocking(move || htmd::convert(&html))
-            .await
-            .map_err(mlua::Error::external)?
-            .map_err(|e| format!("html_to_markdown: {e}")),
+        spawn_blocking(move || {
+            let mut builder = HtmlToMarkdown::builder();
+            // htmd asserts on an empty tag list.
+            if !skip_tags.is_empty() {
+                builder = builder.skip_tags(skip_tags.iter().map(String::as_str).collect());
+            }
+            builder.build().convert(&html)
+        })
+        .await
+        .map_err(mlua::Error::external)?
+        .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }
 
@@ -249,6 +265,8 @@ mod tests {
     const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
     const LATIN1_TEXT: &[u8] = b"caf\xe9 cr\xe8me";
     const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
+    const PAGE_BODY: &str = "body";
+    const CHROME_PAGE: &[u8] = br#"<nav><a href="/">Home</a></nav><script type="application/json">{"menu":1}</script><p>body</p>"#;
 
     fn best(needle: &str) -> Option<&'static str> {
         let pattern = compile(needle);
@@ -312,19 +330,38 @@ mod tests {
         lua
     }
 
+    async fn to_markdown(html: &[u8], skip_tags: Option<&[&str]>) -> String {
+        let lua = lua_with_text();
+        let text: Table = lua.globals().get("text").unwrap();
+        let convert: Function = text.get("html_to_markdown").unwrap();
+        let opts = skip_tags.map(|tags| {
+            lua.create_table_from([("skip_tags", tags.to_vec())])
+                .unwrap()
+        });
+        let (markdown, error): (String, Option<String>) = convert
+            .call_async((lua.create_string(html).unwrap(), opts))
+            .await
+            .unwrap();
+        assert_eq!(error, None);
+        markdown.trim().to_owned()
+    }
+
     #[test_case(b"<h1>hello</h1>", "# hello" ; "utf8")]
     #[test_case(LATIN1_HTML, LOSSY_MARKDOWN ; "non_utf8")]
     #[tokio::test]
     async fn html_bytes_are_decoded_at_the_text_boundary(input: &[u8], expected: &str) {
-        let lua = lua_with_text();
-        let text: Table = lua.globals().get("text").unwrap();
-        let convert: Function = text.get("html_to_markdown").unwrap();
-        let (markdown, error): (String, Option<String>) = convert
-            .call_async(lua.create_string(input).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(error, None);
-        assert_eq!(markdown.trim(), expected);
+        assert_eq!(to_markdown(input, None).await, expected);
+    }
+
+    #[test_case(CHROME_PAGE, &["script", "nav"], PAGE_BODY ; "listed_tags")]
+    #[test_case(PAGE_BODY.as_bytes(), &[], PAGE_BODY ; "empty_list")]
+    #[tokio::test]
+    async fn skip_tags_drop_elements_with_their_content(
+        input: &[u8],
+        skip_tags: &[&str],
+        expected: &str,
+    ) {
+        assert_eq!(to_markdown(input, Some(skip_tags)).await, expected);
     }
 
     #[test_case(b"caf\xc3\xa9", "caf\u{e9}" ; "valid_utf8_is_unchanged")]

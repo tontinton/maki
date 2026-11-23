@@ -6210,7 +6210,7 @@ local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ### `maki.text.html_to_markdown()` {#maki-text-html_to_markdown}
 
 ```lua
-maki.text.html_to_markdown({html})
+maki.text.html_to_markdown({html}, {opts?})
 ```
 
 Convert an HTML string to Markdown.
@@ -6220,6 +6220,7 @@ Invalid UTF-8 becomes U+FFFD.
 **Parameters:**
 
 - `{html}` (`string`) HTML source text.
+- `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
 
 **Returns:** (`string?`, `string?`) Markdown text on success, or nil plus an error message.
 
@@ -6229,6 +6230,8 @@ Invalid UTF-8 becomes U+FFFD.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+
+local article = maki.text.html_to_markdown(page, { skip_tags = { "script", "style", "nav" } })
 ```
 
 ---

@@ -177,7 +177,7 @@ declare maki: {
     messages: @checked (ctx: any, id: string, opts: any) -> (any, string?),
   },
   text: {
-    html_to_markdown: @checked (html: string) -> (string?, string?),
+    html_to_markdown: @checked (html: string, opts: any) -> (string?, string?),
     to_utf8: @checked (s: string) -> (string),
     fuzzy: @checked (needle: string, haystack: string, opts: any) -> (number?, any),
     fuzzy_list: @checked (needle: string, haystacks: any, opts: any) -> (any),
