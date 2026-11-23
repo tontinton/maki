@@ -577,13 +577,16 @@ impl BackgroundTasks {
 
     /// Sends the model the result of {part} of moved call `id` now, while the
     /// rest keeps running. It is worded like the final reply of a call that
-    /// moved alone, so the transcript reads the same either way. Says `false`
-    /// once the call stopped or has its final reply, because that reply will
-    /// carry the part and explain the stop. Also `false` when nothing waits
-    /// on `id` any more.
+    /// moved alone, so the transcript reads the same either way. A part that
+    /// ran as subagent `task` is named by that id, the one the receipt gave
+    /// it, so the model can tell which of its tasks ended. Says `false` once
+    /// the call stopped or has its final reply, because that reply will carry
+    /// the part and explain the stop. Also `false` when nothing waits on `id`
+    /// any more.
     pub(crate) fn report_part(
         &self,
         id: &str,
+        task: Option<&str>,
         part: &TaskLabel,
         failed: bool,
         output: &str,
@@ -597,7 +600,8 @@ impl BackgroundTasks {
         else {
             return false;
         };
-        let (text, display, end) = result_notice(part, id, failed, false, output);
+        let named = task.unwrap_or(id);
+        let (text, display, end) = result_notice(part, named, failed, false, output);
         mailbox.report_part(
             id,
             BackgroundNotice {

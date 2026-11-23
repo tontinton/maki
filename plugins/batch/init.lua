@@ -716,6 +716,7 @@ function Batch:report_finished()
       c.reported = self.ctx:report_part({
         tool = c.tool,
         name = header_text(c),
+        task = c.task_id,
         output = c.output,
         is_error = c.status == STATUS.ERROR,
         format = c.format,

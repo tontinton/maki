@@ -9,7 +9,8 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use common::{
-    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, request_move,
+    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, poll_until,
+    request_move,
 };
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
@@ -681,6 +682,17 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
         (format!("{NESTED_STOPPED}{CALL_ID}."), false)
     );
     assert_refused(&host, chat.id, second);
+    let notices = poll_until("the stopped subagent never reported", || {
+        Some(chat.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
+    });
+    let [notice] = &notices[..] else {
+        panic!("one part notice: {notices:?}");
+    };
+    let notice = notice.first_text_content().unwrap();
+    assert!(
+        notice.contains(second) && !notice.contains(CALL_ID),
+        "the part is named by the id the receipt gave it: {notice}"
+    );
     assert_eq!(
         message(&host, chat.id, first, false),
         (QUEUED.to_owned(), false)
