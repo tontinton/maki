@@ -93,7 +93,7 @@ declare maki: {
     rm: @checked (path: string, opts: any) -> (true?, string?),
     mkdir: @checked (path: string, opts: any) -> (true?, string?),
     glob: @checked (pattern: any, opts: any) -> (any, string?),
-    grep: @checked (pattern: string, opts: any) -> (any, string?),
+    grep: @checked (pattern: string, opts: any) -> (any, string?, any),
     fuzzy_files: @checked (opts: any) -> (any, string?),
   },
   image: {

@@ -44,9 +44,24 @@ impl GrepParams {
     }
 }
 
+/// What `limit` cut. `files` counts every file that lost a group, including
+/// one that still shows some.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Omitted {
+    pub groups: usize,
+    pub files: usize,
+}
+
+#[derive(Debug)]
+pub struct GrepResults {
+    pub base: PathBuf,
+    /// Paths are relative to `base`.
+    pub entries: Vec<GrepFileEntry>,
+    pub omitted: Option<Omitted>,
+}
+
 /// Core grep logic. Blocking — caller must run on a thread pool.
-/// Returns `(base_path, entries)` where entries have paths relative to base.
-pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), String> {
+pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
     let search_path = resolve_search_path(params.path.as_deref())?;
     let is_multiline = needs_multiline(&params.pattern);
     debug!(
@@ -132,10 +147,6 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
 
     let mut entries = results.into_inner().unwrap_or_else(PoisonError::into_inner);
 
-    if entries.is_empty() {
-        return Ok((base.to_path_buf(), entries));
-    }
-
     entries.sort_by_cached_key(|e| {
         (
             std::cmp::Reverse(mtime(&base.join(&e.path))),
@@ -143,15 +154,27 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         )
     });
 
-    let mut total_groups = 0;
+    let mut kept = 0;
+    let mut omitted = Omitted {
+        groups: 0,
+        files: 0,
+    };
     for entry in &mut entries {
-        let remaining = params.limit.saturating_sub(total_groups);
-        entry.groups.truncate(remaining);
-        total_groups += entry.groups.len();
+        let keep = entry.groups.len().min(params.limit.saturating_sub(kept));
+        if keep < entry.groups.len() {
+            omitted.groups += entry.groups.len() - keep;
+            omitted.files += 1;
+        }
+        entry.groups.truncate(keep);
+        kept += keep;
     }
     entries.retain(|e| !e.groups.is_empty());
 
-    Ok((base.to_path_buf(), entries))
+    Ok(GrepResults {
+        base: base.to_path_buf(),
+        entries,
+        omitted: (omitted.groups > 0).then_some(omitted),
+    })
 }
 
 struct GrepSink<'a> {
