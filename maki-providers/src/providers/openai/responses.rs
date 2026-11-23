@@ -44,35 +44,40 @@ pub(crate) fn build_body(
     system_channel: SystemChannel,
 ) -> Value {
     let mut input = convert_input(messages, replay_reasoning);
-    let send_instructions = match system_channel {
-        SystemChannel::Instructions => true,
-        SystemChannel::DeveloperMessage => {
-            if !system.is_empty()
-                && let Value::Array(items) = &mut input
-            {
-                items.insert(
-                    0,
-                    json!({
-                        "type": "message",
-                        "role": "developer",
-                        "content": [{"type": "input_text", "text": system}]
-                    }),
-                );
-            }
-            false
-        }
-    };
+    if matches!(system_channel, SystemChannel::DeveloperMessage)
+        && !system.is_empty()
+        && let Value::Array(items) = &mut input
+    {
+        items.insert(
+            0,
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system}]
+            }),
+        );
+    }
     let wire_tools = convert_tools(tools);
 
-    let mut body = json!({
-        "model": model.id,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
-    if send_instructions {
-        body["instructions"] = json!(system);
-    }
+    // agent-client-protocol-schema turns on serde_json's preserve_order in the
+    // maki binary, so the instructions arm repeats the fields to serialize
+    // exactly like the pre-channel wire: xAI, compat and local backends keep
+    // receiving byte-identical bodies.
+    let mut body = match system_channel {
+        SystemChannel::Instructions => json!({
+            "model": model.id,
+            "instructions": system,
+            "input": input,
+            "stream": true,
+            "store": false,
+        }),
+        SystemChannel::DeveloperMessage => json!({
+            "model": model.id,
+            "input": input,
+            "stream": true,
+            "store": false,
+        }),
+    };
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
@@ -620,63 +625,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_body_leads_the_input_with_the_system_developer_message() {
+    #[test_case(SystemChannel::DeveloperMessage, SYSTEM_PROMPT, None, "developer", SYSTEM_PROMPT, 2 ; "developer_message_leads_the_input")]
+    #[test_case(SystemChannel::Instructions, SYSTEM_PROMPT, Some(SYSTEM_PROMPT), "user", USER_PROMPT, 1 ; "instructions_wire_keeps_system_out_of_input")]
+    #[test_case(SystemChannel::DeveloperMessage, "", None, "user", USER_PROMPT, 1 ; "empty_system_skips_the_developer_message")]
+    fn build_body_routes_the_system_prompt_by_channel(
+        channel: SystemChannel,
+        system: &str,
+        expected_instructions: Option<&str>,
+        expected_first_role: &str,
+        expected_first_text: &str,
+        expected_input_len: usize,
+    ) {
         let model = Model::from_spec(GPT_SPEC).unwrap();
         let messages = vec![Message::user(USER_PROMPT.to_string())];
-        let body = build_body(
-            &model,
-            &messages,
-            SYSTEM_PROMPT,
-            &json!([]),
-            false,
-            SystemChannel::DeveloperMessage,
-        );
+        let body = build_body(&model, &messages, system, &json!([]), false, channel);
 
         assert_eq!(
             body["input"][0],
             json!({
                 "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]
+                "role": expected_first_role,
+                "content": [{"type": "input_text", "text": expected_first_text}]
             })
         );
-        assert_eq!(body["input"][1]["role"], "user");
-        assert!(body.get("instructions").is_none());
-    }
-
-    #[test]
-    fn build_body_keeps_the_instructions_wire_for_unswitched_backends() {
-        let model = Model::from_spec(GPT_SPEC).unwrap();
-        let messages = vec![Message::user(USER_PROMPT.to_string())];
-        let body = build_body(
-            &model,
-            &messages,
-            SYSTEM_PROMPT,
-            &json!([]),
-            false,
-            SystemChannel::Instructions,
+        assert_eq!(
+            body.get("instructions").and_then(Value::as_str),
+            expected_instructions
         );
-
-        assert_eq!(body["instructions"], json!(SYSTEM_PROMPT));
-        assert_eq!(body["input"][0]["role"], "user");
-    }
-
-    #[test]
-    fn build_body_skips_the_developer_message_without_a_system_prompt() {
-        let model = Model::from_spec(GPT_SPEC).unwrap();
-        let messages = vec![Message::user(USER_PROMPT.to_string())];
-        let body = build_body(
-            &model,
-            &messages,
-            "",
-            &json!([]),
-            false,
-            SystemChannel::DeveloperMessage,
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), expected_input_len);
+        assert_eq!(
+            input.last().unwrap()["content"][0]["text"],
+            json!(USER_PROMPT)
         );
-
-        assert_eq!(body["input"][0]["role"], "user");
-        assert!(body.get("instructions").is_none());
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
