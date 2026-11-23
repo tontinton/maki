@@ -103,9 +103,9 @@ local function cmd_read(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local content, err = maki.fs.read(file_path)
+  local content, read_err = maki.fs.read(file_path)
   if not content then
-    return nil, "read error: " .. err
+    return nil, "read error: " .. read_err
   end
   local formatted =
     helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
