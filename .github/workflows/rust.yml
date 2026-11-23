@@ -121,9 +121,11 @@ jobs:
       - name: Type check
         run: cd plugins && ../lute check $(find . -name '*.lua')
       # The lint parser rejects the `declare` syntax of `maki.d.luau`, so it gets the file list, not the dir.
+      # `--sequential`: the default parallel mode (one `vm.create` worker per core) races in lute's
+      # cross-VM runtime and crashes ~10% of runs (SIGSEGV, or "Cannot resume a non-thread reference").
       - name: Lint
         if: ${{ !cancelled() }}
-        run: cd plugins && ../lute lint $(find . -name '*.lua')
+        run: cd plugins && ../lute lint --sequential $(find . -name '*.lua')
       # Luau's built-in lints until `lute lint` has them (luau-lang/lute#728). luau-analyze can't load
       # `maki.d.luau`, so its type errors are left to `lute check`, and it exits 0 on findings.
       - name: Analyzer lints
