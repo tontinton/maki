@@ -4589,19 +4589,31 @@ maki.model.info({spec})
 ```
 
 Resolve a model spec to everything maki knows about it: identity, tier,
-context window, and the price table the session would be billed by --
+limits, capabilities, and the price table the session would be billed by --
 including rates resolved from provider config or the bundled catalog
 (e.g. subsidised custom providers), which the provider's own /v1/models
-endpoint may never report. Purely local -- no UI round-trip, no network
--- so it also works from slash commands and headless embeddings.
+endpoint may never report. The provider's own adjustments apply, as they do
+for a session. Purely local -- no UI round-trip, no network -- so it also
+works from slash commands and headless embeddings.
 
 **Parameters:**
 
 - `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
-  tier, subsidised_by?, context_window, max_output_tokens?, free?,
-  pricing?}`, or nil and an error.
+  tier, family, subsidised_by?, context_window, max_output_tokens?, free?,
+  supports_thinking, supports_vision, pricing?, sources}`, or nil and an
+  error.
+
+  `family` is `"generic"`, `"claude"`, `"gpt"`, `"gemini"`, `"glm"` or
+  `"synthetic"`.
+
+  `sources` names what decided each fact, as
+  `{context_window, max_output_tokens, pricing, thinking, vision}`. Each is
+  `"config"` (`providers.toml`), `"discovery"` (the provider's live model
+  list), `"table"` (a curated or plugin model row), `"like"` (the row a
+  `like` names), `"catalog"` (models.dev) or `"default"` (nothing described
+  the model, so a provider or family default applies).
 
   `free` has three states: `true` when the model is known to cost nothing,
   `false` when it is metered, and nil when no source ever quoted a rate.

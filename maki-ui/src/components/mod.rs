@@ -583,7 +583,7 @@ impl DisplayRole {
 }
 
 #[cfg(test)]
-use maki_providers::ModelPricing;
+use maki_providers::{FactSources, ModelPricing};
 
 #[cfg(test)]
 pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
@@ -609,6 +609,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         discovered_free: false,
         max_output_tokens: Some(8192),
         turn_output_tokens: None,
+        sources: FactSources::default(),
         context_window: TEST_CONTEXT_WINDOW,
         thinking_fields: None,
     }

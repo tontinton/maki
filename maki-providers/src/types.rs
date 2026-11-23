@@ -1931,6 +1931,7 @@ mod tests {
     use maki_storage::sessions::generate_title;
 
     use super::*;
+    use crate::model::FactSources;
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
@@ -3089,6 +3090,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 200_000,
             thinking_fields: None,
         }

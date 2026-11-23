@@ -1703,7 +1703,7 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::model::ModelTier;
+    use crate::model::{FactSource, ModelTier};
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, isolated_home, serve};
@@ -3091,7 +3091,7 @@ mod tests {
 
         let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
         assert_eq!(model.family, ModelFamily::Glm);
-        assert!(!model.supports_vision());
+        assert_eq!(model.vision_with_source(), (false, FactSource::Like));
         assert!(!model.supports_tool_examples());
     }
 

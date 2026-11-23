@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{Model, ModelFamily, ThinkingSupport};
+use crate::model::{FactSource, Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -302,6 +302,7 @@ fn adjust_model(model: &mut Model) {
     };
     if version >= THINKING_SINCE {
         model.thinking_override = Some(ThinkingSupport::Yes);
+        model.sources.thinking = FactSource::Default;
     }
 }
 
