@@ -384,7 +384,11 @@ impl<'a> ModelSources<'a> {
         Self {
             entry,
             exact,
-            catalog: (!exact)
+            // An exact row is the authority on what it states, but one that
+            // omits pricing hands that field to the catalog, so a model the
+            // provider has not priced yet still picks up the rate the day
+            // models.dev lists it.
+            catalog: ((!exact) || entry.is_some_and(|e| e.pricing.is_none()))
                 .then(|| catalog::model_meta_if_available(catalog_slug, model_id))
                 .flatten(),
         }

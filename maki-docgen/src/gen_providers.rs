@@ -368,7 +368,7 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | `requires_thinking` | bool | `false` | For APIs that reject a request with thinking off. Implies `supports_thinking` and raises thinking to minimal effort when off |
 | `supports_vision` | bool | unset | When false, image input and `view_image` are off for this model |
 | `supports_tool_examples` | bool | unset | |
-| `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
+| `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens. Unset reads the rates models.dev lists for this model under the provider's slug, or its `base`. Without them the price is unknown |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
 | `family` | string | provider's | `generic`, `claude`, `gpt`, `gemini`, `glm` or `synthetic` |
 | `default` | bool | first row of its tier | The tier's default model. At most one per tier |
