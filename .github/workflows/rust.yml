@@ -81,7 +81,7 @@ jobs:
       - run: ./stylua --check plugins/
 
   check-lua:
-    name: Type check (Lua)
+    name: Check (Lua)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
@@ -104,7 +104,12 @@ jobs:
           unzip -o lute.zip lute
           rm lute.zip
       # lute looks for `.config.luau` upward from the working directory, not from the checked files.
-      - run: cd plugins && ../lute check $(find . -name '*.lua')
+      - name: Type check
+        run: cd plugins && ../lute check $(find . -name '*.lua')
+      # The lint parser rejects the `declare` syntax of `maki.d.luau`, so it gets the file list, not the dir.
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: cd plugins && ../lute lint $(find . -name '*.lua')
 
   lint:
     name: Lint
