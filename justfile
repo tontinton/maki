@@ -46,7 +46,7 @@ check-lua:
 
 # Same command as CI, with lute's default rules. Prefix a deliberately unused variable with `_`.
 lint-lua:
-    cd plugins && lute lint $(find . -name '*.lua')
+    cd plugins && lute lint --sequential $(find . -name '*.lua')
 
 # Same command as CI: Luau's built-in lints, minus the type errors `lute check` covers.
 analyze-lua:
