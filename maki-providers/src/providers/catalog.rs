@@ -1926,6 +1926,31 @@ mod tests {
         assert_eq!(Some(listed.context_window), curated.context_window);
     }
 
+    /// An exact row that states no price hands the field to models.dev, so a
+    /// model launched before the provider published a rate (glm-5.4 shipped
+    /// coding-plan-only) picks the catalog's up the day it lists one, while
+    /// everything the row does state stays authoritative.
+    #[test]
+    fn an_exact_row_without_pricing_reads_the_catalog() {
+        let (_tmp, state_dir) = temp_state_dir();
+        const CATALOG_INPUT: f64 = 1.4;
+        const CATALOG_OUTPUT: f64 = 4.4;
+        let models = HashMap::from([("glm-5.4".into(), priced_row(CATALOG_INPUT, CATALOG_OUTPUT))]);
+        let index = catalog_index(
+            "zai",
+            "@ai-sdk/openai-compatible",
+            Some("https://api.z.ai/api/paas/v4"),
+            models,
+        );
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = Model::from_spec("zai/glm-5.4").unwrap();
+        assert_eq!(model.pricing.input, CATALOG_INPUT);
+        assert_eq!(model.pricing.output, CATALOG_OUTPUT);
+        assert_eq!(model.context_window, 1_000_000, "the row keeps its word");
+        assert!(model.supports_vision());
+    }
+
     /// Curated rows match by prefix, so `grok-4.6` answers for every id
     /// starting with it. That guess loses to models.dev naming the exact model,
     /// or the next release in an existing family bills at its predecessor's

@@ -193,9 +193,10 @@ mod tests {
         assert_eq!(bare[0].max_output_tokens, None);
         assert!(bare[0].pricing.as_ref().expect(PARSED).fast.is_none());
 
-        const RATES: &str = "pricing = { input = 1.0, output = 2.0, cache_write = 0.0, cache_read = 0.0 }";
-        let unpriced = parse(SLUG, &table(SLUG, &ROW.replace(&format!("{RATES}\n"), "")))
-            .expect(PARSED);
+        const RATES: &str =
+            "pricing = { input = 1.0, output = 2.0, cache_write = 0.0, cache_read = 0.0 }";
+        let unpriced =
+            parse(SLUG, &table(SLUG, &ROW.replace(&format!("{RATES}\n"), ""))).expect(PARSED);
         assert_eq!(unpriced[0].pricing, None);
 
         let declared = table(SLUG, ROW).replace(
