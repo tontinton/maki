@@ -8,7 +8,8 @@ use maki_acp::ProjectStack;
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, load_env_files};
-use maki_lua::{InitFiles, Interaction, PluginHost, agent_autocmd};
+use maki_lua::agent_autocmd::{self, HostEvent};
+use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
 use crate::cli::Cli;
@@ -104,6 +105,7 @@ pub async fn run(
 
     let event_handle = plugin_host.event_handle();
     let agent_event_handle = event_handle.clone();
+    let turn_start_handle = event_handle.clone();
     let interrupt = Interrupt::install();
     maki_acp::run(maki_acp::AcpParams {
         stack: ProjectStack {
@@ -122,6 +124,9 @@ pub async fn run(
             })),
             on_agent_event: Some(Arc::new(move |session_id, envelope| {
                 agent_autocmd::dispatch(&agent_event_handle, &session_id, envelope);
+            })),
+            on_turn_start: Some(Arc::new(move |session_id, text| {
+                turn_start_handle.fire(Some(&session_id), HostEvent::TurnStart { text });
             })),
         },
         launch_dir,

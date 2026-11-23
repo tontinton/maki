@@ -1,7 +1,8 @@
 //! Every event the host fires, and the one place that classifies its fields.
 //! Agent events are turned into host events here too, shared by the UI app
 //! loop, `maki -p`, sdk mode and ACP, so a plugin sees the same events
-//! whichever way maki was started.
+//! whichever way maki was started. `TurnStart` and `PlanReady` are no agent
+//! events: the UI fires both, and ACP fires `TurnStart` on `session/prompt`.
 
 use std::fmt::Display;
 

@@ -30,6 +30,10 @@ pub type SessionEndHook =
 /// session id. Must not block: it runs on the event pump.
 pub type AgentEventHook = Arc<dyn Fn(&str, &Envelope) + Send + Sync>;
 
+/// Called with the session id and the text of each prompt the agent is about
+/// to get. Must not block: it runs on the request loop.
+pub type TurnStartHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// What the launch folder's plugin host, `init.lua` and model give every
 /// session this process runs.
 pub struct ProjectStack {
@@ -52,6 +56,8 @@ pub struct ProjectStack {
     pub on_session_end: Option<SessionEndHook>,
     /// Lets the plugin host see agent events, as the other drivers do.
     pub on_agent_event: Option<AgentEventHook>,
+    /// Lets the plugin host see a turn start, which no agent event reports.
+    pub on_turn_start: Option<TurnStartHook>,
 }
 
 pub struct AcpParams {
