@@ -310,7 +310,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-///   or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+///   or `"idle"`), `data.title` and `data.focused` (boolean). A
+///   `"needs_input"` session also has `data.attention`, as in
+///   `maki.session.live()`. It fires when `status` or `attention` changes.
+///   So a permission prompt for another tool fires again with the same
+///   `"needs_input"`, and a prompt that reads the same does not. A session
 ///   stays `"working"` while a background task it waits on still runs.
 /// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
 ///   when the title changes (rename or auto-generation).

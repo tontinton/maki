@@ -951,7 +951,11 @@ name the session now running or focused. What each event adds:
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-  or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+  or `"idle"`), `data.title` and `data.focused` (boolean). A
+  `"needs_input"` session also has `data.attention`, as in
+  `maki.session.live()`. It fires when `status` or `attention` changes.
+  So a permission prompt for another tool fires again with the same
+  `"needs_input"`, and a prompt that reads the same does not. A session
   stays `"working"` while a background task it waits on still runs.
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
@@ -5460,8 +5464,13 @@ maki.session.live()
 Lists the sessions currently running in this UI. Status is "working",
 "needs_input", or "idle". Background work a turn moved out keeps the
 session "working" until its result is in, with no "idle" in between.
+A "needs_input" session has `attention`, text that says what it waits
+on, like "Permission requested: bash". The wording can change between
+releases, so show it and do not parse it. Other sessions have none.
+`resumable` is true once the session has a transcript `maki -r <id>` can
+open.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, attention, resumable, updated_at, focused}`, or nil and an error.
 
 **Example:**
 

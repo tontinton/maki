@@ -96,6 +96,8 @@ pub enum HostEvent<'a> {
     SessionStatusChanged {
         title: &'a str,
         status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attention: Option<String>,
         focused: bool,
     },
     SessionTitleChanged {
@@ -239,7 +241,7 @@ impl HostEventKind {
             Self::SessionReset => (&[], &[]),
             Self::SessionEnd => (&[], &["reason", "deadline_ms"]),
             Self::SessionFocusChanged => (&[], &["previous_session_id"]),
-            Self::SessionStatusChanged => (&[], &["title", "status", "focused"]),
+            Self::SessionStatusChanged => (&[], &["title", "status", "attention", "focused"]),
             Self::SessionTitleChanged => (&[], &["title", "focused"]),
             Self::SessionCwdChanged => (&[], &["cwd"]),
             Self::TaskStatusChanged => (&[], &["id", "name", "status", "plugin"]),
@@ -591,6 +593,7 @@ mod tests {
             HostEventKind::SessionStatusChanged => HostEvent::SessionStatusChanged {
                 title: SAMPLE_TEXT,
                 status: SAMPLE_TEXT,
+                attention: Some(SAMPLE_TEXT.into()),
                 focused: true,
             },
             HostEventKind::SessionTitleChanged => HostEvent::SessionTitleChanged {
