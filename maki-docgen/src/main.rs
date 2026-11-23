@@ -18,6 +18,7 @@ use tokio::runtime::Runtime;
 
 const CONTENT_DIR: &str = "site/docs/content";
 const DEFINITIONS_PATH: &str = "plugins/maki.d.luau";
+const FALLIBLE_PATH: &str = "plugins/lint/dropped_maki_error/fallible.luau";
 
 type Page = (&'static str, fn() -> String);
 
@@ -82,6 +83,7 @@ fn main() -> ExitCode {
         running.map(|(path, page)| (path, page.join().unwrap()))
     }));
     outputs.push((DEFINITIONS_PATH.into(), gen_luau::generate()));
+    outputs.push((FALLIBLE_PATH.into(), gen_luau::fallible()));
 
     if check {
         let mismatches = outputs
