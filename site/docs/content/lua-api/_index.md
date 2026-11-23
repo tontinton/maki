@@ -9733,6 +9733,7 @@ function Toast.show(text: unknown, opts: Opts?)
 ### `require("maki.tool_view")`
 
 ```lua
+--!strict
 -- The shared truncate/expand body that tool plugins render through.
 --
 -- Click handlers get `ev.row`, a 1-based line in this buf; 0 means the
@@ -9746,7 +9747,7 @@ function Toast.show(text: unknown, opts: Opts?)
 
 -- Right aligned, so the content column stays put when a number gains a digit.
 -- Formats the number alone, callers add their own separator.
-function ToolView.line_nr_fmt(max_line_nr)
+function ToolView.line_nr_fmt(max_line_nr: number): string
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
@@ -9755,37 +9756,37 @@ function ToolView.line_nr_fmt(max_line_nr)
 -- With max_lines 0 only the set_header lines show until a click expands the
 -- view. The UI puts the line count in the tool header, so the row still says
 -- how much is hidden.
-function ToolView.new(buf, opts)
-function ToolView:set_header(lines)
-function ToolView:clear()
-function ToolView:append(line)
-function ToolView:append_text(text)
+function ToolView.new(buf: Buf, opts: Opts?): ToolView
+function ToolView.set_header(self: ToolView, lines: { Line })
+function ToolView.clear(self: ToolView)
+function ToolView.append(self: ToolView, line: Line)
+function ToolView.append_text(self: ToolView, text: string)
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
-function ToolView:set_highlight(content: string, ext)
+function ToolView.set_highlight(self: ToolView, content: string, ext: string?): boolean
 
 -- Content rows on screen, for callers with their own per-row click targets. A
 -- single hidden line is drawn as itself instead of a notice, so it counts as
 -- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
 -- prints its notice first and shifts them.
-function ToolView:visible_count()
-function ToolView:toggle()
-function ToolView:flush()
-function ToolView:update_line(all_idx, line)
+function ToolView.visible_count(self: ToolView): number
+function ToolView.toggle(self: ToolView)
+function ToolView.flush(self: ToolView)
+function ToolView.update_line(self: ToolView, all_idx: number, line: Line)
 
 -- Call once after the last append so the collapsed notice renders.
-function ToolView:finish()
-function ToolView.restore_lines(lines, opts)
+function ToolView.finish(self: ToolView)
+function ToolView.restore_lines(lines: { Line }, opts: Opts?): Buf
 
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
-function ToolView.restore(output, opts)
+function ToolView.restore(output: string, opts: Opts?): Buf
 
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`). {opts.width} is the wrap width and defaults to the body
 -- column of the current terminal. Errors stay plain, as they do live.
-function ToolView.restore_markdown(output, is_error, opts)
+function ToolView.restore_markdown(output: string, is_error: boolean?, opts: Opts): Buf
 ```
 
 ### `require("maki.truncate")`
