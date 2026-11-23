@@ -48,6 +48,10 @@ check-lua:
 lint-lua:
     cd plugins && lute lint $(find . -name '*.lua')
 
+# Same command as CI: Luau's built-in lints, minus the type errors `lute check` covers.
+analyze-lua:
+    cd plugins && ! luau-analyze --formatter=plain $(find . -name '*.lua') | grep -vE ': \([EW][0-9]+\) TypeError:'
+
 pylint:
     ruff check scripts/
     ty check scripts/
