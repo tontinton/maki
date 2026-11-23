@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
+use maki_agent::tools::grep::{GrepParams, GrepResults, grep_search};
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
@@ -1159,9 +1160,9 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 ///
 /// @param pattern string Regular expression to search for.
 /// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
-/// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
+/// @return (table?, string?, table?) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 /// @example
-/// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+/// local hits, err, omitted = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 /// if err then return end
 /// for _, file in ipairs(hits) do
 ///   for _, g in ipairs(file.groups) do
@@ -1170,9 +1171,14 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 ///     end
 ///   end
 /// end
+/// if omitted then print(omitted.groups .. " more not shown") end
 #[lua_fn(guard = FsRead)]
-async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+async fn grep(
+    lua: Lua,
+    pattern: String,
+    opts: Option<Table>,
+) -> LuaResult<(Option<Table>, Option<String>, Option<Table>)> {
+    let mut params = GrepParams::new(pattern);
     if let Some(ref opts) = opts {
         if let Ok(v) = opts.get::<String>("path") {
             params.path = Some(v);
@@ -1194,11 +1200,18 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
     }
 
-    let result = spawn_blocking(move || maki_agent::tools::grep::grep_search(params))
+    let result = spawn_blocking(move || grep_search(params))
         .await
         .map_err(mlua::Error::external)?;
 
-    let (base, entries) = try_pair!(result);
+    let GrepResults {
+        base,
+        entries,
+        omitted,
+    } = match result {
+        Ok(results) => results,
+        Err(e) => return Ok((None, Some(e), None)),
+    };
     let arr = lua.create_table()?;
     for (i, entry) in entries.iter().enumerate() {
         let etbl = lua.create_table()?;
@@ -1220,7 +1233,10 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         etbl.set("groups", groups_tbl)?;
         arr.set(i + 1, etbl)?;
     }
-    Ok((Some(arr), None))
+    let omitted = omitted
+        .map(|o| lua.create_table_from([("groups", o.groups), ("files", o.files)]))
+        .transpose()?;
+    Ok((Some(arr), None, omitted))
 }
 
 /// Ranked paths asked for more than this at once stop being a completion and
@@ -2987,7 +3003,11 @@ mod tests {
         assert!(paths[0].ends_with("inner.rs"));
     }
 
-    async fn grep_call(tbl: &Table, pattern: &str, opts: Table) -> (mlua::Value, mlua::Value) {
+    async fn grep_call(
+        tbl: &Table,
+        pattern: &str,
+        opts: Table,
+    ) -> (mlua::Value, mlua::Value, mlua::Value) {
         let grep: mlua::Function = tbl.get("grep").unwrap();
         grep.call_async((pattern, opts)).await.unwrap()
     }
@@ -3009,8 +3029,9 @@ mod tests {
         // basic match: hits data.txt, skips other.txt
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "line_", opts).await;
+        let (val, err, omitted) = grep_call(&tbl, "line_", opts).await;
         assert_eq!(err, mlua::Value::Nil);
+        assert_eq!(omitted, mlua::Value::Nil);
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         assert_eq!(result.len().unwrap(), 1);
         let entry: Table = result.get(1).unwrap();
@@ -3034,7 +3055,7 @@ mod tests {
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         opts.set("context_before", 1).unwrap();
         opts.set("context_after", 1).unwrap();
-        let (val, _) = grep_call(&tbl, "line_10", opts).await;
+        let (val, _, _) = grep_call(&tbl, "line_10", opts).await;
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         let lines: Table = result
             .get::<Table>(1)
@@ -3072,15 +3093,18 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         opts.set("limit", 5).unwrap();
-        let (val, _) = grep_call(&tbl, "line_", opts).await;
+        let (val, _, omitted) = grep_call(&tbl, "line_", opts).await;
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         let groups: Table = result.get::<Table>(1).unwrap().get("groups").unwrap();
         assert_eq!(groups.len().unwrap(), 5);
+        let omitted: Table = mlua::FromLua::from_lua(omitted, &lua).unwrap();
+        assert_eq!(omitted.get::<usize>("groups").unwrap(), 15);
+        assert_eq!(omitted.get::<usize>("files").unwrap(), 1);
 
         // no match returns empty table, not error
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "zzz_no_match", opts).await;
+        let (val, err, _) = grep_call(&tbl, "zzz_no_match", opts).await;
         assert_eq!(err, mlua::Value::Nil);
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         assert_eq!(result.len().unwrap(), 0);
@@ -3097,7 +3121,7 @@ mod tests {
 
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "[invalid", opts).await;
+        let (val, err, _) = grep_call(&tbl, "[invalid", opts).await;
         assert_eq!(val, mlua::Value::Nil);
         assert!(matches!(err, mlua::Value::String(_)));
     }

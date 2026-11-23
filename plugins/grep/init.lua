@@ -5,8 +5,14 @@ local color = require("maki.color")
 local output_limits = require("maki.output_limits")
 
 local NO_MATCHES = "No files found"
+local LIMIT_NOTE = "[limit of %d reached, %d more %s from %d %s not shown]"
+local MIN_PER_CALL_LIMIT = 1
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
+
+local function plural(n, word)
+  return n == 1 and word or word .. "s"
+end
 
 local opts = maki.api.register_options(output_limits.extend({
   search_result_limit = {
@@ -58,8 +64,7 @@ local function count_matches(entries)
       end
     end
   end
-  local f = #entries == 1 and "file" or "files"
-  return string.format("%d matches in %d %s", matches, #entries, f)
+  return string.format("%d matches in %d %s", matches, #entries, plural(#entries, "file"))
 end
 
 local function grep_view_opts(ctx)
@@ -251,11 +256,11 @@ maki.api.register_tool({
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
+    local limit = math.max(MIN_PER_CALL_LIMIT, math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT))
 
     local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
-    local entries, err = maki.fs.grep(pattern, {
+    local entries, err, omitted = maki.fs.grep(pattern, {
       path = input.path,
       include = input.include,
       context_before = input.context_before or 0,
@@ -278,6 +283,11 @@ maki.api.register_tool({
 
     local llm_output = format_llm_output(entries)
     llm_output = truncate(llm_output, max_lines, max_bytes)
+    if omitted then
+      local groups, files = omitted.groups, omitted.files
+      local note = string.format(LIMIT_NOTE, limit, groups, plural(groups, "match group"), files, plural(files, "file"))
+      llm_output = llm_output .. "\n\n" .. note
+    end
 
     return {
       llm_output = llm_output,
