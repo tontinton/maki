@@ -286,9 +286,59 @@ pub struct ModelEntry {
     /// The model its tier resolves to when nothing else picked one.
     #[serde(default)]
     pub default: bool,
+    /// `<slug>/<model>` this row is a copy of, see [`ModelEntry::inherit_like`].
+    #[serde(default)]
+    pub like: Option<String>,
+}
+
+/// What `like` lends: how a model behaves, which holds wherever it is served.
+/// Limits, price and thinking describe one deployment and the wire it speaks,
+/// so they stay with the row that borrows.
+#[derive(Debug)]
+pub(crate) struct Capabilities {
+    pub(crate) family: ModelFamily,
+    pub(crate) supports_vision: Option<bool>,
+    pub(crate) supports_tool_examples: Option<bool>,
+}
+
+impl Capabilities {
+    /// The row `spec` uses for `model_id`, without following that row's own
+    /// `like`, so no chain of them can loop.
+    pub(crate) fn of(spec: &ProviderSpec, model_id: &str) -> Option<Self> {
+        let entry = lookup_entry(spec.models(), model_id)?;
+        Some(Self {
+            family: entry.family.unwrap_or(spec.family),
+            supports_vision: entry.supports_vision,
+            supports_tool_examples: entry.supports_tool_examples,
+        })
+    }
+
+    /// `target` is `<slug>/<model>` on any provider [`ProviderRegistry::get`]
+    /// knows.
+    pub(crate) fn like(target: &str) -> Option<Self> {
+        let (slug, model_id) = target.split_once('/')?;
+        Self::of(ProviderRegistry::get(slug)?, model_id)
+    }
 }
 
 impl ModelEntry {
+    /// Fills the capabilities this row leaves out from the row its `like`
+    /// names. False when `like` names no row Maki knows.
+    pub(crate) fn inherit_like(&mut self) -> bool {
+        let Some(target) = &self.like else {
+            return true;
+        };
+        let Some(borrowed) = Capabilities::like(target) else {
+            return false;
+        };
+        self.family = self.family.or(Some(borrowed.family));
+        self.supports_vision = self.supports_vision.or(borrowed.supports_vision);
+        self.supports_tool_examples = self
+            .supports_tool_examples
+            .or(borrowed.supports_tool_examples);
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
@@ -366,6 +416,9 @@ fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
 struct ModelSources<'a> {
     /// The curated row [`lookup_entry`] reached, exact or not.
     entry: Option<&'a ModelEntry>,
+    /// What the row named by `entry`'s `like` lends, for whatever `entry`
+    /// leaves out.
+    like: Option<Capabilities>,
     /// `entry` names this id. Such a row was checked against the provider's own
     /// pricing page, so nothing outranks it but live discovery. A row reached
     /// by prefix is still the right family and a usable guess at the rest, but
@@ -383,6 +436,9 @@ impl<'a> ModelSources<'a> {
         let catalog_slug = plugin::base_spec(spec.slug).map_or(spec.slug, |base| base.slug);
         Self {
             entry,
+            like: entry
+                .and_then(|entry| entry.like.as_deref())
+                .and_then(Capabilities::like),
             exact,
             catalog: (!exact)
                 .then(|| catalog::model_meta_if_available(catalog_slug, model_id))
@@ -596,7 +652,11 @@ impl Model {
         let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
         let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
-        let family = entry.and_then(|entry| entry.family).unwrap_or(base.family);
+        let like = sources.like.as_ref();
+        let family = entry
+            .and_then(|entry| entry.family)
+            .or(like.map(|like| like.family))
+            .unwrap_or(base.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .cloned()
@@ -624,7 +684,9 @@ impl Model {
             provider: Arc::from(slug),
             tier,
             family,
-            supports_tool_examples_override: entry.and_then(|e| e.supports_tool_examples),
+            supports_tool_examples_override: entry
+                .and_then(|e| e.supports_tool_examples)
+                .or_else(|| like.and_then(|like| like.supports_tool_examples)),
             thinking_override,
             supports_vision_override: None,
             supports_fast_override: None,
@@ -734,8 +796,10 @@ impl Model {
         model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_vision)
             .or_else(|| {
-                ModelSources::resolve(spec, &self.id)
+                let sources = ModelSources::resolve(spec, &self.id);
+                sources
                     .pick(|entry| entry.supports_vision, |meta| meta.supports_vision)
+                    .or_else(|| sources.like.as_ref()?.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
     }

@@ -8,7 +8,9 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model::{
+    Capabilities, Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
+};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
@@ -176,6 +178,14 @@ fn validate_overrides(overrides: &Overrides) {
                     model, base, "base is not an OpenAI-compatible provider, ignoring"
                 );
             }
+            if let Some(like) = &f.like
+                && Capabilities::like(like).is_none()
+            {
+                warn!(
+                    provider,
+                    model, like, "like names no model Maki knows, ignoring"
+                );
+            }
         }
     }
 }
@@ -198,6 +208,7 @@ fn merged_override(overrides: &Overrides, provider_id: &str, model_id: &str) -> 
             .path_prefix
             .clone()
             .or_else(|| po.default.path_prefix.clone()),
+        like: m.like.clone().or_else(|| po.default.like.clone()),
     }
 }
 
@@ -445,7 +456,8 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     let payload = model_registry::discovered(SLUG, &model.id);
     let payload_context = payload.as_ref().and_then(|info| info.context_window);
     let payload_output = payload.as_ref().and_then(|info| info.max_output_tokens);
-    if let Some(spec) = routed_spec(provider_id, &ov) {
+    let routed = routed_spec(provider_id, &ov);
+    if let Some(spec) = routed {
         model.family = spec.family;
         model.thinking_override = model
             .thinking_override
@@ -457,9 +469,15 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
             model.max_output_tokens = payload_output
                 .or(entry.max_output_tokens)
                 .or(model.max_output_tokens);
-            model.supports_vision_override =
-                model.supports_vision_override.or(entry.supports_vision);
         }
+    }
+    if let Some(borrowed) = borrowed_capabilities(&ov, routed, provider_id, model_id) {
+        model.family = borrowed.family;
+        model.supports_tool_examples_override = model
+            .supports_tool_examples_override
+            .or(borrowed.supports_tool_examples);
+        model.supports_vision_override =
+            model.supports_vision_override.or(borrowed.supports_vision);
     }
     if let Some(cw) = ov.context_window {
         model.context_window = cw;
@@ -469,6 +487,20 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.thinking_override = ThinkingSupport::from_flags(Some(thinking), false);
     }
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
+}
+
+/// An explicit `like` wins. Without one the gateway already names the
+/// upstream, so `aperture/openai/gpt-5.4` reads like `openai/gpt-5.4`.
+fn borrowed_capabilities(
+    ov: &OverrideFields,
+    routed: Option<&'static ProviderSpec>,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<Capabilities> {
+    ov.like.as_deref().and_then(Capabilities::like).or_else(|| {
+        let upstream = routed.or_else(|| ProviderRegistry::get(provider_id))?;
+        Capabilities::of(upstream, model_id)
+    })
 }
 
 impl Provider for Aperture {
@@ -997,6 +1029,90 @@ mod tests {
         assert!(model.thinking_override.is_none());
         assert!(model.supports_vision_override.is_none());
         assert!(!model.supports_thinking());
+    }
+
+    const OPAQUE_UPSTREAM: &str = "azureai";
+    const OPAQUE_MODEL: &str = "opaque-model";
+    const CLAUDE_TARGET: &str = "anthropic/claude-opus-5";
+
+    fn opaque_override(fields: OverrideFields) -> Overrides {
+        Overrides::from([(
+            OPAQUE_UPSTREAM.to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(OPAQUE_MODEL.to_string(), fields)]),
+            },
+        )])
+    }
+
+    fn opaque_model(overrides: &Overrides) -> Model {
+        let mut model =
+            Model::from_spec(&format!("aperture/{OPAQUE_UPSTREAM}/{OPAQUE_MODEL}")).unwrap();
+        apply_adjustments(&mut model, overrides);
+        model
+    }
+
+    #[test]
+    fn like_lends_capabilities_but_not_limits_or_price() {
+        let model = opaque_model(&opaque_override(OverrideFields {
+            like: Some(CLAUDE_TARGET.into()),
+            ..Default::default()
+        }));
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert!(model.supports_vision());
+        assert!(model.supports_tool_examples());
+        assert_eq!(model.context_window, SPEC.fallback_context_window);
+        assert!(model.pricing.is_zero());
+        assert!(!model.supports_thinking());
+    }
+
+    #[test]
+    fn a_stated_field_wins_over_like() {
+        let model = opaque_model(&opaque_override(OverrideFields {
+            like: Some(CLAUDE_TARGET.into()),
+            supports_vision: Some(false),
+            context_window: Some(1_000),
+            ..Default::default()
+        }));
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert!(!model.supports_vision());
+        assert_eq!(model.context_window, 1_000);
+    }
+
+    #[test]
+    fn like_does_not_change_the_route() {
+        let overrides = opaque_override(OverrideFields {
+            like: Some("zai/glm-5.3".into()),
+            ..Default::default()
+        });
+        let model = opaque_model(&overrides);
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert!(routed_model(&overrides, &model).is_none());
+    }
+
+    #[test]
+    fn the_gateway_provider_id_names_the_row() {
+        let mut model = Model::from_spec("aperture/openai/gpt-6-sol").unwrap();
+        apply_adjustments(&mut model, &Overrides::new());
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert!(model.supports_vision());
+    }
+
+    #[test]
+    fn an_unknown_like_falls_back_to_the_gateway_provider_id() {
+        let overrides = Overrides::from([(
+            "zai".to_string(),
+            ProviderOverride {
+                default: OverrideFields {
+                    like: Some("nobody/nothing".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]);
+        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Glm);
     }
 
     /// The routed provider answers, not Aperture, which declares no thinking of

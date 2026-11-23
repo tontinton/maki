@@ -157,6 +157,7 @@ impl From<&ModelDef> for ModelEntry {
             thinking_fields: def.thinking_fields.clone(),
             family: None,
             default: false,
+            like: def.like.clone(),
         }
     }
 }
@@ -179,6 +180,18 @@ fn model_from_def(
         .unwrap_or_default();
     let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
+    // What the endpoint says it serves outranks the row `like` borrows from.
+    row.supports_vision = row
+        .supports_vision
+        .or_else(|| discovered.and_then(|d| d.supports_vision));
+    if !row.inherit_like() {
+        warn!(
+            slug,
+            model = model_id,
+            like = row.like.as_deref(),
+            "like names no model Maki knows, ignoring"
+        );
+    }
     row.max_output_tokens = row
         .max_output_tokens
         .or_else(|| discovered.and_then(|d| d.max_output_tokens));
@@ -457,6 +470,7 @@ mod tests {
 
     use super::super::bearer_value;
     use super::*;
+    use crate::model::ModelFamily;
     use crate::test_support::{Canned, Requests, isolated_home, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
     use crate::{Message, RequestOptions, StreamResponse};
@@ -547,6 +561,52 @@ mod tests {
         );
     }
 
+    const LIKE_TARGET: &str = "zai/glm-5.3";
+    const LIKE_SLUG: &str = "custom-gw";
+    const LIKE_MODEL: &str = "local-v4";
+
+    fn like_row(like: &str, fields: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"protocol":"openai","models":[{{"id":"{LIKE_MODEL}","like":"{like}"{fields}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn like_lends_capabilities_but_not_limits_or_price() {
+        let model = model_from_def(
+            &like_row(LIKE_TARGET, ""),
+            openai_spec(),
+            LIKE_SLUG,
+            LIKE_MODEL,
+        );
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert!(!model.supports_vision());
+        assert!(!model.supports_tool_examples());
+        assert_eq!(model.context_window, openai_spec().fallback_context_window);
+        assert_eq!(model.max_output_tokens, openai_spec().fallback_max_output);
+        assert!(model.pricing.is_zero());
+    }
+
+    #[test]
+    fn a_stated_field_wins_over_like() {
+        let def = like_row(
+            LIKE_TARGET,
+            r#","supports_vision":true,"context_window":1024"#,
+        );
+        let model = model_from_def(&def, openai_spec(), LIKE_SLUG, LIKE_MODEL);
+        assert!(model.supports_vision());
+        assert_eq!(model.context_window, 1024);
+    }
+
+    #[test]
+    fn an_unknown_like_is_ignored() {
+        let def = like_row("nobody/nothing", "");
+        let model = model_from_def(&def, openai_spec(), LIKE_SLUG, LIKE_MODEL);
+        assert_eq!(model.family, openai_spec().family);
+        assert_eq!(model.context_window, openai_spec().fallback_context_window);
+    }
+
     // The exact regression this fixes: discovery parsed context_window but
     // never stored it, so custom models always got the protocol fallback.
     #[test]
@@ -571,15 +631,18 @@ mod tests {
         assert_eq!(model.max_output_tokens, Some(expected_output));
     }
 
-    #[test_case(Some(true), Some(false), true ; "declared_outranks_discovery")]
-    #[test_case(None, Some(false), false ; "text_only_discovery_turns_vision_off")]
-    #[test_case(None, Some(true), true ; "image_discovery_keeps_vision_on")]
+    #[test_case(Some(true), Some(false), None, true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), None, false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), None, true ; "image_discovery_keeps_vision_on")]
+    #[test_case(None, Some(true), Some(LIKE_TARGET), true ; "image_discovery_outranks_like")]
+    #[test_case(None, None, Some(LIKE_TARGET), false ; "like_fills_what_discovery_leaves_out")]
     fn discovered_vision_flows_into_custom_model(
         declared: Option<bool>,
         discovered: Option<bool>,
+        like: Option<&str>,
         expected: bool,
     ) {
-        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}");
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}-{like:?}");
         let model_id = "vllm-model";
         crate::model_registry::set_known_models(
             &slug,
@@ -590,6 +653,7 @@ mod tests {
         );
         let mut def = openai_def(model_id);
         def.models[0].supports_vision = declared;
+        def.models[0].like = like.map(str::to_string);
         let model = model_from_def(&def, openai_spec(), &slug, model_id);
         assert_eq!(model.supports_vision(), expected);
     }
