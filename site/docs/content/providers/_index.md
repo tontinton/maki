@@ -563,6 +563,13 @@ like = "deepseek/deepseek-flash"
 like = "anthropic/claude-opus-5"
 ```
 
+A model without a native route goes out as chat completions, and claims thinking only with `supports_thinking = true`. It then sends the effort as chat's `reasoning_effort`, whatever `like` names. A gateway that refuses the field gets one replay without it, and Maki leaves the field out for that model until restart:
+
+```toml
+[aperture.overrides.azureai.models."gpt-6.1-sol"]
+supports_thinking = true
+```
+
 Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
 ### Plans

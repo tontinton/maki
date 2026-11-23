@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
@@ -17,7 +17,7 @@ use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,
 };
-use crate::types::ThinkingFallback;
+use crate::types::{EffortDialect, ThinkingFallback, dialect};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 use maki_storage::id::SessionRef;
 
@@ -41,6 +41,9 @@ const DOC_API_URL: &str = "Aperture gateway (set APERTURE_HOST)";
 const FEATURES: &str =
     "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml";
 const AUTH_DOC: &str = "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)";
+/// The generic route speaks chat completions, so a model pinned to think
+/// spells it as chat's `reasoning_effort`, whatever row it borrows from.
+const GENERIC_DIALECT: &EffortDialect<'static> = &dialect::STANDARD;
 const DISCOVERY_NOTE: &str = "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
      endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.";
 
@@ -129,22 +132,37 @@ fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
 
 /// The routed provider builds the request, so it answers, about the model as
 /// its own: a plugin codec finds its declaration and discovery by its slug.
-/// A model that routes nowhere takes the generic path, which sends no effort.
 fn routed_sends_thinking(
     overrides: &Overrides,
     model: &Model,
     choice: ThinkingConfig,
 ) -> ThinkingConfig {
-    routed_model(overrides, model).map_or(choice, |(spec, routed)| {
-        (spec.sends_thinking)(&routed, choice)
-    })
+    match routed_model(overrides, model) {
+        Some((spec, routed)) => (spec.sends_thinking)(&routed, choice),
+        None if model.supports_thinking() => {
+            ThinkingFallback::Dialect(GENERIC_DIALECT).sends(model, choice)
+        }
+        None => choice,
+    }
 }
 
+/// The generic route takes no `thinking_fields`, only its own spelling.
 fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
     let config = ProvidersConfig::load_or_default();
     let overrides = config.get(SLUG).map(|def| &def.overrides);
     let (spec, routed) = routed_model(overrides.unwrap_or(&Overrides::new()), model)?;
     (spec.thinking_fields_fallback)(&routed)
+}
+
+/// The fields the generic route adds for `choice`, kept apart from the body so
+/// a refusal strips exactly these.
+fn generic_thinking(model: &Model, choice: ThinkingConfig) -> Map<String, Value> {
+    let mut fields = Value::Object(Map::new());
+    choice.apply_dialect(&mut fields, model, GENERIC_DIALECT);
+    match fields {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
+    }
 }
 
 fn routed_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
@@ -538,11 +556,23 @@ impl Provider for Aperture {
             let auth = routed_auth(&self.auth, &prefix);
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body =
+            let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let thinking = generic_thinking(model, opts.thinking);
+            let thinking_keys: Vec<String> = thinking.keys().cloned().collect();
+            if let Some(object) = body.as_object_mut() {
+                object.extend(thinking);
+            }
             self.compat
-                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
+                .stream_with_thinking_retry(
+                    model,
+                    &HeaderMap::new(),
+                    body,
+                    &thinking_keys,
+                    event_tx,
+                    &auth,
+                )
                 .await
         })
     }
@@ -1154,6 +1184,10 @@ mod tests {
     }
 
     async fn ask(aperture: &Aperture, model: &Model) {
+        ask_with(aperture, model, RequestOptions::default()).await;
+    }
+
+    async fn ask_with(aperture: &Aperture, model: &Model, opts: RequestOptions) {
         let (tx, _rx) = unbounded_channel();
         aperture
             .stream_message(
@@ -1162,7 +1196,7 @@ mod tests {
                 "",
                 &json!([]),
                 &tx,
-                RequestOptions::default(),
+                opts,
                 None,
             )
             .await
@@ -1313,5 +1347,72 @@ supports_vision = true
         assert_eq!(path_prefix(Some(route("zai")), &ov), "");
         let ov2 = merged_override(&overrides, "zai", "other");
         assert_eq!(ov2.context_window, Some(128_000));
+    }
+
+    const REASONING_EFFORT: &str = "reasoning_effort";
+    const REFUSED_REASONING: Canned = Canned::json(
+        400,
+        r#"{"error":{"message":"unsupported parameter: reasoning_effort","type":"invalid_request_error"}}"#,
+    );
+    const REFUSAL_THEN_ANSWERS: &[Canned] = &[REFUSED_REASONING, ANSWER, ANSWER];
+    const ZAI_TARGET: &str = "zai/glm-5.3";
+
+    fn pinned_thinking() -> Overrides {
+        opaque_override(OverrideFields {
+            supports_thinking: Some(true),
+            like: Some(ZAI_TARGET.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test_case(pinned_thinking(), Some("high") ; "a_pin_sends_chat_effort_whatever_like_names")]
+    #[test_case(Overrides::new(), None ; "no_pin_sends_nothing")]
+    fn the_generic_route_spells_thinking_the_chat_way(
+        overrides: Overrides,
+        expected: Option<&str>,
+    ) {
+        let model = opaque_model(&overrides);
+        let fields = generic_thinking(&model, ThinkingConfig::Effort(Effort::High));
+        assert_eq!(
+            fields.get(REASONING_EFFORT).and_then(Value::as_str),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_generic_pin_reports_what_the_chat_spelling_sends() {
+        let overrides = pinned_thinking();
+        let model = opaque_model(&overrides);
+        assert!(model.supports_thinking());
+        assert_eq!(
+            routed_sends_thinking(&overrides, &model, ThinkingConfig::Effort(Effort::Max)),
+            ThinkingConfig::Effort(Effort::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_reasoning_effort_is_replayed_and_remembered() {
+        let _home = isolated_home();
+        let (base_url, requests) = serve(REFUSAL_THEN_ANSWERS);
+        let host = base_url.trim_end_matches(DEFAULT_PATH_PREFIX);
+        let auth = Arc::new(Mutex::new(gateway_auth(host, FIRST_TOKEN)));
+        let overrides = pinned_thinking();
+        let model = opaque_model(&overrides);
+        let aperture = Aperture::with_auth_and_overrides(auth, Timeouts::default(), overrides);
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Adaptive,
+            ..Default::default()
+        };
+
+        ask_with(&aperture, &model, opts).await;
+        ask_with(&aperture, &model, opts).await;
+
+        let sent: Vec<bool> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.json().get(REASONING_EFFORT).is_some())
+            .collect();
+        assert_eq!(sent, [true, false, false]);
     }
 }
