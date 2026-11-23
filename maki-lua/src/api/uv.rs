@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult};
 
@@ -38,11 +40,26 @@ fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
     Ok(std::env::var(&name).ok())
 }
 
+/// Return the wall clock time since the Unix epoch. Like
+/// `vim.uv.gettimeofday`.
+///
+/// @return (integer, integer) Seconds, and the microseconds within that second.
+/// @example
+/// local sec, usec = maki.uv.gettimeofday()
+/// local now_ms = sec * 1000 + usec // 1000
+#[lua_fn]
+fn gettimeofday(_lua: &Lua) -> LuaResult<(u64, u32)> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok((since_epoch.as_secs(), since_epoch.subsec_micros()))
+}
+
 lua_table! {
     /// System and environment utilities, modelled after `vim.uv`.
     ///
-    /// Provides access to the working directory, home directory, and environment
-    /// variables. None of these functions throw.
+    /// Provides access to the working directory, home directory, environment
+    /// variables and the wall clock. None of these functions throw.
     ///
     /// Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
     /// `os_getenv` reads the process environment, where secrets live, so it needs
@@ -52,6 +69,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), os_getenv(perms), gettimeofday,
     ]
 }
