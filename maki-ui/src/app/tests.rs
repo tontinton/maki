@@ -5019,6 +5019,8 @@ fn checkpoint_keeps_pending_background(held: bool, expected: &[&str]) {
 #[test_case(|app| app.recoverable_queue = vec![RECOVERED_PROMPT.into()], false, false ; "recovery_text_holds_the_wake")]
 #[test_case(|app| app.exit_request = ExitRequest::Error, false, false ; "failed_exit_holds_the_wake")]
 #[test_case(|app| app.chats[MAIN_CHAT].auth_parked = true, false, false ; "prompt_holds_the_wake")]
+#[test_case(open_plan_form, false, false ; "plan_form_holds_the_wake")]
+#[test_case(open_pack_review, false, false ; "pack_review_holds_the_wake")]
 fn a_pending_wake_is_work_only_while_it_may_run(
     hold: fn(&mut App),
     working: bool,
@@ -6979,6 +6981,17 @@ fn permission_request_reason_reaches_the_prompt() {
 
     assert!(app.permission_prompt.is_asking(FIRST_ASK));
     assert!(rendered(&mut app).contains(ASK_REASON));
+}
+
+pub(crate) fn open_question_float(app: &mut App) {
+    let config = maki_lua::FloatConfig {
+        needs_input: true,
+        ..maki_lua::FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (_cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
 fn open_plan_form(app: &mut App) {
@@ -10715,6 +10728,15 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
 }
 
+/// A plan form waits for the turn to end, but the review takes the keys as
+/// soon as it opens. So it waits on the user even while a turn streams.
+#[test]
+fn a_package_review_waits_on_the_user_while_a_turn_streams() {
+    let mut app = streaming_app();
+    open_pack_review(&mut app);
+    assert_eq!(app.attention(), Some(Notification::PackReview));
+}
+
 #[test]
 fn attention_float_marks_app_as_awaiting_input_until_close() {
     let mut app = test_app();
@@ -11309,6 +11331,7 @@ fn turn_response_stops_after_bounded_large_input() {
 #[test_case(Notification::AuthenticationRequired, "Authentication required", true ; "authentication")]
 #[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
 #[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
+#[test_case(Notification::PackReview, "Package changes to review", true ; "pack_review")]
 #[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
 fn notification_message_and_urgency(
     notification: Notification,
@@ -11370,7 +11393,6 @@ fn attention_classifies_auth_and_ready_plan() {
     assert_eq!(app.attention(), None);
     app.status = Status::Idle;
     assert_eq!(app.attention(), Some(Notification::PlanReady));
-    assert!(!app.awaiting_input());
 
     app.plan_form.hide();
     assert_eq!(app.attention(), None);

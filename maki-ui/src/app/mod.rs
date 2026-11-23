@@ -85,6 +85,7 @@ use maki_storage::model::{persist_expanded_providers, persist_thinking};
 use maki_storage::sessions::StoredThinking;
 
 use crate::storage_writer::StorageWriter;
+use crate::terminal::BlockedKind;
 use ratatui::layout::{Position, Rect};
 use strum::{EnumIter, IntoEnumIterator};
 use tokio::sync::oneshot;
@@ -430,12 +431,24 @@ pub(crate) enum Notification {
     AuthenticationRequired,
     QuestionRequested,
     PlanReady,
+    PackReview,
     AgentError { message: String },
 }
 impl Notification {
     /// Prompts blocking the agent outrank turn completions.
     pub(crate) fn is_urgent(&self) -> bool {
-        !matches!(self, Self::TurnComplete { .. } | Self::AgentError { .. })
+        self.blocked_kind().is_some()
+    }
+
+    /// The OSC 7501 kinds stop at permission, question and auth, so the plan
+    /// menu passes as a question and the package review as a permission.
+    pub(crate) fn blocked_kind(&self) -> Option<BlockedKind> {
+        match self {
+            Self::PermissionRequested { .. } | Self::PackReview => Some(BlockedKind::Permission),
+            Self::QuestionRequested | Self::PlanReady => Some(BlockedKind::Question),
+            Self::AuthenticationRequired => Some(BlockedKind::Auth),
+            Self::TurnComplete { .. } | Self::AgentError { .. } => None,
+        }
     }
 
     pub(crate) fn reason(&self) -> &'static str {
@@ -445,6 +458,7 @@ impl Notification {
             Self::AuthenticationRequired => "Authentication required",
             Self::QuestionRequested => "Question requested",
             Self::PlanReady => "Plan ready",
+            Self::PackReview => "Package review",
             Self::AgentError { .. } => "Agent error",
         }
     }
@@ -461,6 +475,7 @@ impl Notification {
             Self::AuthenticationRequired => "Authentication required".into(),
             Self::QuestionRequested => "Question requested".into(),
             Self::PlanReady => "Plan ready".into(),
+            Self::PackReview => "Package changes to review".into(),
             Self::AgentError { message } => message.clone(),
         }
     }
@@ -2576,10 +2591,8 @@ impl App {
         self.overlays().any(Overlay::is_open)
     }
 
-    /// True when the agent is parked on user input. Drives the `needs_input`
-    /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
+        self.attention().is_some()
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -2591,6 +2604,9 @@ impl App {
         }
         if self.turn_awaits_auth() {
             return Some(Notification::AuthenticationRequired);
+        }
+        if self.pack_review.is_open() {
+            return Some(Notification::PackReview);
         }
         if self.status != Status::Streaming && self.plan_form_open() {
             return Some(Notification::PlanReady);
