@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::{Permission, PluginHost, PluginPermissions};
@@ -7,6 +8,7 @@ const PERMISSION_DENIED_SUBSTR: &str = "permission denied";
 const CWD: &str = "maki.uv.cwd()";
 const HOMEDIR: &str = "maki.uv.os_homedir()";
 const GETENV: &str = r#"maki.uv.os_getenv("HOME")"#;
+const USEC_PER_SEC: u32 = 1_000_000;
 
 fn setup() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
@@ -24,6 +26,22 @@ fn os_getenv_returns_nil_for_missing_var() {
         "#,
     )
     .unwrap();
+}
+
+#[test]
+fn gettimeofday_needs_no_permission_and_tracks_the_wall_clock() {
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let chunk = format!(
+        r#"local sec, usec = maki.uv.gettimeofday()
+        assert(sec >= {before} and sec % 1 == 0, "sec: " .. tostring(sec))
+        assert(usec % 1 == 0 and usec >= 0 and usec < {USEC_PER_SEC}, "usec: " .. tostring(usec))"#
+    );
+    setup()
+        .load_source_with_permissions("uv_time", &chunk, PluginPermissions::denied())
+        .unwrap();
 }
 
 fn load_with(permission: Permission, chunk: &str) -> Result<(), maki_lua::PluginError> {

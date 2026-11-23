@@ -9101,8 +9101,8 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 
 System and environment utilities, modelled after `vim.uv`.
 
-Provides access to the working directory, home directory, and environment
-variables. None of these functions throw.
+Provides access to the working directory, home directory, environment
+variables and the wall clock. None of these functions throw.
 
 Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
 `os_getenv` reads the process environment, where secrets live, so it needs
@@ -9176,6 +9176,26 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.gettimeofday()` {#maki-uv-gettimeofday}
+
+```lua
+maki.uv.gettimeofday()
+```
+
+Return the wall clock time since the Unix epoch. Like
+`vim.uv.gettimeofday`.
+
+**Returns:** (`integer`, `integer`) Seconds, and the microseconds within that second.
+
+**Example:**
+
+```lua
+local sec, usec = maki.uv.gettimeofday()
+local now_ms = sec * 1000 + usec // 1000
 ```
 
 
