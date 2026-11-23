@@ -1,3 +1,4 @@
+--!strict
 -- When a tool is cut short, it still hands back what it printed. The marker
 -- tells the model that output is real but unfinished. One home for the
 -- wording and the painting, so every tool says it the same way.
@@ -17,7 +18,7 @@ local NO_OUTPUT = "no output before the cut"
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
-function M.cut(view, out, reason, timeout_secs, started_at)
+function M.cut(view, out: string, reason: string, timeout_secs: number, started_at: number)
   local tail = out ~= "" and SOME_OUTPUT or NO_OUTPUT
   local marker
   if reason == TIMEOUT_REASON then
