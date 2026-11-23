@@ -82,7 +82,10 @@ maki.api.register_tool({
 
     local parent = maki.fs.dirname(path)
     if parent then
-      maki.fs.mkdir(parent, { parents = true })
+      local _, mkdir_err = maki.fs.mkdir(parent, { parents = true })
+      if mkdir_err then
+        return { llm_output = "write error: " .. mkdir_err, is_error = true }
+      end
     end
 
     local write = input.append and maki.fs.append or maki.fs.write
