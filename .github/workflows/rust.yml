@@ -126,6 +126,10 @@ jobs:
       - name: Lint
         if: ${{ !cancelled() }}
         run: cd plugins && ../lute lint --sequential $(find . -name '*.lua')
+      # A rule that stops matching after a lute update reports nothing, so check that ours still fires.
+      - name: Lint rules fire
+        if: ${{ !cancelled() }}
+        run: cd plugins && ../lute lint --no-default-lints -s 'maki.fs.rm("x")' | grep -qF 'maki.fs.rm returns'
       # Luau's built-in lints until `lute lint` has them (luau-lang/lute#728). luau-analyze can't load
       # `maki.d.luau`, so its type errors are left to `lute check`, and it exits 0 on findings.
       - name: Analyzer lints
