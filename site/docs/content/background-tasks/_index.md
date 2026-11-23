@@ -112,7 +112,7 @@ You can type to a moved subagent in its tab. Other task tabs have no input box, 
 - **You.** The main agent gets it with your next message, without being woken. A subagent waiting on the call gets it right away.
 - **`task_stop`.** The tool waits up to five seconds and returns the output. A task that needs longer returns `stop requested`, and its output arrives later as a message that does not start a turn.
 
-`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives with the batch result.
+`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives later under its own id.
 
 ## Results
 
@@ -140,7 +140,7 @@ maki.setup({
 
 Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the whole batch moves.
 
-The batch receipt gives each running subagent its own task id. A subagent that ends while others still run reports its result under that id. The table shows what each id reaches:
+The batch receipt gives each running subagent its own task id. Each subagent's result names that id, including the last one, which comes back in the batch result. The table shows what each id reaches:
 
 | Id | `task_message` | `task_stop` |
 |----|----------------|-------------|

@@ -1784,7 +1784,11 @@ fn batch_parts_keep_their_place_and_leave_subagents_out() {
         ("2", EDIT_TOOL, PartStatus::Done),
         ("3", "slow", PartStatus::Done),
     ]);
-    assert!(!call.join().expect("batch thread").is_error);
+    let reply = call.join().expect("batch thread").output.as_text();
+    assert!(
+        reply.starts_with(&section(HOOKED_TOOL, "hooked:agent")),
+        "a reply that never moved keeps the plain header restore parses: {reply}"
+    );
 }
 
 /// A stopped batch lists what it cut short as cancelled, and what had

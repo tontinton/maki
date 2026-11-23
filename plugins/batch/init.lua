@@ -34,9 +34,7 @@ local BACKGROUND_PARAM = "background"
 local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
 local MOVED_ITEM_FMT = "- %s"
 local MOVED_ITEM_HEADER_FMT = ": %s"
--- A subagent child is a task of its own. Without its id the model has no way
--- to message or stop it alone.
-local MOVED_ITEM_TASK_FMT = " (task %s)"
+local TASK_ID_FMT = " (task %s)"
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
 
@@ -306,14 +304,24 @@ local function render_children(children)
   return lines, ranges
 end
 
+-- A subagent child is a task of its own. Its id is how the model messages
+-- or stops it alone, and how it tells which result belongs to which task.
+local function tool_label(c)
+  return c.task_id and c.tool .. string.format(TASK_ID_FMT, c.task_id) or c.tool
+end
+
 -- batch_policy.rs pins this exact llm format; keep it byte-identical.
 -- Returns the sections and how many of them failed, so the move receipt
 -- can reuse them without the summary line.
-local function render_sections(children)
+-- Only a moved batch's final reply passes `named`, so each subagent in it
+-- shows the id from its receipt line. That reply reaches the model as a
+-- notice, and restore never reads notices. The row's own result keeps plain
+-- `## tool` headers, so restore still parses it, in old builds too.
+local function render_sections(children, named)
   local out = {}
   local failed = 0
   for _, c in ipairs(children) do
-    out[#out + 1] = string.format(SECTION_FMT, c.tool)
+    out[#out + 1] = string.format(SECTION_FMT, named and tool_label(c) or c.tool)
     if c.status == STATUS.SUCCESS then
       out[#out + 1] = c.output or ""
     else
@@ -325,9 +333,9 @@ local function render_sections(children)
   return table.concat(out), failed
 end
 
-local function render_llm(children)
+local function render_llm(children, named)
   local total = #children
-  local sections, failed = render_sections(children)
+  local sections, failed = render_sections(children, named)
   if failed > 0 then
     return sections .. string.format(SUMMARY_MIXED_FMT, total - failed, total, failed)
   end
@@ -649,7 +657,7 @@ function Batch:reply()
   local note = self.foreground_reason and string.format(FOREGROUND_NOTE, tostring(self.foreground_reason)) or ""
   local children = self:unreported()
   return {
-    llm_output = note .. render_llm(children),
+    llm_output = note .. render_llm(children, self.ctx:backgrounded()),
     format = all_markdown(children) and MARKDOWN_FORMAT or nil,
     is_error = self.cancelled,
     body = self.buf,
@@ -748,8 +756,7 @@ function Batch:hand_over()
   local items = {}
   for i, c in ipairs(running) do
     local header = header_text(c)
-    items[i] = string.format(MOVED_ITEM_FMT, c.tool)
-      .. (c.task_id and string.format(MOVED_ITEM_TASK_FMT, c.task_id) or "")
+    items[i] = string.format(MOVED_ITEM_FMT, tool_label(c))
       .. (header ~= "" and string.format(MOVED_ITEM_HEADER_FMT, header) or "")
   end
   local sections = render_sections(finished)
