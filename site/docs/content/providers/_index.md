@@ -488,6 +488,7 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+| `like` | string | unset | `<slug>/<model>` to borrow capabilities from. See [Borrowing with like](#borrowing-with-like) |
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
@@ -515,6 +516,19 @@ You can also create a custom provider interactively with `maki auth login` and c
 
 In `/model`, a custom provider without a key shows `no key`. A provider whose model list request fails shows `offline`, or `fallback` when Maki still has models to list for it. Press Enter on a `no key` or `offline` row to open `/login` for that provider. For an entry in this file, login first shows its `base_url` so you can fix a moved endpoint, then asks for the key. Leave the key blank to keep the one from the env var, `api_key`, or an earlier login.
 
+### Borrowing with like
+
+`like = "<slug>/<model>"` says that a model is a known one under another name. It works the same on a `providers.toml` model, an [Aperture override](#aperture-overrides) and a plugin's [model row](#model-rows). Family, vision and tool examples that the model leaves out come from the row `<slug>` uses for `<model>`, so a local copy of a known model needs no repeated flags. Fields the model states and what discovery reports still win:
+
+```toml
+[[my-proxy.models]]
+id = "local-deepseek-flash"
+like = "deepseek/deepseek-flash"
+supports_vision = false
+```
+
+Limits, pricing and thinking stay with the model and its own provider, because they describe one deployment and the wire it speaks. The route stays the same too. Maki ignores a `like` that names no model it knows, and logs a warning for one in `providers.toml`.
+
 ### Aperture overrides
 
 Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
@@ -530,7 +544,24 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (see [Borrowing with like](#borrowing-with-like)). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Without `like`, an Aperture model borrows from the row its upstream id names when Maki knows that provider, so `aperture/openai/gpt-5.4` reads like `openai/gpt-5.4`. For limits, explicit fields win, then the gateway's published limits, then the routed table, then Aperture's fallback. Price comes only from the gateway. A namespaced or unfamiliar id needs a pin:
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+base = "anthropic"
+
+[aperture.overrides.baseten.models."deepseek-ai/DeepSeek-V4.1-Flash"]
+like = "deepseek/deepseek-flash"
+```
+
+`base` routes the model through the upstream's own protocol, so one that exposes `/v1/messages` (as the Bedrock example does) keeps native thinking. `like` keeps the generic route. The bundled `deepseek` plugin declares `deepseek-flash` as V4.1 Flash. Use `like` instead of `base` when the route should stay generic:
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+like = "anthropic/claude-opus-5"
+```
 
 Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
@@ -645,6 +676,7 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens. Unset reads the rates models.dev lists for this model under the provider's slug, or its `base`. Without them the price is unknown |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
 | `family` | string | provider's | `generic`, `claude`, `gpt`, `gemini`, `glm` or `synthetic` |
+| `like` | string | unset | `<slug>/<model>` to borrow capabilities from. See [Borrowing with like](#borrowing-with-like) |
 | `default` | bool | first row of its tier | The tier's default model. At most one per tier |
 
 An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.

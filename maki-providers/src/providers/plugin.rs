@@ -3078,6 +3078,23 @@ mod tests {
         assert_eq!(listed.context_window, unlisted.context_window);
     }
 
+    #[test]
+    fn a_row_borrows_capabilities_with_like() {
+        const SLUG: &str = "like-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.models[0] = serde_json::from_value(serde_json::json!({
+            "prefixes": [MODEL_ID],
+            "like": "zai/glm-5.3",
+        }))
+        .unwrap();
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert!(!model.supports_vision());
+        assert!(!model.supports_tool_examples());
+    }
+
     fn authored_cap(stated: Option<Value>) -> Value {
         let mut authored = serde_json::json!({
             "slug": CAP_SLUG,
