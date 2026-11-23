@@ -3584,12 +3584,12 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 - `{pattern}` (`string`) Regular expression to search for.
 - `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
-**Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
+**Returns:** (`table?`, `string?`, `table?`) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 
 **Example:**
 
 ```lua
-local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+local hits, err, omitted = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 if err then return end
 for _, file in ipairs(hits) do
   for _, g in ipairs(file.groups) do
@@ -3598,6 +3598,7 @@ for _, file in ipairs(hits) do
     end
   end
 end
+if omitted then print(omitted.groups .. " more not shown") end
 ```
 
 ---
