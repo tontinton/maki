@@ -3,16 +3,12 @@ return function(U)
   local find_child = U.find_child
   local compact_ws = U.compact_ws
   local new_entry = U.new_entry
-  local new_import_entry = U.new_import_entry
   local simple_import = U.simple_import
   local SECTION = U.SECTION
   local CHILD_BRIEF = U.CHILD_BRIEF
   local prefixed = U.prefixed
   local extract_enum_variants = U.extract_enum_variants
   local extract_body_members = U.extract_body_members
-  local format_range = U.format_range
-  local line_start = U.line_start
-  local line_end = U.line_end
 
   local MODIFIER_KEYWORDS = {
     public = true,

@@ -74,7 +74,7 @@ return function(U)
           end
         end
 
-        for i, expr in ipairs(expr_children) do
+        for _, expr in ipairs(expr_children) do
           if expr:type() == "function_call" then
             local imp = import_from_require(expr, source)
             if imp then

@@ -13,7 +13,6 @@ return function(U)
   local is_imports_binding = ast.is_imports_binding
   local collect_list_paths = ast.collect_list_paths
   local segments_from_element = ast.segments_from_element
-  local attrset_lookup = ast.attrset_lookup
   local derivation_pname = ast.derivation_pname
   local is_import_apply = ast.is_import_apply
 

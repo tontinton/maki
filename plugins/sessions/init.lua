@@ -163,7 +163,7 @@ local function render()
   board.reserved = ListPicker.render_header(board.win, lines, input, prefix, inner)
   local cursor_line = board.reserved
   local words = filter_words()
-  for i, s in ipairs(board.items) do
+  for _, s in ipairs(board.items) do
     local selected = s.id == board.sel_id
     local icon, icon_style, spinning = icon_of(s)
     local base = selected and "selected" or "item"

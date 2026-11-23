@@ -8,7 +8,6 @@ local case = th.case
 local idx = helpers.idx
 local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
-local lacks = helpers.lacks
 
 case("c_all_sections", function()
   local src = [==[

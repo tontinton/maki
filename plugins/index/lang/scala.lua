@@ -10,9 +10,6 @@ return function(U)
   local CHILD_BRIEF = U.CHILD_BRIEF
   local prefixed = U.prefixed
   local extract_body_members = U.extract_body_members
-  local format_range = U.format_range
-  local line_start = U.line_start
-  local line_end = U.line_end
 
   local MODIFIER_KINDS = {
     access_modifier = true,

@@ -821,9 +821,8 @@ local function default_extract(lang, source, root)
   local is_test = lang.is_test_node
 
   for _, child in ipairs(root:children()) do
-    if (is_attr and is_attr(child)) or (is_doc and is_doc(child, source)) then
-      -- these get attached to the next real item instead
-    else
+    -- Attributes and doc comments get attached to the next real item instead.
+    if not ((is_attr and is_attr(child)) or (is_doc and is_doc(child, source))) then
       local attrs = collect_preceding_attrs(child, is_attr)
       if is_test and is_test(child, source, attrs) then
         test_lines[#test_lines + 1] = line_start(child)

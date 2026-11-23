@@ -15,9 +15,9 @@ local rmtree = th.rmtree
 
 local dir_listing = require("maki.dir_listing")
 
-local function mock_ctx(path)
+local function mock_ctx()
   return {
-    is_instruction_file = function(self, name)
+    is_instruction_file = function(_, name)
       local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
       return set[name] or false
     end,
@@ -40,7 +40,7 @@ case("dir_listing_sort_and_filter", function()
   maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
   maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
 
-  local listing, err = dir_listing.list(tmpdir, mock_ctx(tmpdir))
+  local listing, err = dir_listing.list(tmpdir, mock_ctx())
   assert(err == nil, "dir listing should succeed: " .. tostring(err))
   eq(#listing.names, 7)
   eq(listing.names[1], "adir/")

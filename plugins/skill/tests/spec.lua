@@ -76,7 +76,7 @@ case("frontmatter_body_with_embedded_triple_dashes", function()
 end)
 
 case("frontmatter_only_dashes_no_yaml", function()
-  local fm, body = parse_frontmatter("---\n\n---\nBody")
+  local _, body = parse_frontmatter("---\n\n---\nBody")
   eq(body, "Body")
 end)
 

@@ -149,7 +149,7 @@ return function(U)
 
   local extract_nodes
 
-  local function dispatch(kind, node, source, attrs)
+  local function dispatch(kind, node, source)
     if kind == "create_table" then
       return { extract_table(node, source) }
     elseif kind == "create_view" then
@@ -180,11 +180,11 @@ return function(U)
   extract_nodes = function(node, source, attrs)
     local kind = node:type()
     if RECOGNIZED[kind] then
-      return dispatch(kind, node, source, attrs)
+      return dispatch(kind, node, source)
     elseif kind == "statement" then
       for _, child in ipairs(node:children()) do
         if RECOGNIZED[child:type()] then
-          return dispatch(child:type(), child, source, attrs)
+          return dispatch(child:type(), child, source)
         end
       end
       return {}
