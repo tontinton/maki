@@ -301,14 +301,6 @@ fn select_notification(
     }
 }
 
-fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
-    match attention {
-        Some(Notification::AuthenticationRequired) => BlockedKind::Auth,
-        Some(Notification::QuestionRequested) => BlockedKind::Question,
-        _ => BlockedKind::Permission,
-    }
-}
-
 fn program_state_rank(state: ProgramState) -> u8 {
     match state {
         ProgramState::Idle => 0,
@@ -449,8 +441,12 @@ impl SessionRuntime {
         let state = match self.last_status {
             SessionStatus::NeedsInput => {
                 let attention = self.app.attention();
+                let kind = attention
+                    .as_ref()
+                    .and_then(Notification::blocked_kind)
+                    .unwrap_or(BlockedKind::Permission);
                 let msg = attention.as_ref().map(Notification::message);
-                return (ProgramState::Blocked(blocked_kind(attention.as_ref())), msg);
+                return (ProgramState::Blocked(kind), msg);
             }
             SessionStatus::Working => ProgramState::Working,
             SessionStatus::Idle => self.notifications.outcome.unwrap_or(ProgramState::Idle),
@@ -2763,7 +2759,9 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 mod tests {
     use super::*;
     use crate::agent::model_slots::tests::{OTHER_SPEC, STARTUP_SPEC, slots, strict_policy};
-    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
+    use crate::app::tests::{
+        MOVED_ID, app_with_moved_call, end_turn, open_question_float, streaming_app,
+    };
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::provider::BoxFuture;
@@ -3026,6 +3024,16 @@ mod tests {
 
         app.end_task(MOVED_ID, BackgroundOutcome::Done);
         assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
+    }
+
+    /// The question tool asks mid-turn. The user has to hear about it, not
+    /// just see a spinner.
+    #[test]
+    fn a_question_outranks_the_turn_that_asks_it() {
+        let mut app = streaming_app();
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Working);
+        open_question_float(&mut app);
+        assert_eq!(SessionStatus::of(&app), SessionStatus::NeedsInput);
     }
 
     const PACK_ANSWER: &str = "prepared";

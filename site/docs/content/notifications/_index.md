@@ -24,6 +24,7 @@ Maki uses these messages:
 - `Authentication required` when authentication needs attention.
 - `Question requested` for a question prompt.
 - `Plan ready` when a plan is ready.
+- `Package changes to review` when a package review waits on you.
 
 Response previews can appear in your operating system's notification history.
 Maki does not include tool arguments, permission scopes, question bodies, plan
@@ -73,7 +74,7 @@ waits on you. Other terminals ignore it.
 | --- | --- |
 | `idle` | Nothing runs or waits. |
 | `working` | A turn or a background task runs. |
-| `blocked` | A permission prompt, question, plan, or login waits on you. |
+| `blocked` | A permission prompt, question, plan, package review, or login waits on you. |
 | `done` | The last turn finished. |
 | `error` | The last turn stopped with an error. |
 
