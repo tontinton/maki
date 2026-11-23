@@ -44,6 +44,10 @@ fmt:
 check-lua:
     cd plugins && lute check $(find . -name '*.lua')
 
+# Same command as CI, with lute's default rules. Prefix a deliberately unused variable with `_`.
+lint-lua:
+    cd plugins && lute lint $(find . -name '*.lua')
+
 pylint:
     ruff check scripts/
     ty check scripts/
