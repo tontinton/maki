@@ -189,7 +189,7 @@ local function finish(commit)
   end
   board = nil
   if not commit and closing.origin_id then
-    maki.task.focus(closing.origin_id)
+    local _ = maki.task.focus(closing.origin_id)
   end
   closing.win:close()
 end
