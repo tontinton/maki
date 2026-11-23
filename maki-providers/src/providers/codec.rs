@@ -16,7 +16,7 @@ use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::headers::{HeaderError, header_name, parse_headers};
-use crate::model::{Model, ModelEffort, ModelInfo, ThinkingSupport};
+use crate::model::{FactSource, Model, ModelEffort, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
@@ -228,6 +228,7 @@ impl OpenAiWire {
     pub(crate) fn adjust_model(&self, model: &mut Model) {
         if let Some(support) = self.thinking_override(&model.id) {
             model.thinking_override = Some(support);
+            model.sources.thinking = FactSource::Table;
         }
     }
 

@@ -873,7 +873,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::headers::parse_headers;
-    use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::model::{FactSources, Model, ModelPricing, ModelTier};
     use crate::test_support::{Canned, serve, sse_body};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1611,6 +1611,7 @@ data: [DONE]\n\n";
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 131_072,
             thinking_fields: None,
         }

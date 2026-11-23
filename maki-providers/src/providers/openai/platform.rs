@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ThinkingConfig;
 use crate::headers::HeaderError;
-use crate::model::{FastSupport, Model, ModelInfo};
+use crate::model::{FactSource, FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{EffortDialect, ThinkingFallback};
@@ -612,8 +612,10 @@ impl Provider for OpenAi {
         ));
         let declared_window = model_registry::discovered(&CONFIG.slug, &model.id)
             .and_then(|discovered| discovered.context_window);
-        if declared_window.is_none() {
-            model.context_window = model.context_window.min(plan_context_window(&model.id));
+        let plan_window = plan_context_window(&model.id);
+        if declared_window.is_none() && plan_window < model.context_window {
+            model.context_window = plan_window;
+            model.sources.context_window = FactSource::Default;
         }
     }
 }

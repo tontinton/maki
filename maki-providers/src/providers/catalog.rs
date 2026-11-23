@@ -1154,7 +1154,7 @@ mod tests {
         ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
         parse_model, quirks_for,
     };
-    use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+    use crate::model::{FactSources, Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, opencode};
     use crate::spec::ProviderRegistry;
@@ -1340,6 +1340,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 0,
             thinking_fields: None,
         };

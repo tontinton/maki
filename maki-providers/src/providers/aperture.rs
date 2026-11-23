@@ -9,7 +9,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::model::{
-    Capabilities, Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
+    Capabilities, FactSource, Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport,
+    lookup_entry,
 };
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -477,34 +478,56 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     let routed = routed_spec(provider_id, &ov);
     if let Some(spec) = routed {
         model.family = spec.family;
-        model.thinking_override = model
-            .thinking_override
-            .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
+        if model.thinking_override.is_none() {
+            model.thinking_override =
+                ThinkingSupport::from_flags(Some(spec.supports_thinking), false);
+            model.sources.thinking = FactSource::Default;
+        }
         if let Some(entry) = lookup_entry(spec.models(), model_id) {
-            model.context_window = payload_context
-                .or(entry.context_window)
-                .unwrap_or(model.context_window);
-            model.max_output_tokens = payload_output
-                .or(entry.max_output_tokens)
-                .or(model.max_output_tokens);
+            if let Some((tokens, source)) = sourced(payload_context, entry.context_window) {
+                model.context_window = tokens;
+                model.sources.context_window = source;
+            }
+            if let Some((tokens, source)) = sourced(payload_output, entry.max_output_tokens) {
+                model.max_output_tokens = Some(tokens);
+                model.sources.max_output_tokens = source;
+            }
         }
     }
-    if let Some(borrowed) = borrowed_capabilities(&ov, routed, provider_id, model_id) {
+    if let Some((borrowed, source)) = borrowed_capabilities(&ov, routed, provider_id, model_id) {
         model.family = borrowed.family;
         model.supports_tool_examples_override = model
             .supports_tool_examples_override
             .or(borrowed.supports_tool_examples);
-        model.supports_vision_override =
-            model.supports_vision_override.or(borrowed.supports_vision);
+        if model.supports_vision_override.is_none() && borrowed.supports_vision.is_some() {
+            model.supports_vision_override = borrowed.supports_vision;
+            model.sources.vision = source;
+        }
     }
     if let Some(cw) = ov.context_window {
         model.context_window = cw;
+        model.sources.context_window = FactSource::Config;
     }
-    model.max_output_tokens = ov.max_output_tokens.or(model.max_output_tokens);
+    if let Some(tokens) = ov.max_output_tokens {
+        model.max_output_tokens = Some(tokens);
+        model.sources.max_output_tokens = FactSource::Config;
+    }
     if let Some(thinking) = ov.supports_thinking {
         model.thinking_override = ThinkingSupport::from_flags(Some(thinking), false);
+        model.sources.thinking = FactSource::Config;
     }
-    model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
+    if let Some(vision) = ov.supports_vision {
+        model.supports_vision_override = Some(vision);
+        model.sources.vision = FactSource::Config;
+    }
+}
+
+/// The gateway's own limit describes this deployment, so it outranks the
+/// routed table.
+fn sourced(payload: Option<u32>, table: Option<u32>) -> Option<(u32, FactSource)> {
+    payload
+        .map(|tokens| (tokens, FactSource::Discovery))
+        .or_else(|| Some((table?, FactSource::Table)))
 }
 
 /// An explicit `like` wins. Without one the gateway already names the
@@ -514,11 +537,12 @@ fn borrowed_capabilities(
     routed: Option<&'static ProviderSpec>,
     provider_id: &str,
     model_id: &str,
-) -> Option<Capabilities> {
-    ov.like.as_deref().and_then(Capabilities::like).or_else(|| {
-        let upstream = routed.or_else(|| ProviderRegistry::get(provider_id))?;
-        Capabilities::of(upstream, model_id)
-    })
+) -> Option<(Capabilities, FactSource)> {
+    if let Some(borrowed) = ov.like.as_deref().and_then(Capabilities::like) {
+        return Some((borrowed, FactSource::Like));
+    }
+    let upstream = routed.or_else(|| ProviderRegistry::get(provider_id))?;
+    Some((Capabilities::of(upstream, model_id)?, FactSource::Table))
 }
 
 impl Provider for Aperture {
@@ -924,6 +948,8 @@ mod tests {
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.context_window, 123_456);
         assert_eq!(model.max_output_tokens, Some(7_890));
+        assert_eq!(model.sources.context_window, FactSource::Discovery);
+        assert_eq!(model.sources.max_output_tokens, FactSource::Discovery);
         crate::model_registry::set_known_models("aperture", Vec::new());
     }
 
@@ -1089,11 +1115,12 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(model.family, ModelFamily::Claude);
-        assert!(model.supports_vision());
+        assert_eq!(model.vision_with_source(), (true, FactSource::Like));
         assert!(model.supports_tool_examples());
         assert_eq!(model.context_window, SPEC.fallback_context_window);
+        assert_eq!(model.sources.context_window, FactSource::Default);
         assert!(model.pricing.is_zero());
-        assert!(!model.supports_thinking());
+        assert_eq!(model.thinking_with_source(), (false, FactSource::Default));
     }
 
     #[test]
@@ -1105,8 +1132,9 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(model.family, ModelFamily::Claude);
-        assert!(!model.supports_vision());
+        assert_eq!(model.vision_with_source(), (false, FactSource::Config));
         assert_eq!(model.context_window, 1_000);
+        assert_eq!(model.sources.context_window, FactSource::Config);
     }
 
     #[test]
@@ -1125,7 +1153,7 @@ mod tests {
         let mut model = Model::from_spec("aperture/openai/gpt-6-sol").unwrap();
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.family, ModelFamily::Gpt);
-        assert!(model.supports_vision());
+        assert_eq!(model.vision_with_source(), (true, FactSource::Table));
     }
 
     #[test]
@@ -1383,7 +1411,7 @@ supports_vision = true
     fn a_generic_pin_reports_what_the_chat_spelling_sends() {
         let overrides = pinned_thinking();
         let model = opaque_model(&overrides);
-        assert!(model.supports_thinking());
+        assert_eq!(model.thinking_with_source(), (true, FactSource::Config));
         assert_eq!(
             routed_sends_thinking(&overrides, &model, ThinkingConfig::Effort(Effort::Max)),
             ThinkingConfig::Effort(Effort::High)
