@@ -1,3 +1,4 @@
+--!strict
 -- Typed readers for provider model-list and usage JSON, for use in
 -- `list_models` and `fetch_usage` hooks.
 --
@@ -9,7 +10,10 @@ local U32_MAX = 4294967295
 local U64_MAX = 2 ^ 64
 local PER_MILLION = 1000000
 
-local function whole(value: unknown, max)
+export type Pricing = { input: number, output: number, cache_write: number, cache_read: number }
+export type Row = { id: string }
+
+local function whole(value: unknown, max: number): number?
   if type(value) ~= "number" or value ~= math.floor(value) or value < 0 or value > max then
     return nil
   end
@@ -17,17 +21,17 @@ local function whole(value: unknown, max)
 end
 
 --- A whole, non-negative number up to 2^64, or nil.
-function M.as_u64(value)
+function M.as_u64(value: unknown): number?
   return whole(value, U64_MAX)
 end
 
 --- A whole, non-negative number that fits a u32, or nil.
-function M.as_u32(value)
+function M.as_u32(value: unknown): number?
   return whole(value, U32_MAX)
 end
 
 --- A number, or nil.
-function M.as_f64(value)
+function M.as_f64(value: unknown): number?
   if type(value) ~= "number" then
     return nil
   end
@@ -35,7 +39,7 @@ function M.as_f64(value)
 end
 
 --- A boolean, or nil.
-function M.as_bool(value)
+function M.as_bool(value: unknown): boolean?
   if type(value) ~= "boolean" then
     return nil
   end
@@ -45,7 +49,7 @@ end
 --- A model row's `pricing`, converted from per-token to per-million-token
 --- dollars. Nil unless both `input` and `output` are given, so a partial price
 --- never reads as free. A missing cache price is 0.
-function M.pricing(input, output, cache_write, cache_read)
+function M.pricing(input: number?, output: number?, cache_write: number?, cache_read: number?): Pricing?
   if input == nil or output == nil then
     return nil
   end
@@ -60,17 +64,17 @@ end
 --- Maps each `body.data` element through `parse_row`, drops nils, keeps the
 --- first row per id, and sorts by id. Returns an empty list when `data` is
 --- not an array.
-function M.models(body, parse_row)
-  local rows, seen = {}, {}
-  local data = type(body) == "table" and body.data
-  for _, raw in ipairs(type(data) == "table" and data or {}) do
+function M.models(body: unknown, parse_row: (unknown) -> Row?): { Row }
+  local rows: { Row }, seen: { [string]: true } = {}, {}
+  local data = type(body) == "table" and (body :: { data: unknown }).data
+  for _, raw in ipairs(type(data) == "table" and data :: { unknown } or {}) do
     local row = parse_row(raw)
     if row and not seen[row.id] then
       seen[row.id] = true
       table.insert(rows, row)
     end
   end
-  table.sort(rows, function(a, b)
+  table.sort(rows, function(a: Row, b: Row): boolean
     return a.id < b.id
   end)
   return rows

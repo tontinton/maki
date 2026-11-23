@@ -9330,26 +9330,27 @@ shown as full source, larger ones as their public interface.
 ### `require("maki.color")`
 
 ```lua
+--!strict
 local M = {}
 
-function M.lerp(from, to, t)
+function M.lerp(from: string, to: string, t: number): string?
   local fr, fg, fb = from:match("^#(%x%x)(%x%x)(%x%x)$")
   local tr, tg, tb = to:match("^#(%x%x)(%x%x)(%x%x)$")
   if not fr or not tr then
     return nil
   end
-  fr, fg, fb = tonumber(fr, 16), tonumber(fg, 16), tonumber(fb, 16)
-  tr, tg, tb = tonumber(tr, 16), tonumber(tg, 16), tonumber(tb, 16)
-  local r = math.floor(fr + (tr - fr) * t + 0.5)
-  local g = math.floor(fg + (tg - fg) * t + 0.5)
-  local b = math.floor(fb + (tb - fb) * t + 0.5)
-  return string.format("#%02x%02x%02x", r, g, b)
+  -- The pattern matched, so every capture is two hex digits.
+  local function channel(from_hex: string?, to_hex: string?): number
+    local a, b = tonumber(from_hex, 16) :: number, tonumber(to_hex, 16) :: number
+    return math.floor(a + (b - a) * t + 0.5)
+  end
+  return string.format("#%02x%02x%02x", channel(fr, tr), channel(fg, tg), channel(fb, tb))
 end
 
-function M.dim(color, factor)
+function M.dim(color: string, factor: number): string?
   local background = maki.ui.theme_style("background")
   local bg = background and background.bg
-  return bg and M.lerp(color, bg, factor)
+  return if bg then M.lerp(color, bg, factor) else nil
 end
 
 return M
@@ -9381,6 +9382,7 @@ function M.replace(content, old_string, new_string, replace_all)
 ### `require("maki.list_nav")`
 
 ```lua
+--!strict
 -- Moves a cursor through a list, so every picker answers the same keys. It
 -- keeps no state: you pass the key, the cursor row and a function that moves
 -- the cursor. The list and the drawing stay yours.
@@ -9400,7 +9402,7 @@ ListNav.KEYS = table.freeze({
   ["<Down>"] = "down",
   ["<PageUp>"] = "page_up",
   ["<PageDown>"] = "page_down",
-})
+} :: Keys)
 
 -- Adds j and k, for a list without a text input.
 ListNav.VIM_KEYS = table.freeze({
@@ -9410,7 +9412,7 @@ ListNav.VIM_KEYS = table.freeze({
   ["<PageDown>"] = "page_down",
   j = "down",
   k = "up",
-})
+} :: Keys)
 
 -- Calls {move_to}(row) for a navigation {key} and returns whether {key} is
 -- one, so you know when to pass it on. It returns true even when the cursor
@@ -9425,7 +9427,7 @@ ListNav.VIM_KEYS = table.freeze({
 --     spacers or headings
 --   keys: key -> "up"|"down"|"page_up"|"page_down", with keys spelled as
 --     `maki.keymap.normalize` returns them. Defaults to `ListNav.KEYS`
-function ListNav.handle_key(key, cursor, opts, move_to)
+function ListNav.handle_key(key: string, cursor: number, opts: Opts, move_to: (row: number) -> ()): boolean
 ```
 
 ### `require("maki.list_picker")`
@@ -9541,6 +9543,7 @@ function M.cut_middle(text, max_lines, max_bytes)
 ### `require("maki.partial")`
 
 ```lua
+--!strict
 -- When a tool is cut short, it still hands back what it printed. The marker
 -- tells the model that output is real but unfinished. One home for the
 -- wording and the painting, so every tool says it the same way.
@@ -9549,12 +9552,13 @@ function M.cut_middle(text, max_lines, max_bytes)
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
-function M.cut(view, out, reason, timeout_secs, started_at)
+function M.cut(view, out: string, reason: string, timeout_secs: number, started_at: number)
 ```
 
 ### `require("maki.provider_parse")`
 
 ```lua
+--!strict
 -- Typed readers for provider model-list and usage JSON, for use in
 -- `list_models` and `fetch_usage` hooks.
 --
@@ -9562,34 +9566,35 @@ function M.cut(view, out, reason, timeout_secs, started_at)
 -- and in an array it stops `ipairs`. Numbers above 2^53 come back rounded.
 
 --- A whole, non-negative number up to 2^64, or nil.
-function M.as_u64(value)
+function M.as_u64(value: unknown): number?
 
 --- A whole, non-negative number that fits a u32, or nil.
-function M.as_u32(value)
+function M.as_u32(value: unknown): number?
 
 --- A number, or nil.
-function M.as_f64(value)
+function M.as_f64(value: unknown): number?
 
 --- A boolean, or nil.
-function M.as_bool(value)
+function M.as_bool(value: unknown): boolean?
 
 --- A model row's `pricing`, converted from per-token to per-million-token
 --- dollars. Nil unless both `input` and `output` are given, so a partial price
 --- never reads as free. A missing cache price is 0.
-function M.pricing(input, output, cache_write, cache_read)
+function M.pricing(input: number?, output: number?, cache_write: number?, cache_read: number?): Pricing?
 
 --- Maps each `body.data` element through `parse_row`, drops nils, keeps the
 --- first row per id, and sorts by id. Returns an empty list when `data` is
 --- not an array.
-function M.models(body, parse_row)
+function M.models(body: unknown, parse_row: (unknown) -> Row?): { Row }
 ```
 
 ### `require("maki.scroll")`
 
 ```lua
+--!strict
 -- Relative scrolling on top of maki.fn.winsaveview / winrestview.
 -- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
-local function scroll(delta)
+local function scroll(delta: number): (boolean?, string?)
   local view, err = maki.fn.winsaveview()
   if not view then
     return nil, err
@@ -9603,11 +9608,12 @@ return scroll
 ### `require("maki.shorten_path")`
 
 ```lua
-local function normalize_sep(s)
-  return s:gsub("\\", "/")
+--!strict
+local function normalize_sep(s: string): string
+  return (s:gsub("\\", "/"))
 end
 
-local function shorten_path(path)
+local function shorten_path(path: string): string
   local p = normalize_sep(path)
   local cwd = maki.uv.cwd()
   if cwd then
@@ -9634,16 +9640,17 @@ return shorten_path
 ### `require("maki.test_helpers")`
 
 ```lua
+--!strict
 -- Shared test helpers for Lua plugin specs.
 --
 -- Provides a lightweight test harness: `case` wraps each block in pcall so a
 -- single failure does not abort the rest of the suite. Failures are collected
 -- and surfaced by `report()` at the end.
-function M.case(name, fn)
-function M.eq(actual, expected, msg)
-function M.has(s, substr, msg)
-function M.mktmpdir(prefix)
-function M.rmtree(dir)
+function M.case(name: string, fn: () -> ())
+function M.eq(actual: unknown, expected: unknown, msg: string?)
+function M.has(s: string, substr: string, msg: string?)
+function M.mktmpdir(prefix: string?): string
+function M.rmtree(dir: string)
 function M.report()
 ```
 
@@ -9712,6 +9719,7 @@ function TextInput:render(prefix, prefix_width, width)
 ### `require("maki.toast")`
 
 ```lua
+--!strict
 -- Corner toast notifications built on floating windows. `maki.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
@@ -9719,7 +9727,7 @@ function TextInput:render(prefix, prefix_width, width)
 -- Show {text} as a toast, up to 5 lines of it. {opts}: title (string),
 -- timeout_secs (integer, default 4). Returns right away and the toast
 -- dismisses itself when the time is up.
-function Toast.show(text, opts)
+function Toast.show(text: unknown, opts: Opts?)
 ```
 
 ### `require("maki.tool_view")`
@@ -9783,6 +9791,7 @@ function ToolView.restore_markdown(output, is_error, opts)
 ### `require("maki.truncate")`
 
 ```lua
+--!strict
 --- require("maki.truncate")(text, max_lines, max_bytes)
 --- Cuts {text} to the limits and notes how many bytes it dropped. A nil limit
 --- is unlimited.

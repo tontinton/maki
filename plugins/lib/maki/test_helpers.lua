@@ -1,3 +1,4 @@
+--!strict
 -- Shared test helpers for Lua plugin specs.
 --
 -- Provides a lightweight test harness: `case` wraps each block in pcall so a
@@ -6,22 +7,22 @@
 
 local M = {}
 
-local failures = {}
+local failures: { string } = {}
 
-function M.case(name, fn)
+function M.case(name: string, fn: () -> ())
   local ok, err = pcall(fn)
   if not ok then
     table.insert(failures, name .. ": " .. tostring(err))
   end
 end
 
-function M.eq(actual, expected, msg)
+function M.eq(actual: unknown, expected: unknown, msg: string?)
   if actual ~= expected then
     error((msg or "") .. "\nexpected: " .. tostring(expected) .. "\n  actual: " .. tostring(actual))
   end
 end
 
-function M.has(s, substr, msg)
+function M.has(s: string, substr: string, msg: string?)
   if not s:find(substr, 1, true) then
     error((msg or "") .. "\nexpected to contain: " .. tostring(substr) .. "\n  actual: " .. tostring(s))
   end
@@ -29,7 +30,7 @@ end
 
 local _tmpdir_counter = 0
 
-function M.mktmpdir(prefix)
+function M.mktmpdir(prefix: string?): string
   _tmpdir_counter = _tmpdir_counter + 1
   local name = "/tmp/maki_"
     .. (prefix or "test")
@@ -41,7 +42,7 @@ function M.mktmpdir(prefix)
   return name
 end
 
-function M.rmtree(dir)
+function M.rmtree(dir: string)
   maki.fs.rm(dir, { recursive = true })
 end
 
