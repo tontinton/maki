@@ -1,4 +1,4 @@
-use crate::terminal;
+use crate::terminal::{self, ClipboardRoute};
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
@@ -35,12 +35,14 @@ pub(crate) fn read_text() -> Option<String> {
 
 pub(crate) struct ClipboardState {
     native: Option<Clipboard>,
+    route: ClipboardRoute,
 }
 
 impl ClipboardState {
     pub(crate) fn new() -> Self {
         Self {
             native: Clipboard::new().ok(),
+            route: terminal::caps().clipboard,
         }
     }
 
@@ -48,14 +50,28 @@ impl ClipboardState {
     /// desktop's clipboard.
     #[cfg(test)]
     pub(crate) fn terminal_only() -> Self {
-        Self { native: None }
+        Self {
+            native: None,
+            route: ClipboardRoute::NativeElseOsc52,
+        }
     }
 
     pub(crate) fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {
-        Self::copy_text_impl(text, |t| self.copy_native(t), terminal::copy_to_clipboard)
+        let route = self.route;
+        Self::copy_text_impl(
+            text,
+            route,
+            |t| self.copy_native(t),
+            terminal::copy_to_clipboard,
+        )
     }
 
-    fn copy_text_impl<F, G>(text: &str, native: F, osc52: G) -> Result<CopyResult, String>
+    fn copy_text_impl<F, G>(
+        text: &str,
+        route: ClipboardRoute,
+        native: F,
+        osc52: G,
+    ) -> Result<CopyResult, String>
     where
         F: FnOnce(&str) -> Result<(), String>,
         G: FnOnce(&str) -> Result<(), String>,
@@ -63,13 +79,15 @@ impl ClipboardState {
         if text.is_empty() {
             return Ok(CopyResult::Noop);
         }
-        let native_err = match native(text) {
-            Ok(()) => return Ok(CopyResult::Copied),
-            Err(e) => e,
-        };
-        match osc52(text) {
-            Ok(()) => Ok(CopyResult::Copied),
-            Err(osc52_err) => Err(format!("native ({native_err}); osc52 ({osc52_err})")),
+        let native_result = native(text);
+        if native_result.is_ok() && route == ClipboardRoute::NativeElseOsc52 {
+            return Ok(CopyResult::Copied);
+        }
+        match (native_result, osc52(text)) {
+            (Ok(()), _) | (_, Ok(())) => Ok(CopyResult::Copied),
+            (Err(native_err), Err(osc52_err)) => {
+                Err(format!("native ({native_err}); osc52 ({osc52_err})"))
+            }
         }
     }
 
@@ -104,57 +122,67 @@ impl ClipboardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::ClipboardRoute::{NativeAndOsc52, NativeElseOsc52};
     use std::cell::Cell;
+    use test_case::test_case;
 
-    #[test]
-    fn empty_text_is_noop_and_skips_both_backends() {
-        let native_called = Cell::new(false);
+    fn ok() -> Result<(), String> {
+        Ok(())
+    }
+
+    fn failed() -> Result<(), String> {
+        Err("failed".into())
+    }
+
+    #[test_case(NativeElseOsc52, ok(),     ok()     => (true, false) ; "native_success_skips_osc52")]
+    #[test_case(NativeElseOsc52, failed(), ok()     => (true, true)  ; "native_failure_falls_back_to_osc52")]
+    #[test_case(NativeAndOsc52,  ok(),     ok()     => (true, true)  ; "both_sends_osc52_after_native_success")]
+    #[test_case(NativeAndOsc52,  ok(),     failed() => (true, true)  ; "both_native_success_survives_osc52_failure")]
+    #[test_case(NativeAndOsc52,  failed(), ok()     => (true, true)  ; "both_osc52_success_survives_native_failure")]
+    #[test_case(NativeAndOsc52,  failed(), failed() => (false, true) ; "both_fails_only_when_both_fail")]
+    fn copy_backends(
+        route: ClipboardRoute,
+        native: Result<(), String>,
+        osc52: Result<(), String>,
+    ) -> (bool, bool) {
         let osc52_called = Cell::new(false);
         let result = ClipboardState::copy_text_impl(
-            "",
+            "hello",
+            route,
+            |_| native,
             |_| {
-                native_called.set(true);
+                osc52_called.set(true);
+                osc52
+            },
+        );
+        (matches!(result, Ok(CopyResult::Copied)), osc52_called.get())
+    }
+
+    #[test_case(NativeElseOsc52 ; "native_else_osc52")]
+    #[test_case(NativeAndOsc52  ; "native_and_osc52")]
+    fn empty_text_is_noop_and_skips_both_backends(route: ClipboardRoute) {
+        let called = Cell::new(false);
+        let result = ClipboardState::copy_text_impl(
+            "",
+            route,
+            |_| {
+                called.set(true);
                 Ok(())
             },
             |_| {
-                osc52_called.set(true);
+                called.set(true);
                 Ok(())
             },
         );
         assert!(matches!(result, Ok(CopyResult::Noop)));
-        assert!(!native_called.get(), "empty text must not reach native");
-        assert!(!osc52_called.get(), "empty text must not reach osc52");
-    }
-
-    #[test]
-    fn native_success_skips_osc52() {
-        let osc52_called = Cell::new(false);
-        let result = ClipboardState::copy_text_impl(
-            "hello",
-            |_| Ok(()),
-            |_| {
-                osc52_called.set(true);
-                Ok(())
-            },
-        );
-        assert!(matches!(result, Ok(CopyResult::Copied)));
-        assert!(
-            !osc52_called.get(),
-            "osc52 must not fire after native succeeds"
-        );
-    }
-
-    #[test]
-    fn native_failure_is_recovered_by_osc52() {
-        let result =
-            ClipboardState::copy_text_impl("hello", |_| Err("unavailable".into()), |_| Ok(()));
-        assert!(matches!(result, Ok(CopyResult::Copied)));
+        assert!(!called.get(), "empty text must not reach a backend");
     }
 
     #[test]
     fn both_failing_composes_errors_with_native_first() {
         let result = ClipboardState::copy_text_impl(
             "hello",
+            NativeElseOsc52,
             |_| Err("no display".into()),
             |_| Err("stdout closed".into()),
         );
@@ -169,6 +197,7 @@ mod tests {
         let native_called = Cell::new(false);
         let result = ClipboardState::copy_text_impl(
             "   \n\t",
+            NativeElseOsc52,
             |_| {
                 native_called.set(true);
                 Ok(())

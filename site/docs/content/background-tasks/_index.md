@@ -28,7 +28,7 @@ A build, a test run or a subagent can keep the agent waiting for minutes. Press 
 
 A call that can move shows a dim `ctrl+b background` hint in its header. Click the hint to move only that call. When nothing moves, the status bar says why.
 
-Inside tmux, `Ctrl+B` is the prefix, so press it twice, or bind the `background` action to another key:
+Inside tmux or Herdr, `Ctrl+B` is the prefix, so press it twice, or bind the `background` action to another key:
 
 ```lua
 maki.keymap.set("n", "<C-g>", function()

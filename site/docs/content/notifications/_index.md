@@ -115,6 +115,19 @@ can appear while the GNU screen window has focus.
 
 Maki sends OSC 9 and OSC 7501 directly through Zellij.
 
+## Herdr
+
+[Herdr](https://herdr.dev) forwards BEL to the terminal you attach from, so
+`auto` uses BEL there. Herdr does not show OSC 9, so `osc9` shows nothing
+inside Herdr.
+
+Herdr tracks Maki panes and plays its own sound when one is blocked or done.
+With both on you can hear two alerts. Set `off` to leave alerts to Herdr, or
+keep `bell` if you want the terminal window flagged too.
+
+Maki detects Herdr from `TERM_PROGRAM=herdr`. Inside tmux or GNU screen started
+in a Herdr pane, Maki talks to that multiplexer instead.
+
 ## Focus on Windows
 
 This terminal focus protocol is not available on Windows. Maki treats the
