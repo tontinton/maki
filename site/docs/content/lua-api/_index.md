@@ -9657,6 +9657,7 @@ function M.report()
 ### `require("maki.text_input")`
 
 ```lua
+--!strict
 -- TextInput: multi-line editable buffer with a byte-offset cursor.
 --
 -- Invariants enforced everywhere:
@@ -9682,38 +9683,38 @@ function M.report()
 -- Parity cases live in plugins/lib/tests/spec.lua (TRACE_CASES). Add one
 -- whenever you change handle_key semantics.
 TextInput.Result = R
-function TextInput.new()
-function TextInput:value()
-function TextInput:is_empty()
-function TextInput:line_count()
-function TextInput:clear()
+function TextInput.new(): TextInput
+function TextInput.value(self: TextInput): string
+function TextInput.is_empty(self: TextInput): boolean
+function TextInput.line_count(self: TextInput): number
+function TextInput.clear(self: TextInput)
 
 -- Returns the codepoint right before the cursor as a string, or nil at the
 -- start of a line. Lets callers peek backwards (e.g. "is the previous char
 -- a backslash?") without touching internal indices.
-function TextInput:char_before_cursor()
-function TextInput:insert_text(text)
-function TextInput:insert_char(c)
-function TextInput:insert_space()
-function TextInput:split_line()
-function TextInput:remove_char()
-function TextInput:delete_char()
-function TextInput:remove_word_before()
-function TextInput:delete_word_after()
-function TextInput:kill_to_end_of_line()
-function TextInput:move_left()
-function TextInput:move_right()
-function TextInput:move_up()
-function TextInput:move_down()
-function TextInput:move_home()
-function TextInput:move_end()
-function TextInput:move_word_left()
-function TextInput:move_word_right()
-function TextInput:handle_key(key)
+function TextInput.char_before_cursor(self: TextInput): string?
+function TextInput.insert_text(self: TextInput, text: string)
+function TextInput.insert_char(self: TextInput, c: string)
+function TextInput.insert_space(self: TextInput)
+function TextInput.split_line(self: TextInput)
+function TextInput.remove_char(self: TextInput)
+function TextInput.delete_char(self: TextInput)
+function TextInput.remove_word_before(self: TextInput)
+function TextInput.delete_word_after(self: TextInput)
+function TextInput.kill_to_end_of_line(self: TextInput)
+function TextInput.move_left(self: TextInput)
+function TextInput.move_right(self: TextInput)
+function TextInput.move_up(self: TextInput)
+function TextInput.move_down(self: TextInput)
+function TextInput.move_home(self: TextInput)
+function TextInput.move_end(self: TextInput)
+function TextInput.move_word_left(self: TextInput)
+function TextInput.move_word_right(self: TextInput)
+function TextInput.handle_key(self: TextInput, key: string): Result
 
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
-function TextInput:render(prefix, prefix_width, width)
+function TextInput.render(self: TextInput, prefix: string, prefix_width: number?, width: number?)
 ```
 
 ### `require("maki.toast")`
