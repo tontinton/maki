@@ -23,7 +23,7 @@ return function(U)
     return t and get_text(t, source) or nil
   end
 
-  local function first_arg(node, source)
+  local function first_arg(node)
     local args = find_child(node, "arguments")
     if not args then
       return nil
@@ -50,7 +50,7 @@ return function(U)
     if not target or not IMPORT_KEYWORDS[target] then
       return nil
     end
-    local arg = first_arg(node, source)
+    local arg = first_arg(node)
     if not arg then
       return nil
     end
@@ -64,7 +64,7 @@ return function(U)
     if not args then
       return nil
     end
-    local arg = first_arg(node, source)
+    local arg = first_arg(node)
     if not arg then
       return nil
     end
@@ -133,7 +133,7 @@ return function(U)
     if target ~= "defmodule" then
       return nil
     end
-    local arg = first_arg(node, source)
+    local arg = first_arg(node)
     if not arg then
       return nil
     end

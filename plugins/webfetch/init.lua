@@ -45,9 +45,7 @@ local function strip_html(html)
         out[#out + 1] = " "
         last_was_space = true
       end
-    elseif in_tag then
-      -- accumulate nothing; we use sub(tag_start, i-1) on close
-    elseif not skip_tag then
+    elseif not in_tag and not skip_tag then
       if is_ws(b) then
         if not last_was_space and #out > 0 then
           out[#out + 1] = " "

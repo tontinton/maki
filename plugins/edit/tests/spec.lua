@@ -215,7 +215,7 @@ case("block_anchor_no_panic_short_content", function()
     "fn test() {",
     "fn test() {\n}",
   }) do
-    local result, err = fr.replace(content, search, "x", false)
+    local result = fr.replace(content, search, "x", false)
     eq(result, nil)
   end
 end)

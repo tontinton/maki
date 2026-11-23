@@ -566,7 +566,7 @@ return function(U)
     return entries
   end
 
-  local function require_rule(node, values, source, resolver)
+  local function require_rule(_, values, source, resolver)
     local entries = {}
     for i = 2, #values do
       each_branch(values[i], function(value)

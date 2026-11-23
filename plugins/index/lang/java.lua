@@ -2,11 +2,7 @@ return function(U)
   local get_text = U.get_text
   local find_child = U.find_child
   local compact_ws = U.compact_ws
-  local format_range = U.format_range
-  local line_start = U.line_start
-  local line_end = U.line_end
   local new_entry = U.new_entry
-  local new_import_entry = U.new_import_entry
   local simple_import = U.simple_import
   local SECTION = U.SECTION
   local CHILD_BRIEF = U.CHILD_BRIEF
