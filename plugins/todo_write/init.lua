@@ -218,16 +218,23 @@ maki.api.register_tool({
   end,
 })
 
+-- Answers whether there was a panel to toggle, so a key that tries several
+-- actions can fall through to the next one.
 local function toggle()
   local s = sessions[focused_session]
   if not s or #shown_items(s) == 0 then
-    return
+    return false
   end
   s.hidden = not s.hidden
   sync(focused_session)
+  return true
 end
 
 maki.keymap.set({ "n", "i" }, "<C-t>", toggle, { desc = "Toggle todo panel" })
+
+-- A user's init.lua cannot reach the local above, so this action is the only
+-- way to bind the panel to another key.
+maki.api.register_action("toggle", toggle, { capability = {} })
 
 -- Subagents run inside the parent's turn, so its end clears their lists too.
 maki.api.create_autocmd("TurnEnd", {
