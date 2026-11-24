@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{debug, warn};
 
@@ -12,6 +13,12 @@ const STALE_READ_MSG: &str = "file changed since last read";
 /// Dead `Weak`s are only ever cleared once the map grows to this many entries,
 /// so the map is bounded by construction instead of by a drop hook.
 const LOCK_PRUNE_AT: usize = 512;
+
+/// Past this size a file is tracked by mtime alone, so recording a read of a
+/// huge file never costs a full pass over it.
+const DIGEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+type ContentDigest = [u8; 32];
 
 /// A path that has been through [`maki_storage::paths::canonical_key`]. Both
 /// maps here are keyed by one, so no caller can key them with a raw path. Two
@@ -39,12 +46,46 @@ type FileLocks = Mutex<HashMap<FileKey, Weak<AsyncMutex<()>>>>;
 /// with agents working next to this one, see [`FileAccess::sharing_locks`].
 #[derive(Default)]
 pub struct FileAccess {
-    mtimes: Mutex<HashMap<FileKey, SystemTime>>,
+    seen: Mutex<HashMap<FileKey, Seen>>,
     locks: Arc<FileLocks>,
+}
+
+/// A file as the agent last saw it. The mtime is the cheap answer. The digest
+/// settles the case where only the mtime moved: formatters, git hooks and
+/// stash round trips rewrite files without changing them.
+#[derive(Clone, PartialEq, Eq)]
+struct Seen {
+    mtime: SystemTime,
+    digest: Option<ContentDigest>,
 }
 
 fn get_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn content_digest(path: &Path) -> Option<ContentDigest> {
+    let small = fs::metadata(path).ok()?.len() <= DIGEST_MAX_BYTES;
+    small
+        .then(|| fs::read(path).ok())
+        .flatten()
+        .map(|content| Sha256::digest(content).into())
+}
+
+impl Seen {
+    fn now(path: &Path) -> Option<Self> {
+        let mtime = get_mtime(path)?;
+        Some(Self {
+            mtime,
+            digest: content_digest(path),
+        })
+    }
+
+    fn still_holds(&self, path: &Path, current_mtime: SystemTime) -> bool {
+        self.mtime == current_mtime
+            || self
+                .digest
+                .is_some_and(|digest| content_digest(path) == Some(digest))
+    }
 }
 
 impl FileAccess {
@@ -59,7 +100,7 @@ impl FileAccess {
     /// edits of one file still take turns.
     pub fn sharing_locks(&self) -> Arc<Self> {
         Arc::new(Self {
-            mtimes: Mutex::default(),
+            seen: Mutex::default(),
             locks: Arc::clone(&self.locks),
         })
     }
@@ -104,9 +145,9 @@ impl FileAccess {
     }
 
     pub fn record_read(&self, key: &FileKey) {
-        match get_mtime(key.as_path()) {
-            Some(mtime) => {
-                self.mtimes.lock().unwrap().insert(key.clone(), mtime);
+        match Seen::now(key.as_path()) {
+            Some(seen) => {
+                self.seen.lock().unwrap().insert(key.clone(), seen);
             }
             None => warn!(
                 path = %key.as_path().display(),
@@ -116,19 +157,19 @@ impl FileAccess {
     }
 
     pub fn check_before_edit(&self, key: &FileKey) -> Result<(), String> {
-        let Some(recorded) = self.mtimes.lock().unwrap().get(key).copied() else {
+        let Some(recorded) = self.seen.lock().unwrap().get(key).cloned() else {
             return Ok(());
         };
         let Some(current) = get_mtime(key.as_path()) else {
             // A sibling may have read a recreated file since the copy above,
             // and its record must survive.
-            let mut mtimes = self.mtimes.lock().unwrap();
-            if mtimes.get(key) == Some(&recorded) {
-                mtimes.remove(key);
+            let mut seen = self.seen.lock().unwrap();
+            if seen.get(key) == Some(&recorded) {
+                seen.remove(key);
             }
             return Ok(());
         };
-        if recorded != current {
+        if !recorded.still_holds(key.as_path(), current) {
             return Err(format!(
                 "{STALE_READ_MSG}: {} - re-read using read tool before editing",
                 key.as_path().display(),
@@ -143,11 +184,13 @@ impl FileAccess {
 /// rather than again for every map.
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use futures::FutureExt;
     use test_case::test_case;
 
     use super::*;
-    use crate::tools::test_support::future_mtime;
+    use crate::tools::test_support::{foreign_edit, future_mtime};
 
     const FILE: &str = "f.rs";
     const CONTENT: &str = "content";
@@ -155,15 +198,26 @@ mod tests {
     /// `meanwhile` stands in for everything that can happen between a read and
     /// the edit that follows it. Only a file we read and someone else changed
     /// may be refused, since anything else would block an edit for no reason.
+    /// A rewrite that leaves the content as it was is not a change.
     #[test_case(|_, _, _| {} => true ; "never_read")]
     #[test_case(|access, key, _| access.record_read(key) => true ; "read_and_untouched")]
     #[test_case(|access, key, path| {
         access.record_read(key);
-        future_mtime(path);
+        foreign_edit(path);
     } => false ; "changed_after_the_read")]
     #[test_case(|access, key, path| {
         access.record_read(key);
         future_mtime(path);
+    } => true ; "rewritten_with_the_same_content")]
+    #[test_case(|access, key, path| {
+        access.record_read(key);
+        File::create(path).unwrap().set_len(DIGEST_MAX_BYTES + 1).unwrap();
+        access.record_read(key);
+        future_mtime(path);
+    } => false ; "too_big_to_compare_falls_back_to_mtime")]
+    #[test_case(|access, key, path| {
+        access.record_read(key);
+        foreign_edit(path);
         access.record_read(key);
     } => true ; "changed_then_read_again")]
     #[test_case(|access, key, path| {

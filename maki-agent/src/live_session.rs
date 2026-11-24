@@ -804,7 +804,7 @@ mod tests {
 
     use super::*;
     use crate::tools::FileKey;
-    use crate::tools::test_support::{future_mtime, stub_seed};
+    use crate::tools::test_support::{foreign_edit, stub_seed};
 
     const CHAT_OPTS: RequestOptions = RequestOptions {
         thinking: ThinkingConfig::Adaptive,
@@ -1464,7 +1464,7 @@ mod tests {
         let background = old.tool_context(CancelToken::none());
 
         old.file_access.record_read(&key);
-        future_mtime(&path);
+        foreign_edit(&path);
         background.file_access.record_read(&key);
         assert!(old.file_access.check_before_edit(&key).is_err());
 
