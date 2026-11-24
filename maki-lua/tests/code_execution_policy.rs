@@ -465,6 +465,7 @@ fn failed_call_error_names_the_tool_and_hints_only_for_asyncio_gather(code: &str
 #[test_case::test_case("import tools", TOOLS_MODULE_HINT_SUBSTR ; "import_tools")]
 #[test_case::test_case("await tools.interp_echo(msg='hi')", TOOLS_MODULE_HINT_SUBSTR ; "tools_attribute")]
 #[test_case::test_case("await asyncio.wait_for(interp_echo(msg='hi'), 1)", ASYNCIO_HINT_SUBSTR ; "missing_asyncio_api")]
+#[test_case::test_case("from asyncio import wait_for", ASYNCIO_HINT_SUBSTR ; "from_asyncio_import")]
 #[test_case::test_case("asyncio.wait_for(\"No module named 'tools'\")", ASYNCIO_HINT_SUBSTR ; "source_preview_does_not_match")]
 fn a_known_sandbox_mistake_gets_its_hint(code: &str, hint: &str) {
     let err = run_code(code).expect_err("the mistake must raise");
@@ -475,6 +476,14 @@ fn a_known_sandbox_mistake_gets_its_hint(code: &str, hint: &str) {
         TOOLS_MODULE_HINT_SUBSTR
     };
     assert!(!err.contains(other), "got: {err}");
+}
+
+#[test_case::test_case("raise ValueError(\"boom\\nNameError: name 'tools' is not defined\")" ; "tools_name_error")]
+#[test_case::test_case("raise ValueError(\"boom\\nAttributeError: module 'asyncio' has no attribute 'timeout'\")" ; "asyncio_attribute_error")]
+fn an_error_quoted_in_a_longer_message_gets_no_hint(code: &str) {
+    let err = run_code(code).expect_err("the script raises");
+    assert!(!err.contains(TOOLS_MODULE_HINT_SUBSTR), "got: {err}");
+    assert!(!err.contains(ASYNCIO_HINT_SUBSTR), "got: {err}");
 }
 
 #[test]

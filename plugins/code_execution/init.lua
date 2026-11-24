@@ -26,15 +26,19 @@ local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning 
   .. ERROR_PREFIX
   .. "...` for the failed call."
 -- Mistakes the description leaves out to save tokens on every request: the
--- hint costs tokens only when the model actually makes one. Each key is the
--- start of the traceback's last line, so a source preview or a tool's own
--- error text cannot match.
-local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call `read(...)` directly. There is no `tools` module."
-local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`. Use `gather(...)` for concurrency."
+-- hint costs tokens only when the model actually makes one. Each key is a
+-- pattern for the start of the exception line, the first unindented line under
+-- the traceback header. A source preview is indented and a tool's error text
+-- sits behind `RuntimeError: <tool>: `, so neither can match, and neither can
+-- the later lines of a multi-line message.
+local EXCEPTION_LINE = "\n(%S[^\n]*)"
+local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call them directly. There is no `tools` module."
+local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`."
 local ERROR_HINTS = {
-  { "ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
-  { "NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
-  { "AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
+  { "^ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
+  { "^NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
+  { "^AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
+  { "^ImportError: cannot import name '[^']*' from 'asyncio'", ASYNCIO_HINT },
 }
 -- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
 -- results the model already paid for, so `gather` awaits each call in its own
@@ -434,9 +438,9 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    local exception = err:match("[^\n]*$")
+    local exception = err:match(EXCEPTION_LINE) or ""
     for _, entry in ipairs(ERROR_HINTS) do
-      if exception:sub(1, #entry[1]) == entry[1] then
+      if exception:find(entry[1]) then
         hint = hint .. entry[2]
         break
       end
