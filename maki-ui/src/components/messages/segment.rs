@@ -479,6 +479,14 @@ impl SegmentCache {
             .rposition(|s| s.tool_id.as_deref() == Some(id))
     }
 
+    /// The segment a message drew, so a message that changes in place can
+    /// be drawn again.
+    pub fn find_by_msg_index(&self, index: usize) -> Option<usize> {
+        self.segments
+            .iter()
+            .position(|s| s.msg_index == Some(index))
+    }
+
     pub fn len(&self) -> usize {
         self.segments.len()
     }

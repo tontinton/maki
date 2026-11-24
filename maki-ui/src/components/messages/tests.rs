@@ -1048,6 +1048,70 @@ fn tool_start_upgrades_pending_in_place() {
     assert_eq!(panel.messages[0].annotation.as_deref(), Some("note"));
 }
 
+fn chat_item(
+    id: &str,
+    label: &str,
+    title: &str,
+    status: ChatItemStatus,
+    detail: Option<&str>,
+) -> ChatItem {
+    ChatItem {
+        id: id.into(),
+        label: label.into(),
+        title: title.into(),
+        status,
+        detail: detail.map(str::to_owned),
+    }
+}
+
+/// A closing call carries the label and, without a detail, the new title, so a
+/// finished row never keeps its stale progress text or its old label.
+#[test]
+fn a_closed_plugin_item_updates_label_and_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.plugin_item_start(&chat_item(
+        "job-1",
+        "monitor",
+        "cargo test",
+        ChatItemStatus::Running,
+        None,
+    ));
+    panel.plugin_item_finish(&chat_item(
+        "job-1",
+        "ci",
+        "cargo test done",
+        ChatItemStatus::Done,
+        None,
+    ));
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::PluginItem(role) = &panel.messages[0].role else {
+        panic!("expected a plugin item row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Done);
+    assert_eq!(&*role.name, "ci", "the label follows the closing call");
+    assert_eq!(
+        panel.messages[0].text, "cargo test done",
+        "the title replaces the progress text without a detail"
+    );
+
+    panel.plugin_item_finish(&chat_item(
+        "job-1",
+        "ci",
+        "cargo test done",
+        ChatItemStatus::Failed,
+        Some("exit 1"),
+    ));
+    let DisplayRole::PluginItem(role) = &panel.messages[0].role else {
+        panic!("expected a plugin item row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Failed);
+    assert_eq!(
+        panel.messages[0].text, "exit 1",
+        "a detail wins over the title"
+    );
+}
+
 #[test]
 fn stream_reset_clears_streaming_and_fails_tools() {
     let mut panel = panel_with_tools(&[("t1", "bash")]);

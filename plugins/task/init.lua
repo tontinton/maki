@@ -4,6 +4,7 @@
 
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+require("jobs")
 require("picker")
 require("stop")
 

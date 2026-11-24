@@ -25,7 +25,7 @@ use maki_agent::{
     ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolOutputLines, UiConfig};
-use maki_lua::{LuaCommandInfo, WinView};
+use maki_lua::{ChatItem, ChatItemStatus, LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -630,6 +630,18 @@ impl Chat {
         self.messages_panel.annotate_tool(tool_id, model);
     }
 
+    /// A plugin-owned transcript item: `running` creates or re-titles a
+    /// spinner item, a terminal status closes it, creating the row when its
+    /// running call never reached the transcript.
+    pub(crate) fn apply_chat_item(&mut self, item: &ChatItem) {
+        match item.status {
+            ChatItemStatus::Running => self.messages_panel.plugin_item_start(item),
+            ChatItemStatus::Done | ChatItemStatus::Failed | ChatItemStatus::Cancelled => {
+                self.messages_panel.plugin_item_finish(item);
+            }
+        }
+    }
+
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
@@ -1049,7 +1061,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::IMAGE_PLACEHOLDER;
+    use crate::components::{IMAGE_PLACEHOLDER, PluginItemRole};
     use maki_agent::{
         AgentEvent, DoneReason, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent,
         TurnCompleteEvent,
@@ -1963,5 +1975,86 @@ mod tests {
             "{text}"
         );
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    const TEST_ITEM_LABEL: &str = "monitor";
+    const TEST_ITEM_TITLE: &str = "watch tests";
+    const TEST_ITEM_DETAIL: &str = "exited (code 0)";
+
+    fn chat_item(status: ChatItemStatus, detail: Option<String>) -> ChatItem {
+        ChatItem {
+            id: format!("{TEST_ITEM_LABEL}:1").into(),
+            label: TEST_ITEM_LABEL.into(),
+            title: TEST_ITEM_TITLE.into(),
+            status,
+            detail,
+        }
+    }
+
+    fn item_role(chat: &Chat, index: usize) -> (&PluginItemRole, &str) {
+        let msg = chat.messages_panel.message_at(index).unwrap();
+        let DisplayRole::PluginItem(item) = &msg.role else {
+            panic!("expected a plugin item");
+        };
+        (item, &msg.text)
+    }
+
+    #[test]
+    fn chat_item_running_creates_its_own_row() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        let (role, text) = item_role(&chat, 0);
+        assert_eq!(&*role.name, TEST_ITEM_LABEL);
+        assert_eq!(role.status, ChatItemStatus::Running);
+        assert_eq!(text, TEST_ITEM_TITLE);
+    }
+
+    #[test]
+    fn chat_item_done_closes_with_the_detail() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        chat.apply_chat_item(&chat_item(
+            ChatItemStatus::Done,
+            Some(TEST_ITEM_DETAIL.into()),
+        ));
+        assert_eq!(
+            chat.messages_panel.message_count(),
+            1,
+            "done updates in place"
+        );
+        let (role, text) = item_role(&chat, 0);
+        assert_eq!(role.status, ChatItemStatus::Done);
+        assert_eq!(text, TEST_ITEM_DETAIL);
+    }
+
+    #[test]
+    fn chat_item_failed_marks_the_item_as_failed() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Failed, None));
+        let (role, _) = item_role(&chat, 0);
+        assert_eq!(role.status, ChatItemStatus::Failed);
+    }
+
+    #[test]
+    fn a_terminal_chat_item_creates_the_row_when_running_was_never_shown() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(
+            ChatItemStatus::Done,
+            Some(TEST_ITEM_DETAIL.into()),
+        ));
+        assert_eq!(chat.messages_panel.message_count(), 1);
+        let (role, text) = item_role(&chat, 0);
+        assert_eq!(role.status, ChatItemStatus::Done);
+        assert_eq!(text, TEST_ITEM_DETAIL);
+    }
+
+    #[test]
+    fn chat_item_cancelled_marks_the_item_as_cancelled() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Cancelled, None));
+        let (role, _) = item_role(&chat, 0);
+        assert_eq!(role.status, ChatItemStatus::Cancelled);
     }
 }
