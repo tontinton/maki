@@ -171,6 +171,7 @@ maki.api.register_tool({
             status = {
               type = "string",
               enum = { "pending", "in_progress", "completed", "cancelled" },
+              value_alias = { done = "completed" },
             },
             priority = {
               type = "string",

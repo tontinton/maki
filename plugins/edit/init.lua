@@ -267,11 +267,13 @@ maki.api.register_tool({
         type = "string",
         description = "Exact string to find (must match uniquely unless replace_all is true)",
         required = true,
+        alias = "old",
       },
       new_string = {
         type = "string",
         description = "Replacement string",
         required = true,
+        alias = "new",
       },
       replace_all = {
         type = "boolean",
