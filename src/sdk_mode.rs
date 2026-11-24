@@ -583,7 +583,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     }
 
     let startup_model = model.clone();
-    let opening = SessionOpening::new(&resumed, &model);
+    let opening = SessionOpening::new(&resumed, &model, &working_dir);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,

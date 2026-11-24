@@ -5,7 +5,7 @@
 //! capability added once reaches all of them.
 
 use maki_agent::Envelope;
-use maki_agent::session::Resumed;
+use maki_agent::session::{Resumed, SessionHeader, StoredSession};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, settle_session};
 use maki_storage::id::SessionRef;
@@ -54,9 +54,13 @@ impl HeadlessHost {
         mode: impl Fn() -> &'static str + Send + Sync + 'static,
     ) -> HostedSession {
         let snapshot = HeadlessSnapshot::opened(&opening);
-        let registered = self
-            .sessions
-            .register(opening.id.clone(), &snapshot, opening.model, mode);
+        let registered = self.sessions.register(
+            opening.id.clone(),
+            &snapshot,
+            opening.header(),
+            &opening.cwd,
+            mode,
+        );
         HostedSession {
             observer: SessionObserver {
                 handle: self.handle.clone(),
@@ -73,6 +77,9 @@ pub struct SessionOpening {
     pub id: SessionRef,
     /// Model spec (`provider/id`), until a turn publishes the one it runs.
     pub model: String,
+    /// Where the driver's tools run. A resumed session keeps the cwd it was
+    /// stored with, so this and the stored one can differ.
+    pub cwd: String,
     pub context_window: u32,
     /// What the session spent before this process opened it.
     pub usage: TokenUsage,
@@ -84,7 +91,7 @@ pub struct SessionOpening {
 impl SessionOpening {
     /// Prices what a resumed session spent before against `model`, so `usage`
     /// and `cost` start from the same restored session.
-    pub fn new(resumed: &Resumed, model: &Model) -> Self {
+    pub fn new(resumed: &Resumed, model: &Model, cwd: &str) -> Self {
         let (usage, cost) = resumed.session.as_ref().map_or_else(
             || (TokenUsage::default(), None),
             |session| {
@@ -97,10 +104,23 @@ impl SessionOpening {
         Self {
             id: resumed.id.clone(),
             model: model.spec(),
+            cwd: cwd.to_owned(),
             context_window: model.context_window,
             usage,
             context_size: resumed.context_size,
             cost,
+        }
+    }
+
+    /// What a read says before the session publishes a header of its own,
+    /// which it only does once its provider connected.
+    pub(crate) fn header(&self) -> SessionHeader {
+        SessionHeader {
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            usage: self.usage,
+            context_size: self.context_size,
+            ..SessionHeader::of(&StoredSession::new("", ""))
         }
     }
 }
@@ -164,6 +184,7 @@ mod tests {
 
     const SPEC: &str = "anthropic/claude-sonnet-4-5";
     const RECORDED_COST: f64 = 3.0;
+    const CWD: &str = "/work";
 
     #[test]
     fn a_resumed_opening_starts_from_the_bill_it_recorded() {
@@ -183,7 +204,7 @@ mod tests {
         );
         let resumed = Resumed::stored(SessionRef::generate(), session);
 
-        let opening = SessionOpening::new(&resumed, &model);
+        let opening = SessionOpening::new(&resumed, &model, CWD);
 
         assert_eq!(opening.cost, Some(RECORDED_COST));
         assert_eq!(opening.usage.input, 1_000);
@@ -194,7 +215,7 @@ mod tests {
         let model = Model::from_spec(SPEC).expect("a shipped model");
         let resumed = Resumed::empty(SessionRef::generate());
 
-        let opening = SessionOpening::new(&resumed, &model);
+        let opening = SessionOpening::new(&resumed, &model, CWD);
 
         assert_eq!(opening.cost, None);
         assert_eq!(opening.usage, TokenUsage::default());

@@ -313,7 +313,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
 
     // `maki -p` sends its one prompt in build mode and never switches.
     let hosted = HeadlessHost::sole(lua_handle.clone())
-        .open(SessionOpening::new(&resumed, &model), || MODE_BUILD);
+        .open(SessionOpening::new(&resumed, &model, &cwd), || MODE_BUILD);
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         model: model.clone(),
         config,

@@ -207,28 +207,31 @@ impl HeadlessSnapshot {
         }
     }
 
-    /// What the session publishes (cwd, title, thinking, fast, the model it
-    /// runs), with the tally on top. The agent republishes the header only
-    /// after the turn's `Done` is out, so a `TurnEnd` handler reading it would
-    /// find the turn still working on the old usage. `mode` is a callback
-    /// because the published one lags until the next turn.
+    /// What the session publishes (title, thinking, fast, the model it runs),
+    /// with the tally on top. The agent republishes the header only after the
+    /// turn's `Done` is out, so a `TurnEnd` handler reading it would find the
+    /// turn still working on the old usage. `mode` is a callback because the
+    /// published one lags until the next turn. Until a header is published
+    /// (a failed connect never does) `opening` answers, and `cwd` is always
+    /// the driver's own, since a stored session keeps the one it started in.
     fn provider(
         &self,
         session: SessionRef,
-        model: String,
+        opening: SessionHeader,
+        cwd: String,
         focused: bool,
         mode: impl Fn() -> &'static str + Send + Sync + 'static,
     ) -> Provider {
         let totals = Arc::clone(&self.0);
         Arc::new(move || {
             let id = session.id();
-            let header = live_header(id).ok_or_else(|| not_live(&session))?;
+            let header = live_header(id).map_or_else(|| opening.clone(), Arc::unwrap_or_clone);
             let totals = lock(&totals);
-            let mut snapshot =
-                SessionSnapshot::unhosted(id, Arc::unwrap_or_clone(header), totals.status());
+            let mut snapshot = SessionSnapshot::unhosted(id, header, totals.status());
             snapshot.id = session.to_string();
+            snapshot.cwd.clone_from(&cwd);
             if snapshot.model.is_empty() {
-                snapshot.model.clone_from(&model);
+                snapshot.model.clone_from(&opening.model);
             }
             snapshot.mode = mode();
             snapshot.focused = focused;
@@ -291,11 +294,12 @@ impl HeadlessSessions {
         &self,
         session: SessionRef,
         snapshot: &HeadlessSnapshot,
-        model: String,
+        opening: SessionHeader,
+        cwd: &str,
         mode: impl Fn() -> &'static str + Send + Sync + 'static,
     ) -> RegisteredSession {
         let id = session.id();
-        let provider = snapshot.provider(session, model, self.sole, mode);
+        let provider = snapshot.provider(session, opening, cwd.to_owned(), self.sole, mode);
         lock(&self.providers).insert(id, Arc::clone(&provider));
         RegisteredSession {
             providers: Arc::clone(&self.providers),
@@ -413,6 +417,7 @@ mod tests {
         SessionOpening {
             id,
             model: MODEL.into(),
+            cwd: CWD.into(),
             context_window: WINDOW,
             usage: TokenUsage::default(),
             context_size: 0,
@@ -437,7 +442,8 @@ mod tests {
         session: &SessionRef,
         snapshot: &HeadlessSnapshot,
     ) -> RegisteredSession {
-        sessions.register(session.clone(), snapshot, MODEL.into(), || MODE_PLAN)
+        let header = opening(session.clone()).header();
+        sessions.register(session.clone(), snapshot, header, CWD, || MODE_PLAN)
     }
 
     /// A reload registers the same id before the old run's guard drops, and
@@ -506,6 +512,38 @@ mod tests {
         let read = sessions.provider()(Some(session.as_str())).unwrap();
 
         assert_eq!(read["model"], MODEL);
+    }
+
+    /// A connect that fails never publishes a header, and a `TurnError` handler
+    /// still reads the session as it opened.
+    #[test]
+    fn a_read_before_any_header_answers_from_the_opening() {
+        let session = SessionRef::generate();
+        let sessions = HeadlessSessions::default();
+        let _registered = register(&sessions, &session, &HeadlessSnapshot::default());
+
+        let read = sessions.provider()(Some(session.as_str())).unwrap();
+
+        assert_eq!(read["model"], MODEL);
+        assert_eq!(read["cwd"], CWD);
+        assert_eq!(read["status"], STATUS_IDLE);
+    }
+
+    /// A stored session keeps the cwd it started in, the driver's tools run in
+    /// its own.
+    #[test]
+    fn a_read_names_the_driver_cwd_not_the_stored_one() {
+        let session = SessionRef::generate();
+        let _live = publish(
+            session.id(),
+            SessionHeader::of(&StoredSession::new(MODEL, "/stored")),
+        );
+        let sessions = HeadlessSessions::default();
+        let _registered = register(&sessions, &session, &HeadlessSnapshot::default());
+
+        let read = sessions.provider()(Some(session.as_str())).unwrap();
+
+        assert_eq!(read["cwd"], CWD);
     }
 
     /// A resumed session has spent and has a window before its first new turn,

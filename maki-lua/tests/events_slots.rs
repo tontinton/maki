@@ -600,6 +600,7 @@ fn turn_end_handler_reads_its_finished_turn() {
     let opening = SessionOpening {
         id: id.clone(),
         model: String::new(),
+        cwd: String::new(),
         context_window: WINDOW,
         usage: TokenUsage::default(),
         context_size: 0,

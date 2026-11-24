@@ -705,7 +705,7 @@ async fn start_session(
         &stack.plugins,
         SessionOpening {
             cost: initial_cost,
-            ..SessionOpening::new(&resumed, &stack.model)
+            ..SessionOpening::new(&resumed, &stack.model, &cwd.to_string_lossy())
         },
         &current_mode,
     );
@@ -1878,6 +1878,7 @@ mod tests {
         let opening = SessionOpening::new(
             &Resumed::empty(id.clone()),
             &Model::from_spec(SELECTED_SPEC).expect("a shipped model"),
+            PUMP_CWD,
         );
         open_hosted(plugins, opening, current_mode)
     }

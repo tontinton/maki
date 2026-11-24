@@ -1335,7 +1335,7 @@ mod tests {
         publish_live_session,
     };
     use maki_agent::cancel::CancelToken;
-    use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
+    use maki_agent::session::{NOTHING_TO_STORE, SessionHeader, StoredSession};
     use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
     use maki_storage::id::SessionRef;
@@ -1494,7 +1494,8 @@ mod tests {
         let registered = sessions.register(
             SessionRef::from(id),
             &HeadlessSnapshot::default(),
-            String::new(),
+            SessionHeader::of(&StoredSession::new("", "")),
+            "",
             || MODE_BUILD,
         );
         (registered, live)
