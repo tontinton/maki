@@ -332,6 +332,7 @@ mod tests {
             name: TOOL.into(),
             input: Value::Null,
             thought_signature: None,
+            input_error: None,
         }])
     }
 

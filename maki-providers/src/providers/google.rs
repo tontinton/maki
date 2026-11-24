@@ -371,6 +371,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     name,
                     input,
                     thought_signature,
+                    ..
                 } => {
                     let mut part = json!({
                         "functionCall": {
@@ -646,6 +647,7 @@ async fn parse_sse(
                         name: func_call.name,
                         input,
                         thought_signature,
+                        input_error: None,
                     });
                     stop_reason = Some(StopReason::ToolUse);
                 } else if let Some(text) = part.text {
@@ -979,6 +981,7 @@ mod tests {
                 name: "read_file".into(),
                 input: json!({"path": "/tmp/a"}),
                 thought_signature: Some(SIG.into()),
+                input_error: None,
             }],
             ..Default::default()
         }];

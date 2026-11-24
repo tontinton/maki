@@ -743,6 +743,7 @@ mod tests {
     const LATER_SAVED_KEY: &str = "sk-saved-after";
     const ENV_KEY: &str = "sk-env";
     const THINKING_SIGNATURE: &str = "sig";
+    const PARSE_ERROR: &str = "expected value at line 1 column 12";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
     const USAGE_BODY: &str = r#"{
@@ -1433,6 +1434,24 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         json[0]["content"].take()
     }
 
+    /// The API rejects an unknown field on a saved `tool_use` with a 400, and
+    /// the block stays in history, so one broken call would fail every later
+    /// request in the session.
+    #[test]
+    fn broken_tool_call_wire_block_omits_the_input_error() {
+        let messages = vec![message(
+            Role::Assistant,
+            vec![ContentBlock::invalid_tool_use(
+                "tu_bad",
+                "bash",
+                PARSE_ERROR.to_owned(),
+            )],
+        )];
+        let content = wire_content(&messages, &json!([]));
+        assert_eq!(content[0]["id"], "tu_bad");
+        assert_eq!(content[0].get("input_error"), None);
+    }
+
     fn set_result<F: FnOnce(&mut String, &mut bool)>(messages: &mut [Message], f: F) {
         let ContentBlock::ToolResult {
             content, is_error, ..
@@ -1770,7 +1789,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse_data = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\
@@ -1790,10 +1809,15 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n";
         let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "read");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     #[tokio::test]

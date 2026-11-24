@@ -5,10 +5,11 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
+use crate::providers::parse_tool_input;
 use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
@@ -510,19 +511,20 @@ impl EventParser {
                 Err(e) => warn!(error = %e, "failed to parse content_block_delta"),
             },
             "content_block_stop" => {
-                if let Some(ContentBlock::ToolUse { name, input, .. }) =
-                    self.content_blocks.get_mut(self.current_block_idx)
+                if let Some(ContentBlock::ToolUse {
+                    name,
+                    input,
+                    input_error,
+                    ..
+                }) = self.content_blocks.get_mut(self.current_block_idx)
                 {
-                    *input = match serde_json::from_str(&self.current_tool_json) {
-                        Ok(v) => {
-                            debug!(tool = %name, json = %self.current_tool_json, "tool input JSON");
-                            v
+                    match parse_tool_input(name, &self.current_tool_json) {
+                        Ok(v) => *input = v,
+                        Err(error) => {
+                            *input = Value::Object(Default::default());
+                            *input_error = Some(error);
                         }
-                        Err(e) => {
-                            warn!(error = %e, json = %self.current_tool_json, "malformed tool JSON, falling back to {{}}");
-                            Value::Object(Default::default())
-                        }
-                    };
+                    }
                     self.current_tool_json.clear();
                 }
             }

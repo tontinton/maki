@@ -985,6 +985,7 @@ mod tests {
             name: SECOND.into(),
             input: serde_json::json!({}),
             thought_signature: thought_signature.map(Into::into),
+            input_error: None,
         };
         let call = Message {
             role: Role::Assistant,
