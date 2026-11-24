@@ -1,10 +1,14 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::convert::identity;
 use std::io;
 use std::iter::successors;
 
-use htmd::HtmlToMarkdown;
+use htmd::element_handler::{HandlerResult, Handlers};
 use htmd::node::{Node, NodeType};
+use htmd::options::{BulletListMarker, Options};
+use htmd::{Element, HtmlToMarkdown};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -22,6 +26,14 @@ const INLINE_TAGS: [&str; 32] = [
     "ins", "kbd", "label", "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub",
     "sup", "time", "tt", "u", "var", "wbr",
 ];
+const TABLE_TAG: &str = "table";
+const CELL_TAGS: [&str; 2] = ["td", "th"];
+const HEADER_TAGS: [&str; 2] = ["th", "thead"];
+const CELL_END: char = '|';
+/// A pipe inside a cell is escaped, so only a cell's end has a bare one after a space.
+const PADDED_CELL_END: &str = " |";
+const SEPARATOR_CELL: &str = "---";
+const LIST_MARKER_SPACING: u8 = 1;
 
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
@@ -29,6 +41,59 @@ thread_local! {
     /// candidate. Its config is overwritten on every borrow, which is the only
     /// thing that differs between callers.
     static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::new(Config::DEFAULT));
+}
+
+fn has_header(node: &Node<'_>) -> bool {
+    node.children().iter().any(|child| match child.tag_name() {
+        Some(tag) if HEADER_TAGS.contains(&tag) => true,
+        Some(TABLE_TAG) => false,
+        _ => has_header(&child),
+    })
+}
+
+/// htmd's own rule for writing a table as pipe rows. Any other table comes
+/// out as its cells' content, where a line that starts with `|` is somebody's
+/// code and not ours to touch.
+fn is_pipe_table(table: &Node<'_>) -> bool {
+    let in_cell = successors(table.parent(), Node::parent).any(|ancestor| {
+        ancestor
+            .tag_name()
+            .is_some_and(|tag| CELL_TAGS.contains(&tag))
+    });
+    !in_cell && has_header(table)
+}
+
+/// htmd pads every cell to its column's width, so one long cell costs its
+/// length again in every other row. Markdown needs none of it.
+fn unpad_table(table: HandlerResult) -> HandlerResult {
+    let content = table.content.split_inclusive('\n').map(unpad_row).collect();
+    HandlerResult { content, ..table }
+}
+
+fn unpad_row(line: &str) -> Cow<'_, str> {
+    let Some(cells) = line
+        .trim_end_matches('\n')
+        .strip_prefix(CELL_END)
+        .and_then(|row| row.strip_suffix(PADDED_CELL_END))
+    else {
+        return Cow::Borrowed(line);
+    };
+    let cells: Vec<&str> = cells.split(PADDED_CELL_END).map(str::trim).collect();
+    let is_separator = cells
+        .iter()
+        .all(|cell| cell.len() >= SEPARATOR_CELL.len() && cell.bytes().all(|b| b == b'-'));
+    let mut row = String::from(CELL_END);
+    for cell in cells {
+        let cell = if is_separator { SEPARATOR_CELL } else { cell };
+        if !cell.is_empty() {
+            row.push(' ');
+            row.push_str(cell);
+        }
+        row.push(' ');
+        row.push(CELL_END);
+    }
+    row.push('\n');
+    Cow::Owned(row)
 }
 
 /// Convert an HTML string to Markdown.
@@ -54,7 +119,24 @@ async fn html_to_markdown(
     let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
     Ok(pair(
         spawn_blocking(move || {
-            let mut builder = HtmlToMarkdown::builder();
+            let mut builder = HtmlToMarkdown::builder()
+                .options(Options {
+                    bullet_list_marker: BulletListMarker::Dash,
+                    ul_bullet_spacing: LIST_MARKER_SPACING,
+                    ol_number_spacing: LIST_MARKER_SPACING,
+                    ..Options::default()
+                })
+                .add_handler(
+                    vec![TABLE_TAG],
+                    |handlers: &dyn Handlers, element: &Element| {
+                        let unpad = if is_pipe_table(element.node) {
+                            unpad_table
+                        } else {
+                            identity
+                        };
+                        handlers.fallback(element).map(unpad)
+                    },
+                );
             // htmd asserts on an empty tag list.
             if !skip_tags.is_empty() {
                 builder = builder.skip_tags(skip_tags.iter().map(String::as_str).collect());
@@ -376,6 +458,13 @@ mod tests {
     const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
     const PAGE_BODY: &str = "body";
     const TEXT_SKIP_TAGS: [&str; 3] = ["script", "style", "noscript"];
+    const PADDED_TABLE: &[u8] = b"<table><tr><th>a</th><th>b</th></tr><tr><td>a much longer cell</td><td></td></tr><tr><td>x | y</td><td><code>a|b</code></td></tr><tr><td>-</td><td>-</td></tr></table>";
+    const UNPADDED_TABLE: &str =
+        "| a | b |\n| --- | --- |\n| a much longer cell | |\n| x \\| y | `a\\|b` |\n| \\- | \\- |";
+    const CODE_IN_LAYOUT_TABLE: &[u8] = b"<table><tr><td>1</td><td><pre><code>| id  | name |\n| --- | ---- |\n| 1   | a    |</code></pre></td></tr></table>";
+    const ALIGNED_CODE: &str = "1\n\n```\n| id  | name |\n| --- | ---- |\n| 1   | a    |\n```";
+    const LISTS: &[u8] = b"<ul><li>one<ul><li>nested</li></ul></li></ul><ol><li>first</li></ol><pre>| kept    |</pre>";
+    const COMPACT_LISTS: &str = "- one\n  - nested\n\n1. first\n\n| kept    |";
     const CHROME_PAGE: &[u8] = br#"<nav><a href="/">Home</a></nav><script type="application/json">{"menu":1}</script><p>body</p>"#;
 
     fn best(needle: &str) -> Option<&'static str> {
@@ -460,6 +549,14 @@ mod tests {
     #[test_case(LATIN1_HTML, LOSSY_MARKDOWN ; "non_utf8")]
     #[tokio::test]
     async fn html_bytes_are_decoded_at_the_text_boundary(input: &[u8], expected: &str) {
+        assert_eq!(to_markdown(input, None).await, expected);
+    }
+
+    #[test_case(PADDED_TABLE, UNPADDED_TABLE ; "tables_are_not_padded")]
+    #[test_case(CODE_IN_LAYOUT_TABLE, ALIGNED_CODE ; "code_in_a_headerless_table_keeps_its_alignment")]
+    #[test_case(LISTS, COMPACT_LISTS ; "list_markers_take_one_space")]
+    #[tokio::test]
+    async fn markdown_spends_no_bytes_on_alignment(input: &[u8], expected: &str) {
         assert_eq!(to_markdown(input, None).await, expected);
     }
 
