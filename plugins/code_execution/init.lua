@@ -129,7 +129,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
-- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
+- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`. A failed call returns `[ERROR] ...` in its slot.
 - Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
