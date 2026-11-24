@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::io;
-use std::rc::Rc;
+use std::iter::successors;
 
-use htmd::{HtmlToMarkdown, Node};
+use htmd::HtmlToMarkdown;
+use htmd::node::{Node, NodeType};
 use maki_lua_macro::{lua_fn, lua_table};
-use markup5ever_rcdom::NodeData;
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -99,8 +99,8 @@ enum Gap {
     Line,
 }
 
-enum Step {
-    Visit(Rc<Node>),
+enum Step<'a> {
+    Visit(Node<'a>),
     EndLine,
     EndPre,
 }
@@ -109,9 +109,8 @@ fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
     let mut text = String::new();
     let mut gap = Gap::None;
     let mut pre_depth = 0usize;
-    // Dropping an rcdom node empties its whole subtree, so the root outlives the walk.
-    let document = HtmlToMarkdown::new().html_to_tree(html)?;
-    let mut steps = vec![Step::Visit(Rc::clone(&document))];
+    let tree = HtmlToMarkdown::new().html_to_tree(html)?;
+    let mut steps = vec![Step::Visit(tree.root())];
     while let Some(step) = steps.pop() {
         let node = match step {
             Step::Visit(node) => node,
@@ -125,29 +124,26 @@ fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
                 continue;
             }
         };
-        match &node.data {
-            NodeData::Text { contents } => {
-                for c in contents.borrow().chars() {
-                    if pre_depth == 0 && c.is_whitespace() {
-                        gap = gap.max(Gap::Space);
-                        continue;
-                    }
-                    match gap {
-                        _ if text.is_empty() => {}
-                        Gap::None => {}
-                        Gap::Space => text.push(' '),
-                        Gap::Line => text.push('\n'),
-                    }
-                    gap = Gap::None;
-                    text.push(c);
-                }
-                continue;
-            }
-            NodeData::Element { name, .. } => {
-                let tag: &str = &name.local;
-                if skip_tags.iter().any(|skipped| skipped == tag) {
+        if let Some(contents) = node.text() {
+            for c in contents.chars() {
+                if pre_depth == 0 && c.is_whitespace() {
+                    gap = gap.max(Gap::Space);
                     continue;
                 }
+                match gap {
+                    _ if text.is_empty() => {}
+                    Gap::None => {}
+                    Gap::Space => text.push(' '),
+                    Gap::Line => text.push('\n'),
+                }
+                gap = Gap::None;
+                text.push(c);
+            }
+            continue;
+        }
+        match node.tag_name() {
+            Some(tag) if skip_tags.iter().any(|skipped| skipped == tag) => continue,
+            Some(tag) => {
                 if !INLINE_TAGS.contains(&tag) {
                     gap = Gap::Line;
                     steps.push(Step::EndLine);
@@ -157,17 +153,12 @@ fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
                     steps.push(Step::EndPre);
                 }
             }
-            NodeData::Document => {}
-            _ => continue,
+            None if node.node_type() == NodeType::Document => {}
+            None => continue,
         }
-        steps.extend(
-            node.children
-                .borrow()
-                .iter()
-                .rev()
-                .cloned()
-                .map(Step::Visit),
-        );
+        let first_child = steps.len();
+        steps.extend(successors(node.first_child(), Node::next_sibling).map(Step::Visit));
+        steps[first_child..].reverse();
     }
     Ok(text)
 }
