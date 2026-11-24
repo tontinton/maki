@@ -1917,7 +1917,7 @@ mod tests {
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
     #[test_case("xai/grok-4.6",                     true  ; "grok")]
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
-    #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
+    #[test_case("copilot/claude-opus-5.5",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
     #[test_case(SCHEDULED_SPEC,                     false ; "declared_text_only")]
     #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
