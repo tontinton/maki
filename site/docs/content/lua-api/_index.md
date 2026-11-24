@@ -3603,6 +3603,34 @@ if omitted then print(omitted.groups .. " more not shown") end
 
 ---
 
+### `maki.fs.grep_count()` {#maki-fs-grep_count}
+
+```lua
+maki.fs.grep_count({pattern}, {opts?})
+```
+
+Count the lines matching a regex {pattern} in each file, without
+returning the lines.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{pattern}` (`string`) Regular expression to search for.
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+
+**Returns:** (`table?`, `string?`) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
+
+**Example:**
+
+```lua
+local counts, err = maki.fs.grep_count("TODO", { path = "src" })
+if err then return end
+for _, file in ipairs(counts) do print(file.path .. ": " .. file.matches) end
+```
+
+---
+
 ### `maki.fs.fuzzy_files()` {#maki-fs-fuzzy_files}
 
 ```lua

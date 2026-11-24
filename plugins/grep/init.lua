@@ -5,6 +5,8 @@ local color = require("maki.color")
 local output_limits = require("maki.output_limits")
 
 local NO_MATCHES = "No files found"
+local COUNT_TOTAL = "%d %s in %d %s"
+local COUNT_LINE = "%s: %d"
 local LIMIT_NOTE = "[limit of %d reached, %d more %s from %d %s not shown]"
 local MIN_PER_CALL_LIMIT = 1
 local MAX_PER_CALL_LIMIT = 1000
@@ -51,6 +53,17 @@ local function format_llm_output(entries)
     end
   end
   return table.concat(parts, "\n")
+end
+
+local function format_counts(counts)
+  local total = 0
+  local parts = { "" }
+  for _, file in ipairs(counts) do
+    total = total + file.matches
+    parts[#parts + 1] = COUNT_LINE:format(file.path, file.matches)
+  end
+  parts[1] = COUNT_TOTAL:format(total, plural(total, "matching line"), #counts, plural(#counts, "file"))
+  return table.concat(parts, "\n"), parts[1]
 end
 
 local function count_matches(entries)
@@ -222,6 +235,7 @@ maki.api.register_tool({
       context_before = { type = "integer", description = "Context lines before match" },
       context_after = { type = "integer", description = "Context lines after match" },
       limit = { type = "integer", description = "Max match groups to return" },
+      count = { type = "boolean", description = "Return how many lines match in each file instead of the lines" },
     },
   },
 
@@ -255,6 +269,18 @@ maki.api.register_tool({
     pattern = pattern:gsub('"$', "")
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
+    if input.count then
+      local counts, count_err = maki.fs.grep_count(pattern, { path = input.path, include = input.include })
+      if not counts then
+        return { llm_output = "error: " .. tostring(count_err), is_error = true }
+      end
+      if #counts == 0 then
+        return { llm_output = NO_MATCHES }
+      end
+      local llm_output, total = format_counts(counts)
+      return { llm_output = truncate(llm_output, max_lines, max_bytes), annotation = total }
+    end
 
     local limit = math.max(MIN_PER_CALL_LIMIT, math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT))
 

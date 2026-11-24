@@ -60,8 +60,19 @@ pub struct GrepResults {
     pub omitted: Option<Omitted>,
 }
 
-/// Core grep logic. Blocking — caller must run on a thread pool.
-pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
+/// A file that has matching lines, and how many.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GrepFileCount {
+    pub path: PathBuf,
+    pub matches: usize,
+}
+
+/// Runs `search_file` on every file the walk finds and keeps what it returns.
+/// The hits come back newest file first, with paths relative to the base.
+fn search_files<T: Send>(
+    params: &GrepParams,
+    search_file: impl Fn(&mut Searcher, &RegexMatcher, &Path) -> Option<T> + Sync,
+) -> Result<(PathBuf, Vec<(String, T)>), String> {
     let search_path = resolve_search_path(params.path.as_deref())?;
     let is_multiline = needs_multiline(&params.pattern);
     debug!(
@@ -103,12 +114,10 @@ pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
     } else {
         search
     };
-    let has_context = params.context_before > 0 || params.context_after > 0;
-    let max_line_bytes = params.max_line_bytes;
-    let results = Mutex::new(Vec::new());
+    let hits = Mutex::new(Vec::new());
 
     walker.build_parallel().run({
-        let (results, matcher) = (&results, &matcher);
+        let (hits, matcher, search_file) = (&hits, &matcher, &search_file);
         move || {
             let mut searcher = builder.build();
             Box::new(move |entry| {
@@ -120,39 +129,62 @@ pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
                     return WalkState::Continue;
                 }
                 let path = entry.into_path();
-                let mut groups = Vec::new();
-                let mut sink = GrepSink {
-                    groups: &mut groups,
-                    current_group: Vec::new(),
-                    max_line_bytes,
-                    has_context,
-                };
-                let _ = searcher.search_path(matcher, &path, &mut sink);
-
-                if !groups.is_empty() {
+                if let Some(hit) = search_file(&mut searcher, matcher, &path) {
                     let rel = path
                         .strip_prefix(base)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    results
-                        .lock()
+                    hits.lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .push(GrepFileEntry { path: rel, groups });
+                        .push((rel, hit));
                 }
                 WalkState::Continue
             })
         }
     });
 
-    let mut entries = results.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut hits = hits.into_inner().unwrap_or_else(PoisonError::into_inner);
+    hits.sort_by_cached_key(|(path, _)| (std::cmp::Reverse(mtime(&base.join(path))), path.clone()));
+    Ok((base.to_path_buf(), hits))
+}
 
-    entries.sort_by_cached_key(|e| {
-        (
-            std::cmp::Reverse(mtime(&base.join(&e.path))),
-            e.path.clone(),
-        )
-    });
+/// Counts the matching lines of each file instead of collecting them.
+/// Blocking — caller must run on a thread pool.
+pub fn grep_count(params: &GrepParams) -> Result<Vec<GrepFileCount>, String> {
+    let (base, hits) = search_files(params, |searcher, matcher, path| {
+        let mut sink = CountSink(0);
+        let _ = searcher.search_path(matcher, path, &mut sink);
+        (sink.0 > 0).then_some(sink.0)
+    })?;
+    Ok(hits
+        .into_iter()
+        .map(|(path, matches)| GrepFileCount {
+            path: base.join(path),
+            matches,
+        })
+        .collect())
+}
+
+/// Core grep logic. Blocking — caller must run on a thread pool.
+pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
+    let has_context = params.context_before > 0 || params.context_after > 0;
+    let max_line_bytes = params.max_line_bytes;
+    let (base, hits) = search_files(&params, |searcher, matcher, path| {
+        let mut groups = Vec::new();
+        let mut sink = GrepSink {
+            groups: &mut groups,
+            current_group: Vec::new(),
+            max_line_bytes,
+            has_context,
+        };
+        let _ = searcher.search_path(matcher, path, &mut sink);
+        (!groups.is_empty()).then_some(groups)
+    })?;
+    let mut entries: Vec<_> = hits
+        .into_iter()
+        .map(|(path, groups)| GrepFileEntry { path, groups })
+        .collect();
 
     let mut kept = 0;
     let mut omitted = Omitted {
@@ -171,10 +203,21 @@ pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
     entries.retain(|e| !e.groups.is_empty());
 
     Ok(GrepResults {
-        base: base.to_path_buf(),
+        base,
         entries,
         omitted: (omitted.groups > 0).then_some(omitted),
     })
+}
+
+struct CountSink(usize);
+
+impl Sink for CountSink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+        self.0 += mat.lines().count();
+        Ok(true)
+    }
 }
 
 struct GrepSink<'a> {
@@ -251,6 +294,7 @@ mod tests {
     use super::*;
 
     const TEST_LINE: &[u8] = "match é tail\r\n".as_bytes();
+    const NEEDLE: &str = "needle";
 
     #[test_case("foo",       false ; "simple_pattern")]
     #[test_case("foo\\nbar", true  ; "literal_newline")]
@@ -277,5 +321,32 @@ mod tests {
         let lines = &groups[0].lines;
         assert_eq!(lines[0].text, expected);
         assert_eq!(lines[1].text, expected);
+    }
+
+    #[test_case(None, &[("one.rs", 1), ("two.txt", 2)] ; "every_file_with_a_match")]
+    #[test_case(Some("*.txt"), &[("two.txt", 2)] ; "only_included_files")]
+    fn count_lists_matching_lines_per_file(include: Option<&str>, expected: &[(&str, usize)]) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("one.rs"), "needle\nhay\n").unwrap();
+        std::fs::write(dir.path().join("two.txt"), "needle needle\nhay\nneedle\n").unwrap();
+        std::fs::write(dir.path().join("none.txt"), "hay\n").unwrap();
+        let params = GrepParams {
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            include: include.map(str::to_owned),
+            ..GrepParams::new(NEEDLE.into())
+        };
+
+        let mut counts: Vec<_> = grep_count(&params)
+            .unwrap()
+            .into_iter()
+            .map(|file| (file.path.file_name().unwrap().to_owned(), file.matches))
+            .collect();
+        counts.sort();
+
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|&(name, matches)| (name.into(), matches))
+            .collect();
+        assert_eq!(counts, expected);
     }
 }
