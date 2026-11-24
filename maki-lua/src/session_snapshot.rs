@@ -157,9 +157,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Default)]
 pub(crate) struct HeadlessSnapshot(Arc<Mutex<Totals>>);
 
-impl HeadlessSnapshot {
-    /// Starts from what the session spent before this process opened it.
-    pub(crate) fn opened(opening: &SessionOpening) -> Self {
+/// Starts from what the session spent before this process opened it.
+impl From<&SessionOpening> for HeadlessSnapshot {
+    fn from(opening: &SessionOpening) -> Self {
         Self(Arc::new(Mutex::new(Totals {
             usage: opening.usage,
             cost: opening.cost,
@@ -168,7 +168,9 @@ impl HeadlessSnapshot {
             working: false,
         })))
     }
+}
 
+impl HeadlessSnapshot {
     /// Fold one envelope in. The drivers already loop over the stream, so
     /// they hand every envelope here and keep no bookkeeping of their own.
     pub(crate) fn observe(&self, envelope: &Envelope) {
@@ -553,7 +555,7 @@ mod tests {
         const RESTORED_COST: f64 = 3.0;
         let session = SessionRef::generate();
         let _live = publish(session.id(), blank_header());
-        let snapshot = HeadlessSnapshot::opened(&SessionOpening {
+        let snapshot = HeadlessSnapshot::from(&SessionOpening {
             usage: TokenUsage {
                 input: u64::from(SECOND_TURN_INPUT),
                 ..Default::default()

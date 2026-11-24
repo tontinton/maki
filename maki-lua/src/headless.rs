@@ -53,7 +53,7 @@ impl HeadlessHost {
         opening: SessionOpening,
         mode: impl Fn() -> &'static str + Send + Sync + 'static,
     ) -> HostedSession {
-        let snapshot = HeadlessSnapshot::opened(&opening);
+        let snapshot = HeadlessSnapshot::from(&opening);
         let registered = self.sessions.register(
             opening.id.clone(),
             &snapshot,
