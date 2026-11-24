@@ -50,6 +50,7 @@ maki --no-jit acp
 - **Model switching.** Pick any configured model from the editor's dropdown, mid-session. Providers that fetch their model list (like OpenRouter) fill in a few moments after the session starts.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only). Plan files live in the state directory as in the TUI (`…/plans/<slug>.md`), not in the SDK's `./plan.md`.
 - **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
+- **Permission level.** A `Permissions` option next to the model picks how prompts are answered: `ask` shows each prompt in the editor, `yolo` allows every call that no deny rule blocks. It starts on `ask`, or on `yolo` with `--yolo`. A plugin can add levels with [`maki.api.register_permission_mode`](/docs/lua-api/#maki-api-register_permission_mode), and they appear in the same list.
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). Without elicitation support the tool is dropped, and the model asks in plain text.
 - **Live tool calls.** Tool progress streams as it happens, including subagents and batched calls.
 - **Images and context.** Prompts can include images and editor-attached files.

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-lua = { workspace = true }
 maki-otel = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
@@ -21,6 +22,7 @@ tracing = { workspace = true }
 color-eyre = { workspace = true }
 
 [dev-dependencies]
+arc-swap = { workspace = true }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 
