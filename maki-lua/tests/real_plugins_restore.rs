@@ -19,7 +19,8 @@ use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
-const FILE_TOOL_NOTE: &str = "Use dedicated tools for files, not bash: read instead of cat.";
+const FILE_TOOL_NOTE: &str =
+    "Use dedicated tools for files, not bash: the read tool instead of cat.";
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 /// The bash restore cases all run `echo`, and their output `hi` does not contain it.
 const COMMAND_WORD: &str = "echo";
