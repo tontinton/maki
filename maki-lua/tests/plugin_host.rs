@@ -9556,23 +9556,23 @@ fn file_tool_note(reply: &str) -> Option<&str> {
         .map(|(items, _)| items)
 }
 
-#[test_case::test_case("cat /dev/null", Some("read instead of cat") ; "cat_file")]
-#[test_case::test_case("head -n 1 /dev/null && ls /dev", Some("read instead of head, list instead of ls") ; "chained_commands")]
-#[test_case::test_case("head -20 /dev/null", Some("read instead of head") ; "line_count_as_a_flag")]
-#[test_case::test_case("sed -n 1p /dev/null; sed -n 2p /dev/null", Some("read instead of sed") ; "same_command_named_once")]
-#[test_case::test_case("sed -n '2,4p' /dev/null", Some("read instead of sed") ; "sed_line_range")]
+#[test_case::test_case("cat /dev/null", Some("the read tool instead of cat") ; "cat_file")]
+#[test_case::test_case("head -n 1 /dev/null && ls /dev", Some("the read tool instead of head, the list tool instead of ls") ; "chained_commands")]
+#[test_case::test_case("head -20 /dev/null", Some("the read tool instead of head") ; "line_count_as_a_flag")]
+#[test_case::test_case("sed -n 1p /dev/null; sed -n 2p /dev/null", Some("the read tool instead of sed") ; "same_command_named_once")]
+#[test_case::test_case("sed -n '2,4p' /dev/null", Some("the read tool instead of sed") ; "sed_line_range")]
 #[test_case::test_case("sed -n '/a/,/b/p' /dev/null", None ; "sed_pattern_range")]
 #[test_case::test_case("cat /dev/null | wc -l", None ; "pipe_source")]
-#[test_case::test_case("grep -rn a /dev/null 2>&1", Some("grep instead of grep") ; "stderr_merged_into_stdout")]
-#[test_case::test_case("cat /dev/null/missing 2>/dev/null", Some("read instead of cat") ; "stderr_discarded")]
-#[test_case::test_case("find /dev/null -type f -name x", Some("glob instead of find") ; "find_files_by_name")]
+#[test_case::test_case("grep -rn a /dev/null 2>&1", Some("the grep tool instead of grep") ; "stderr_merged_into_stdout")]
+#[test_case::test_case("cat /dev/null/missing 2>/dev/null", Some("the read tool instead of cat") ; "stderr_discarded")]
+#[test_case::test_case("find /dev/null -type f -name x", Some("the glob tool instead of find") ; "find_files_by_name")]
 #[test_case::test_case("find /dev/null -name x -delete", None ; "find_with_an_action")]
 #[test_case::test_case("find /dev/null -type d", None ; "find_directories")]
-#[test_case::test_case("grep -c a /dev/null", Some("grep instead of grep") ; "counting_grep")]
-#[test_case::test_case("grep -rl a /dev/null", Some("grep instead of grep") ; "grep_listing_the_matching_files")]
+#[test_case::test_case("grep -c a /dev/null", Some("the grep tool instead of grep") ; "counting_grep")]
+#[test_case::test_case("grep -rl a /dev/null", Some("the grep tool instead of grep") ; "grep_listing_the_matching_files")]
 #[test_case::test_case("grep -rvn a /dev/null", None ; "inverted_grep_among_short_flags")]
 #[test_case::test_case("ls -l /dev/null", None ; "long_listing")]
-#[test_case::test_case("tail -n 1 /dev/null", Some("read instead of tail") ; "lines_from_the_end")]
+#[test_case::test_case("tail -n 1 /dev/null", Some("the read tool instead of tail") ; "lines_from_the_end")]
 #[test_case::test_case("tail -f /dev/null/missing", None ; "following_a_file")]
 #[test_case::test_case("sed s/a/b/ /dev/null", None ; "sed_substitution")]
 #[test_case::test_case("sed -i.bak s/a/b/ /dev/null/missing", None ; "sed_in_place")]
@@ -9600,9 +9600,9 @@ fn bash_adds_no_file_tool_note_unless_the_option_is_on() {
     assert_eq!(file_tool_note(&reply), None, "got: {reply}");
 }
 
-#[test_case::test_case(&["read"], &[], Some("grep instead of grep") ; "one_disabled")]
+#[test_case::test_case(&["read"], &[], Some("the grep tool instead of grep") ; "one_disabled")]
 #[test_case::test_case(&["read", "grep"], &[], None ; "both_disabled")]
-#[test_case::test_case(&[], &["bash", "read"], Some("read instead of cat") ; "one_allowed")]
+#[test_case::test_case(&[], &["bash", "read"], Some("the read tool instead of cat") ; "one_allowed")]
 #[test_case::test_case(&[], &["bash"], None ; "none_allowed")]
 fn bash_note_names_only_tools_the_model_can_call(
     disabled: &[&str],

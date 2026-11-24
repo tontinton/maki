@@ -91,7 +91,7 @@ local WRITES_FILE_PATTERN = ">>?%s*[^&%s]"
 local DEV_NULL = "/dev/null"
 local FILE_TOOL_NOTE_HEAD = "Use dedicated tools for files, not bash: "
 local FILE_TOOL_NOTE = FILE_TOOL_NOTE_HEAD .. "%s."
-local FILE_TOOL_ITEM = "%s instead of %s"
+local FILE_TOOL_ITEM = "the %s tool instead of %s"
 
 local rtk_available
 local fallback_log_seq = 0
