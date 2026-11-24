@@ -80,7 +80,6 @@
     {
       matchManagers: ['github-actions'],
       groupName: 'GitHub Actions',
-      extends: ['schedule:monthly'],
     },
     {
       description: 'Only tags bare majors (v35), which the semver extractVersion of the pin preset drops',
@@ -88,13 +87,8 @@
       extractVersion: '^(?<version>v\\d+)$',
     },
     {
-      matchManagers: ['custom.regex'],
-      extends: ['schedule:monthly'],
-    },
-    {
-      description: 'Weekly, unlike the other custom deps. The PR only moves the date, so the new /models shape needs a look before merging',
+      description: 'The PR only moves the date, so the new /models shape needs a look before merging',
       matchDepNames: ['copilot-api-version'],
-      extends: ['schedule:weekly'],
       prBodyNotes: ['Check that `/models` still parses with this version (`billing.token_prices`, `capabilities.limits`) before merging.'],
     },
     {
