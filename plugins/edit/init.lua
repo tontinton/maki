@@ -5,6 +5,7 @@ local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
 local snippet = require("edit_helpers").snippet
+local shift_note = require("edit_helpers").shift_note
 
 local FALLBACK_VIEW_LINES = 5
 
@@ -222,8 +223,9 @@ local function apply_edit(path, transform)
 end
 
 local function diff_result(edit_result, summary)
+  local shift = shift_note(edit_result.before, edit_result.after)
   return {
-    llm_output = summary,
+    llm_output = shift and summary .. "; " .. shift or summary,
     diff_path = edit_result.path,
     diff_before = edit_result.before,
     diff_after = edit_result.after,

@@ -135,6 +135,29 @@ function M.replace_lines(content, start_line, end_line, new_string, expected_fir
   return trailing_nl and joined .. "\n" or joined
 end
 
+-- What the model needs to keep its line numbers right after an edit: every
+-- line below the change moved by the same amount. Nothing when no line moved.
+function M.shift_note(before, after)
+  local old, new = split_lines(before), split_lines(after)
+  local delta = #new - #old
+  if delta == 0 then
+    return nil
+  end
+  local shortest = math.min(#old, #new)
+  local head = 0
+  while head < shortest and old[head + 1] == new[head + 1] do
+    head += 1
+  end
+  local tail = 0
+  while tail < shortest - head and old[#old - tail] == new[#new - tail] do
+    tail += 1
+  end
+  if tail == 0 then
+    return nil
+  end
+  return string.format("lines after %d shifted by %+d", #old - tail, delta)
+end
+
 -- Insert `new_string` after line `after_line` and check arguments.
 function M.insert_after(content, after_line, new_string)
   local lines = split_lines(content)
