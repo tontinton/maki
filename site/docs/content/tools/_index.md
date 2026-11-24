@@ -89,13 +89,14 @@ Prefer this over edit when making multiple changes to the same file.
 
 ### `edit_lines` {#edit_lines}
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. `expect` is the current text of line `start`: line numbers from before your last edit of the file are stale, and a mismatch refuses the edit. Do not use with the batch tool.
 
 **Permission:** `fs_write`
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `end` | integer | yes | Last line, inclusive |
+| `expect` | string | yes | Current text of line `start`, indentation optional |
 | `new_string` | string | yes | Replacement text |
 | `path` | string | yes | Absolute path to the file |
 | `start` | integer | yes | First line (1-indexed) |
