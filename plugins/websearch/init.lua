@@ -6,6 +6,7 @@ local DECODE_OPTS = { luanil = { object = true, array = true } }
 local parse_sse_response = require("parse_sse")
 local providers = require("providers")
 local searxng = require("searxng")
+local kagi = require("kagi")
 local NOT_AN_OBJECT_MSG = require("constants").NOT_AN_OBJECT_MSG
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
@@ -15,7 +16,7 @@ local opts = maki.api.register_options(output_limits.extend({
   provider = {
     default = "exa",
     type = "string",
-    desc = 'Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted).',
+    desc = 'Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi Search API, needs KAGI_API_KEY), or "searxng" (self-hosted).',
   },
   searxng_base_url = {
     default = "",
@@ -62,14 +63,16 @@ local function web_view_opts(ctx)
 end
 
 -- Request gate: a failed request or a non-2xx answer becomes an error
--- string, with a body preview so the server's own reason stays visible.
-local function fetch(url, req_opts)
+-- string, with the server's own reason: what `describe_error` reads out of
+-- the body, or failing that a body preview.
+local function fetch(url, req_opts, describe_error)
   local resp, err = maki.net.request(url, req_opts)
   if not resp then
     return nil, tostring(err)
   end
   if resp.status < 200 or resp.status >= 300 then
-    return nil, "HTTP " .. tostring(resp.status) .. ": " .. resp.body:sub(1, 200)
+    local reason = describe_error and describe_error(resp.body) or resp.body:sub(1, 200)
+    return nil, "HTTP " .. tostring(resp.status) .. ": " .. reason
   end
   return resp
 end
@@ -89,9 +92,6 @@ local function search_mcp(query, num_results)
   end
 
   local key = api_key()
-  if not key and provider.key_required then
-    return nil, provider.label .. " search needs " .. provider.env .. " to be set"
-  end
   local headers = {
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json, text/event-stream",
@@ -116,6 +116,32 @@ local function search_mcp(query, num_results)
     text = provider.format(text)
   end
   return text, sse_err
+end
+
+local function search_kagi(query, num_results)
+  local key = api_key()
+  if not key then
+    return nil, provider.label .. " search needs " .. provider.env .. " to be set"
+  end
+  local payload, encode_err = kagi.request_body(query, num_results)
+  if not payload then
+    return nil, "failed to encode request: " .. tostring(encode_err)
+  end
+  local resp, err = fetch(kagi.ENDPOINT, {
+    method = "POST",
+    body = payload,
+    headers = {
+      ["Content-Type"] = "application/json",
+      ["Accept"] = "application/json",
+      ["Authorization"] = "Bearer " .. key,
+    },
+    timeout = REQUEST_TIMEOUT_SECS,
+    max_bytes = opts.max_response_bytes,
+  }, kagi.error_text)
+  if not resp then
+    return nil, err
+  end
+  return kagi.format_results(resp.body)
 end
 
 local function search_searxng(query, num_results, time_range)
@@ -145,8 +171,11 @@ local function search_searxng(query, num_results, time_range)
   return searxng.format_results(data, num_results)
 end
 
--- time_range only means something to the GET backend; advertising it to the
--- MCP providers would spend prompt tokens on a parameter they silently drop.
+local SEARCHERS = { kagi = search_kagi, searxng = search_searxng }
+local search = SEARCHERS[provider.transport] or search_mcp
+
+-- time_range only reaches searxng; advertising it to the other backends
+-- would spend prompt tokens on a parameter they silently drop.
 local properties = {
   query = { type = "string", description = "Search query", required = true },
   num_results = {
@@ -154,7 +183,7 @@ local properties = {
     description = "Number of results to return (default " .. DEFAULT_NUM_RESULTS .. ")",
   },
 }
-if provider.transport == "get" then
+if provider.transport == "searxng" then
   properties.time_range = {
     type = "string",
     enum = { "day", "week", "month", "year" },
@@ -199,12 +228,7 @@ maki.api.register_tool({
 
     local num_results = math.max(1, input.num_results or DEFAULT_NUM_RESULTS)
 
-    local text, err
-    if provider.transport == "get" then
-      text, err = search_searxng(query, num_results, input.time_range)
-    else
-      text, err = search_mcp(query, num_results)
-    end
+    local text, err = search(query, num_results, input.time_range)
     if not text then
       return { llm_output = "error: " .. tostring(err), is_error = true }
     end
