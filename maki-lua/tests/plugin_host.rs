@@ -7191,24 +7191,26 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
+/// The read tool requires limit. offset defaults to the first line.
+mod read_tool_params {
     use super::*;
 
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
     const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
     const MAX_OUTPUT_LINES: i32 = 2000;
 
     #[test]
-    fn missing_offset_fails_parse() {
+    fn missing_offset_reads_from_the_first_line() {
         let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
-            .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line 1\nline 2\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "limit": 2 }),
+        );
+        assert_eq!(out.as_deref(), Ok("1: line 1\n2: line 2"));
     }
 
     #[test]
@@ -7221,6 +7223,11 @@ mod read_tool_required_params {
             .err()
             .expect("missing limit should fail");
         assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("Use limit=0 to read the whole file"),
+            "the hint must say how to read it all: {err}"
+        );
     }
 
     #[test]
