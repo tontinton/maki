@@ -1,6 +1,7 @@
 local VALID_FORMATS = { markdown = true, text = true, html = true }
 local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { "script", "style", "noscript" }
+local MARKDOWN_SKIP_TAGS = { "script", "style", "noscript", "iframe", "object", "svg", "template" }
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
@@ -100,7 +101,7 @@ maki.api.register_tool({
     local is_html = ct:find("text/html") ~= nil
 
     if fmt == "markdown" and is_html then
-      local converted = maki.text.html_to_markdown(body, { skip_tags = SKIP_TAGS })
+      local converted = maki.text.html_to_markdown(body, { skip_tags = MARKDOWN_SKIP_TAGS })
       body = converted or body
     elseif fmt == "text" and is_html then
       local stripped = maki.text.html_to_text(body, { skip_tags = SKIP_TAGS })
