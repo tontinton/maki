@@ -76,6 +76,7 @@ return {
   ["maki.task.send"] = true,
   ["maki.task.stop"] = true,
   ["maki.text.html_to_markdown"] = true,
+  ["maki.text.html_to_text"] = true,
   ["maki.treesitter.get_parser"] = true,
   ["maki.treesitter.get_string_parser"] = true,
   ["maki.treesitter.language.add"] = true,
