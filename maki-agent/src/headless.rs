@@ -548,7 +548,12 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
-    let spend = Arc::<RunLedger>::default();
+    let spend = Arc::new(
+        params
+            .config
+            .max_budget_usd
+            .map_or_else(RunLedger::default, RunLedger::capped),
+    );
     let track_spend = Arc::clone(&spend);
     let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;

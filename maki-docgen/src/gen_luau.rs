@@ -2,6 +2,8 @@
 //! `lute check`. Every function is `@checked`, so nonstrict mode reports calls
 //! with arguments of the wrong type. Nonstrict can't negate table or function
 //! types, so those and arrays are `any`, and so are userdata classes for now.
+//! Also renders the set of functions that return `(nil, err)` for the
+//! `dropped_maki_error` lint rule.
 
 use std::collections::BTreeSet;
 
@@ -18,12 +20,33 @@ const INTEGER: &str = "integer";
 const NUMBER: &str = "number";
 const PRIMITIVES: [&str; 4] = ["string", "boolean", "buffer", "true"];
 const OPAQUE: [&str; 5] = [ANY, "table", "function", "userdata", "LuaCtx"];
+const ERR_TYPE: &str = "string?";
 
 pub fn generate() -> String {
     let docs = api_docs();
     let mut out = format!("{HEADER}\ndeclare {ROOT}: ");
     push_table(&mut out, ROOT, &docs);
     out.push('\n');
+    out
+}
+
+pub fn fallible() -> String {
+    let docs = api_docs();
+    let paths: BTreeSet<String> = docs
+        .iter()
+        .filter(|m| m.kind == DocKind::Table)
+        .flat_map(|m| {
+            m.fns
+                .iter()
+                .filter(|f| !f.value && is_fallible(f.returns, &docs))
+                .map(|f| format!("{}.{}", m.name, f.name))
+        })
+        .collect();
+    let mut out = format!("{HEADER}\nreturn {{\n");
+    for path in paths {
+        out.push_str(&format!("{INDENT}[\"{path}\"] = true,\n"));
+    }
+    out.push_str("}\n");
     out
 }
 
@@ -65,15 +88,24 @@ fn signature(path: &str, f: &FnDoc, docs: &[&ModuleDoc]) -> String {
         .iter()
         .map(|p| parameter(p.name, &resolve(p.ty)))
         .collect();
-    let returns: Vec<String> = f
-        .returns
+    let returns: Vec<String> = return_types(f.returns).map(resolve).collect();
+    format!("({}) -> ({})", params.join(", "), returns.join(", "))
+}
+
+/// Splits a doc return such as `(string?, string?) text, or nil and an error`
+/// into its types.
+fn return_types(returns: &str) -> impl Iterator<Item = &str> {
+    returns
         .strip_prefix('(')
         .and_then(|r| r.split_once(')'))
-        .map_or(f.returns, |(types, _)| types)
+        .map_or(returns, |(types, _)| types)
         .split_terminator(", ")
-        .map(resolve)
-        .collect();
-    format!("({}) -> ({})", params.join(", "), returns.join(", "))
+}
+
+/// A value followed by an error string, the `(nil, err)` convention.
+fn is_fallible(returns: &str, docs: &[&ModuleDoc]) -> bool {
+    let types: Vec<&str> = return_types(returns).collect();
+    types.len() > 1 && types.last().and_then(|ty| luau_type(ty, docs)).as_deref() == Some(ERR_TYPE)
 }
 
 /// Renders a doc parameter such as `{path}`, `{opts?}` or `{...}`. A name
@@ -129,7 +161,7 @@ mod tests {
     use maki_lua::docs::api_docs;
     use test_case::test_case;
 
-    use super::{luau_type, parameter};
+    use super::{is_fallible, luau_type, parameter};
 
     #[test_case("{path}", "string", "path: string" ; "required")]
     #[test_case("{timeout_ms?}", "number", "timeout_ms: number?" ; "optional_name_takes_nil")]
@@ -151,5 +183,15 @@ mod tests {
     #[test_case("Nod[]", None ; "unknown_array_element")]
     fn maps_doc_types(ty: &str, expected: Option<&str>) {
         assert_eq!(luau_type(ty, &api_docs()).as_deref(), expected);
+    }
+
+    #[test_case("(string?, string?) Contents, or nil and an error.", true ; "optional_value_and_error")]
+    #[test_case("(table|nil, string|nil) The state, or nil and an error.", true ; "nil_unions")]
+    #[test_case("(string?, string?, string?) Output, format, or nil and an error.", true ; "three_values")]
+    #[test_case("(string?) Path, or nil when unset.", false ; "single_value")]
+    #[test_case("(string, integer) Text and its width.", false ; "no_error")]
+    #[test_case("", false ; "no_return")]
+    fn detects_fallible_returns(returns: &str, expected: bool) {
+        assert_eq!(is_fallible(returns, &api_docs()), expected);
     }
 }

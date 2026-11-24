@@ -1,13 +1,12 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use reqwest::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, TRANSFER_ENCODING};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::warn;
 
 use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
 use maki_storage::id::SessionRef;
@@ -17,7 +16,7 @@ use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::headers::{HeaderError, header_name, parse_headers};
-use crate::model::{Model, ModelEffort, ModelInfo, ThinkingSupport};
+use crate::model::{FactSource, Model, ModelEffort, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::ProviderSpec;
@@ -34,12 +33,6 @@ const EFFORT_PATH_SEPARATOR: char = '.';
 /// Framing the HTTP client owns. A declared one would contradict the request
 /// actually sent, or smuggle a second one into it.
 const TRANSPORT_HEADERS: [HeaderName; 4] = [HOST, CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION];
-
-/// Gateways and models that refused the default `thinking` block. It lives in
-/// a static because providers get rebuilt, on a model switch for example, and
-/// each new one would pay for the refusal again. Nothing is saved to disk, so a
-/// gateway that learns the field gets it back after a restart.
-static THINKING_REJECTED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
 
 /// Why a declaration's openai wire options did not parse. Raised while the
 /// declaration decodes, so a bad one fails the plugin that wrote it rather
@@ -235,6 +228,7 @@ impl OpenAiWire {
     pub(crate) fn adjust_model(&self, model: &mut Model) {
         if let Some(support) = self.thinking_override(&model.id) {
             model.thinking_override = Some(support);
+            model.sources.thinking = FactSource::Table;
         }
     }
 
@@ -544,61 +538,23 @@ pub(crate) struct CompatProvider {
 impl CompatProvider {
     /// GLM and Kimi keep reasoning unless they get the default `thinking`
     /// block, but LiteLLM in front of Azure answers any field it does not know
-    /// with a 400. There is no way to tell them apart up front, so the block
-    /// goes out and a refusal costs one replay without it.
-    ///
-    /// We only remember the refusal once the replay works. If it fails too,
-    /// with a 503 or with a 400 that just happened to say "thinking", the
-    /// block was not the problem and the next request offers it again.
+    /// with a 400, so the block is offered and dropped on refusal.
     async fn stream_chat(
         &self,
         model: &Model,
         headers: &HeaderMap,
-        mut body: Value,
+        body: Value,
         event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
-        if !custom::carries_undeclared_thinking(model, &body) {
-            return self
-                .compat
-                .do_stream(model, headers, &body, event_tx, auth)
-                .await;
-        }
-        let gateway = (self.compat.base_url(auth), model.id.clone());
-        let refused_before = THINKING_REJECTED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&gateway);
-        if !refused_before {
-            match self
-                .compat
-                .do_stream(model, headers, &body, event_tx, auth)
-                .await
-            {
-                Err(error) if error.rejects_param(THINKING_FIELD) => warn!(
-                    base_url = %gateway.0,
-                    model = %model.id,
-                    %error,
-                    "gateway refused the thinking block, retrying without it. \
-                     Declare thinking_fields for this model to choose what is sent"
-                ),
-                result => return result,
-            }
-        }
-        if let Some(object) = body.as_object_mut() {
-            object.remove(THINKING_FIELD);
-        }
-        let result = self
-            .compat
-            .do_stream(model, headers, &body, event_tx, auth)
-            .await;
-        if result.is_ok() {
-            THINKING_REJECTED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(gateway);
-        }
-        result
+        let thinking_keys: &[&str] = if custom::carries_undeclared_thinking(model, &body) {
+            &[THINKING_FIELD]
+        } else {
+            &[]
+        };
+        self.compat
+            .stream_with_thinking_retry(model, headers, body, thinking_keys, event_tx, auth)
+            .await
     }
 }
 

@@ -1703,7 +1703,7 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::model::ModelTier;
+    use crate::model::{FactSource, ModelTier};
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, isolated_home, serve};
@@ -3076,6 +3076,23 @@ mod tests {
         assert!(spec(SLUG).unwrap().models()[0].context_window.is_none());
         assert_eq!(listed.max_output_tokens, unlisted.max_output_tokens);
         assert_eq!(listed.context_window, unlisted.context_window);
+    }
+
+    #[test]
+    fn a_row_borrows_capabilities_with_like() {
+        const SLUG: &str = "like-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.models[0] = serde_json::from_value(serde_json::json!({
+            "prefixes": [MODEL_ID],
+            "like": "zai/glm-5.3",
+        }))
+        .unwrap();
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert_eq!(model.vision_with_source(), (false, FactSource::Like));
+        assert!(!model.supports_tool_examples());
     }
 
     fn authored_cap(stated: Option<Value>) -> Value {

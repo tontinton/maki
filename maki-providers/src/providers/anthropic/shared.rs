@@ -601,7 +601,7 @@ mod tests {
         LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, SystemBlock, build_request_body_with_system,
         long_context_window, strip_long_context,
     };
-    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+    use crate::model::{FactSources, Model, ModelFamily, ModelPricing, ModelTier};
     use crate::{ContentBlock, Message, Role, ThinkingConfig};
 
     const SYSTEM: &str = "sys";
@@ -639,6 +639,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 200_000,
             thinking_fields: None,
         }

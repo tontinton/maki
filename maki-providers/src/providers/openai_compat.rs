@@ -1,6 +1,7 @@
 use std::borrow::Cow;
-use std::sync::LazyLock;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -14,7 +15,7 @@ use tracing::{debug, warn};
 
 use super::copilot::copilot_usd;
 use super::{ResolvedAuth, SseBody};
-use crate::model::ModelFamily;
+use crate::model::{Model, ModelFamily};
 use crate::types::rejects_sampling;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -44,6 +45,11 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
     let id = MakiId::generate().to_string();
     id[id.len() - PROCESS_TAG_LEN..].to_owned()
 });
+/// Gateways and models that refused the thinking fields maki adds. It lives in
+/// a static because providers get rebuilt, on a model switch for example, and
+/// each new one would pay for the refusal again. Nothing is saved to disk, so a
+/// gateway that learns the fields gets them back after a restart.
+static THINKING_REFUSED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
 
 #[derive(Clone)]
 pub(crate) struct OpenAiCompatConfig {
@@ -141,7 +147,7 @@ impl OpenAiCompatProvider {
 
     pub fn build_body(
         &self,
-        model: &crate::model::Model,
+        model: &Model,
         messages: &[Message],
         system: &str,
         tools: &Value,
@@ -190,6 +196,63 @@ impl OpenAiCompatProvider {
             .to_owned()
     }
 
+    /// Sends `body`, whose top-level `thinking_keys` are fields maki added on
+    /// its own. There is no way to tell up front which gateways refuse them, so
+    /// they go out and a refusal costs one replay without them.
+    ///
+    /// We only remember the refusal once the replay works. If it fails too,
+    /// with a 503 or with a 400 that just happened to name the field, the
+    /// fields were not the problem and the next request offers them again.
+    pub(crate) async fn stream_with_thinking_retry(
+        &self,
+        model: &Model,
+        headers: &HeaderMap,
+        mut body: Value,
+        thinking_keys: &[impl AsRef<str> + Sync],
+        event_tx: &UnboundedSender<ProviderEvent>,
+        auth: &ResolvedAuth,
+    ) -> Result<StreamResponse, AgentError> {
+        if thinking_keys.is_empty() {
+            return self.do_stream(model, headers, &body, event_tx, auth).await;
+        }
+        let gateway = (self.base_url(auth), model.id.clone());
+        let refused_before = THINKING_REFUSED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&gateway);
+        if !refused_before {
+            match self.do_stream(model, headers, &body, event_tx, auth).await {
+                Err(error)
+                    if thinking_keys
+                        .iter()
+                        .any(|key| error.rejects_param(key.as_ref())) =>
+                {
+                    warn!(
+                        base_url = %gateway.0,
+                        model = %model.id,
+                        %error,
+                        "gateway refused the thinking fields, retrying without them. \
+                         Declare thinking_fields for this model to choose what is sent"
+                    )
+                }
+                result => return result,
+            }
+        }
+        if let Some(object) = body.as_object_mut() {
+            for key in thinking_keys {
+                object.remove(key.as_ref());
+            }
+        }
+        let result = self.do_stream(model, headers, &body, event_tx, auth).await;
+        if result.is_ok() {
+            THINKING_REFUSED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(gateway);
+        }
+        result
+    }
+
     fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
         let base = self.base_url(auth);
         self.client.request(method, format!("{base}{path}"))
@@ -202,7 +265,7 @@ impl OpenAiCompatProvider {
     /// rotation included.
     pub async fn do_stream(
         &self,
-        model: &crate::model::Model,
+        model: &Model,
         declared_headers: &HeaderMap,
         body: &Value,
         event_tx: &UnboundedSender<ProviderEvent>,
@@ -810,7 +873,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::headers::parse_headers;
-    use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::model::{FactSources, Model, ModelPricing, ModelTier};
     use crate::test_support::{Canned, serve, sse_body};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1548,6 +1611,7 @@ data: [DONE]\n\n";
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 131_072,
             thinking_fields: None,
         }

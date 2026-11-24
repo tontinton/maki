@@ -39,14 +39,25 @@ fmt:
     cargo fmt --all
     stylua plugins/
 
-# Same command as CI. lute reads `plugins/.config.luau` from the working directory.
-# Not part of `ci` yet: it needs the lute nightly pinned in `.github/workflows/rust.yml`.
-check-lua:
-    cd plugins && lute check $(find . -name '*.lua')
+# The files the Lua checks run on, from `plugins/`. Definition files are left out, since lute's lint
+# parser rejects their `declare` syntax.
+lua_files := "$(find . \\( -name '*.lua' -o -name '*.luau' \\) ! -name '*.d.luau')"
 
-# Same command as CI, with lute's default rules. Prefix a deliberately unused variable with `_`.
+# CI runs the Lua checks through these recipes. lute reads `plugins/.config.luau` from the working directory.
+# Not part of `ci` yet: they need the lute nightly pinned in `.github/workflows/rust.yml`.
+check-lua:
+    cd plugins && lute check {{lua_files}}
+
+# lute's default rules plus maki's own in `plugins/lint`. Prefix a deliberately unused variable with `_`.
+# `--sequential`: the default parallel mode (one `vm.create` worker per core) races in lute's
+# cross-VM runtime and crashes ~10% of runs (SIGSEGV, or "Cannot resume a non-thread reference").
 lint-lua:
-    cd plugins && lute lint $(find . -name '*.lua')
+    cd plugins && lute lint --sequential {{lua_files}}
+
+# Luau's built-in lints, which `lute check` doesn't run. luau-analyze can't load `maki.d.luau`,
+# so its type errors are left to `lute check`, and it exits 0 on findings.
+analyze-lua:
+    cd plugins && ! luau-analyze --formatter=plain {{lua_files}} | grep -vE ': \([EW][0-9]+\) TypeError:'
 
 pylint:
     ruff check scripts/

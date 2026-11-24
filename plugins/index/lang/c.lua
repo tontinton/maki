@@ -12,6 +12,8 @@ return function(U)
 
   local DEFINE_TRUNCATE = 40
 
+  local extract_nodes
+
   local function extract_include(node, source)
     local path_node = node:field("path")[1]
     if not path_node then

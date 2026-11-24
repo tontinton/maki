@@ -343,6 +343,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::EndTurn => Some("finished"),
         DoneReason::MaxTokens => Some("max_tokens"),
         DoneReason::MaxTurns => Some("max_turns"),
+        DoneReason::MaxBudget => Some("max_budget"),
         DoneReason::Cancelled => Some("cancelled"),
         DoneReason::Dropped => Some("dropped"),
         DoneReason::Compact => None,
@@ -463,6 +464,7 @@ mod tests {
     #[test_case(DoneReason::EndTurn, Some("finished") ; "finished")]
     #[test_case(DoneReason::MaxTokens, Some("max_tokens") ; "max_tokens")]
     #[test_case(DoneReason::MaxTurns, Some("max_turns") ; "max_turns")]
+    #[test_case(DoneReason::MaxBudget, Some("max_budget") ; "max_budget")]
     #[test_case(DoneReason::Cancelled, Some("cancelled") ; "cancelled")]
     #[test_case(DoneReason::Dropped, Some("dropped") ; "dropped")]
     #[test_case(DoneReason::Compact, None ; "manual_compact_is_not_a_turn")]

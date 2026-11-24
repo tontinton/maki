@@ -31,6 +31,12 @@ use maki_config::providers::{
 use url::Url;
 
 const PER_MILLION: f64 = 1_000_000.0;
+pub const FACT_SOURCE_CONFIG: &str = "config";
+pub const FACT_SOURCE_DISCOVERY: &str = "discovery";
+pub const FACT_SOURCE_TABLE: &str = "table";
+pub const FACT_SOURCE_LIKE: &str = "like";
+pub const FACT_SOURCE_CATALOG: &str = "catalog";
+pub const FACT_SOURCE_DEFAULT: &str = "default";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -286,9 +292,59 @@ pub struct ModelEntry {
     /// The model its tier resolves to when nothing else picked one.
     #[serde(default)]
     pub default: bool,
+    /// `<slug>/<model>` this row is a copy of, see [`ModelEntry::inherit_like`].
+    #[serde(default)]
+    pub like: Option<String>,
+}
+
+/// What `like` lends: how a model behaves, which holds wherever it is served.
+/// Limits, price and thinking describe one deployment and the wire it speaks,
+/// so they stay with the row that borrows.
+#[derive(Debug)]
+pub(crate) struct Capabilities {
+    pub(crate) family: ModelFamily,
+    pub(crate) supports_vision: Option<bool>,
+    pub(crate) supports_tool_examples: Option<bool>,
+}
+
+impl Capabilities {
+    /// The row `spec` uses for `model_id`, without following that row's own
+    /// `like`, so no chain of them can loop.
+    pub(crate) fn of(spec: &ProviderSpec, model_id: &str) -> Option<Self> {
+        let entry = lookup_entry(spec.models(), model_id)?;
+        Some(Self {
+            family: entry.family.unwrap_or(spec.family),
+            supports_vision: entry.supports_vision,
+            supports_tool_examples: entry.supports_tool_examples,
+        })
+    }
+
+    /// `target` is `<slug>/<model>` on any provider [`ProviderRegistry::get`]
+    /// knows.
+    pub(crate) fn like(target: &str) -> Option<Self> {
+        let (slug, model_id) = target.split_once('/')?;
+        Self::of(ProviderRegistry::get(slug)?, model_id)
+    }
 }
 
 impl ModelEntry {
+    /// Fills the capabilities this row leaves out from the row its `like`
+    /// names. False when `like` names no row Maki knows.
+    pub(crate) fn inherit_like(&mut self) -> bool {
+        let Some(target) = &self.like else {
+            return true;
+        };
+        let Some(borrowed) = Capabilities::like(target) else {
+            return false;
+        };
+        self.family = self.family.or(Some(borrowed.family));
+        self.supports_vision = self.supports_vision.or(borrowed.supports_vision);
+        self.supports_tool_examples = self
+            .supports_tool_examples
+            .or(borrowed.supports_tool_examples);
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
@@ -317,6 +373,7 @@ impl ModelEntry {
             turn_output_tokens: None,
             context_window: self.context_window.unwrap_or(base.fallback_context_window),
             thinking_fields: self.thinking_fields.clone().map(Box::new),
+            sources: FactSources::default(),
         }
     }
 }
@@ -351,8 +408,8 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 
 /// Whether a curated row names *this* model rather than merely sharing a prefix
 /// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
-/// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
-/// has never been checked against.
+/// their base row, which also means an uncurated `glm-5.5` rides whichever
+/// `glm-` row the provider tabulated as its fallback.
 fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
     entry.prefixes.iter().any(|prefix| {
         model_id
@@ -366,6 +423,9 @@ fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
 struct ModelSources<'a> {
     /// The curated row [`lookup_entry`] reached, exact or not.
     entry: Option<&'a ModelEntry>,
+    /// What the row named by `entry`'s `like` lends, for whatever `entry`
+    /// leaves out.
+    like: Option<Capabilities>,
     /// `entry` names this id. Such a row was checked against the provider's own
     /// pricing page, so nothing outranks it but live discovery. A row reached
     /// by prefix is still the right family and a usable guess at the rest, but
@@ -383,8 +443,15 @@ impl<'a> ModelSources<'a> {
         let catalog_slug = plugin::base_spec(spec.slug).map_or(spec.slug, |base| base.slug);
         Self {
             entry,
+            like: entry
+                .and_then(|entry| entry.like.as_deref())
+                .and_then(Capabilities::like),
             exact,
-            catalog: (!exact)
+            // An exact row is the authority on what it states, but one that
+            // omits pricing hands that field to the catalog, so a model the
+            // provider has not priced yet still picks up the rate the day
+            // models.dev lists it.
+            catalog: ((!exact) || entry.is_some_and(|e| e.pricing.is_none()))
                 .then(|| catalog::model_meta_if_available(catalog_slug, model_id))
                 .flatten(),
         }
@@ -396,12 +463,13 @@ impl<'a> ModelSources<'a> {
         &self,
         from_entry: impl Fn(&ModelEntry) -> Option<T>,
         from_catalog: impl Fn(&CatalogMeta) -> Option<T>,
-    ) -> Option<T> {
+    ) -> Option<(T, FactSource)> {
+        let from_table = |entry: &ModelEntry| Some((from_entry(entry)?, FactSource::Table));
         self.entry
             .filter(|_| self.exact)
-            .and_then(&from_entry)
-            .or_else(|| self.catalog.as_ref().and_then(from_catalog))
-            .or_else(|| self.entry.and_then(&from_entry))
+            .and_then(from_table)
+            .or_else(|| Some((from_catalog(self.catalog.as_ref()?)?, FactSource::Catalog)))
+            .or_else(|| self.entry.and_then(from_table))
     }
 }
 
@@ -526,6 +594,52 @@ pub struct ThinkingOption {
     pub sends: &'static str,
 }
 
+/// Where a resolved fact came from. [`FactSource::as_str`] is what
+/// `maki.model.info` reports, one of the `FACT_SOURCE_*` strings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FactSource {
+    /// `providers.toml`: a model row or an Aperture override.
+    Config,
+    /// The provider's live model list, Aperture's published limits included.
+    Discovery,
+    /// A curated or plugin row for this model, or the upstream row an Aperture
+    /// id names.
+    Table,
+    /// The row a `like` names.
+    Like,
+    /// models.dev.
+    Catalog,
+    /// Nothing described this model, so a provider or family default applies.
+    #[default]
+    Default,
+}
+
+impl FactSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => FACT_SOURCE_CONFIG,
+            Self::Discovery => FACT_SOURCE_DISCOVERY,
+            Self::Table => FACT_SOURCE_TABLE,
+            Self::Like => FACT_SOURCE_LIKE,
+            Self::Catalog => FACT_SOURCE_CATALOG,
+            Self::Default => FACT_SOURCE_DEFAULT,
+        }
+    }
+}
+
+/// Recorded wherever a fact is decided, so an explanation reads the same
+/// decision the request uses.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FactSources {
+    pub context_window: FactSource,
+    pub max_output_tokens: FactSource,
+    pub pricing: FactSource,
+    /// Who set [`Model::thinking_override`]. Read only while it is set.
+    pub thinking: FactSource,
+    /// Who set [`Model::supports_vision_override`]. Read only while it is set.
+    pub vision: FactSource,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastSupport {
     Pending,
@@ -568,6 +682,7 @@ pub struct Model {
     pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
     pub thinking_fields: Option<Box<ThinkingFields>>,
+    pub sources: FactSources,
 }
 
 impl Model {
@@ -596,27 +711,44 @@ impl Model {
         let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
         let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
-        let family = entry.and_then(|entry| entry.family).unwrap_or(base.family);
+        let like = sources.like.as_ref();
+        let family = entry
+            .and_then(|entry| entry.family)
+            .or(like.map(|like| like.family))
+            .unwrap_or(base.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
-        let pricing = discovered_pricing
-            .cloned()
+        let (pricing, pricing_source) = discovered_pricing
+            .map(|pricing| (pricing.clone(), FactSource::Discovery))
             .or_else(|| sources.pick(|entry| entry.pricing.clone(), |meta| meta.pricing.clone()))
             .unwrap_or_default();
-        let max_output_tokens = discovered
+        let (max_output_tokens, max_output_source) = discovered
             .and_then(|info| info.max_output_tokens)
+            .map(|tokens| (tokens, FactSource::Discovery))
             .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
-            .or(base.fallback_max_output);
-        let context_window = discovered
+            .map_or(
+                (base.fallback_max_output, FactSource::Default),
+                |(tokens, source)| (Some(tokens), source),
+            );
+        let (context_window, context_source) = discovered
             .and_then(|info| info.context_window)
-            .or_else(|| anthropic::shared::long_context_window(model_id))
+            .map(|tokens| (tokens, FactSource::Discovery))
+            .or_else(|| {
+                anthropic::shared::long_context_window(model_id)
+                    .map(|tokens| (tokens, FactSource::Default))
+            })
             .or_else(|| sources.pick(|entry| entry.context_window, |meta| meta.context))
-            .unwrap_or(base.fallback_context_window);
+            .unwrap_or((base.fallback_context_window, FactSource::Default));
         let (overlay_thinking, overlay_fields) = local_thinking_overlay(slug, model_id);
         // Curated files never set these, only a plugin's rows do.
-        let thinking_override = overlay_thinking.or_else(|| {
-            entry
-                .and_then(|e| ThinkingSupport::from_flags(e.supports_thinking, e.requires_thinking))
-        });
+        let (thinking_override, thinking_source) = match overlay_thinking {
+            Some(thinking) => (Some(thinking), FactSource::Config),
+            None => (
+                entry.and_then(|e| {
+                    ThinkingSupport::from_flags(e.supports_thinking, e.requires_thinking)
+                }),
+                FactSource::Table,
+            ),
+        };
         let thinking_fields =
             overlay_fields.or_else(|| entry.and_then(|e| e.thinking_fields.clone().map(Box::new)));
         Self {
@@ -624,7 +756,9 @@ impl Model {
             provider: Arc::from(slug),
             tier,
             family,
-            supports_tool_examples_override: entry.and_then(|e| e.supports_tool_examples),
+            supports_tool_examples_override: entry
+                .and_then(|e| e.supports_tool_examples)
+                .or_else(|| like.and_then(|like| like.supports_tool_examples)),
             thinking_override,
             supports_vision_override: None,
             supports_fast_override: None,
@@ -635,6 +769,13 @@ impl Model {
             turn_output_tokens: None,
             context_window,
             thinking_fields,
+            sources: FactSources {
+                context_window: context_source,
+                max_output_tokens: max_output_source,
+                pricing: pricing_source,
+                thinking: thinking_source,
+                vision: FactSource::Default,
+            },
         }
     }
 
@@ -645,6 +786,11 @@ impl Model {
     /// catalog lookup.
     fn from_catalog(slug: &str, model_id: &str, meta: CatalogMeta) -> Self {
         let (context_window, max_output_tokens) = (meta.context_window(), meta.max_output());
+        let pricing_source = if meta.pricing.is_some() {
+            FactSource::Catalog
+        } else {
+            FactSource::Default
+        };
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
@@ -661,26 +807,40 @@ impl Model {
             turn_output_tokens: None,
             context_window,
             thinking_fields: None,
+            sources: FactSources {
+                context_window: FactSource::Catalog,
+                max_output_tokens: FactSource::Catalog,
+                pricing: pricing_source,
+                thinking: FactSource::Catalog,
+                vision: FactSource::Catalog,
+            },
         }
     }
 
     pub fn supports_thinking(&self) -> bool {
+        self.thinking_with_source().0
+    }
+
+    /// [`Self::supports_thinking`], and what decided it.
+    pub fn thinking_with_source(&self) -> (bool, FactSource) {
         if let Some(thinking) = self.thinking_override {
-            return thinking != ThinkingSupport::No;
+            return (thinking != ThinkingSupport::No, self.sources.thinking);
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
         // and custom slugs through their base spec before looking up.
         let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
-            return false;
+            return (false, FactSource::Default);
         };
         model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_thinking)
+            .map(|thinking| (thinking, FactSource::Discovery))
             .or_else(|| {
-                ModelSources::resolve(spec, &self.id)
+                let thinking = ModelSources::resolve(spec, &self.id)
                     .catalog?
-                    .supports_thinking
+                    .supports_thinking?;
+                Some((thinking, FactSource::Catalog))
             })
-            .unwrap_or(spec.supports_thinking)
+            .unwrap_or((spec.supports_thinking, FactSource::Default))
     }
 
     /// A model that spells its own `off` keeps it: the id rule only covers an
@@ -723,21 +883,34 @@ impl Model {
     /// [`ModelSources`], the family default. Checked here under the model's own
     /// slug too, since a custom slug can be discovered after its `Model` is built.
     pub fn supports_vision(&self) -> bool {
-        let discovered_here =
-            || model_registry::discovered(&self.provider, &self.id).and_then(|d| d.supports_vision);
-        if let Some(vision) = self.supports_vision_override.or_else(discovered_here) {
-            return vision;
+        self.vision_with_source().0
+    }
+
+    /// [`Self::supports_vision`], and what decided it.
+    pub fn vision_with_source(&self) -> (bool, FactSource) {
+        if let Some(vision) = self.supports_vision_override {
+            return (vision, self.sources.vision);
+        }
+        let discovered = |slug: &str| {
+            model_registry::discovered(slug, &self.id)
+                .and_then(|d| d.supports_vision)
+                .map(|vision| (vision, FactSource::Discovery))
+        };
+        let family_default = (self.family.supports_vision(), FactSource::Default);
+        if let Some(found) = discovered(&self.provider) {
+            return found;
         }
         let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
-            return self.family.supports_vision();
+            return family_default;
         };
-        model_registry::discovered(spec.slug, &self.id)
-            .and_then(|d| d.supports_vision)
+        discovered(spec.slug)
             .or_else(|| {
-                ModelSources::resolve(spec, &self.id)
+                let sources = ModelSources::resolve(spec, &self.id);
+                sources
                     .pick(|entry| entry.supports_vision, |meta| meta.supports_vision)
+                    .or_else(|| Some((sources.like.as_ref()?.supports_vision?, FactSource::Like)))
             })
-            .unwrap_or_else(|| self.family.supports_vision())
+            .unwrap_or(family_default)
     }
 
     pub fn supports_tool_examples(&self) -> bool {
@@ -2060,6 +2233,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens,
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 200_000,
             thinking_fields: None,
         }

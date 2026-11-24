@@ -103,9 +103,9 @@ local function cmd_read(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local content, err = maki.fs.read(file_path)
+  local content, read_err = maki.fs.read(file_path)
   if not content then
-    return nil, "read error: " .. err
+    return nil, "read error: " .. read_err
   end
   local formatted =
     helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
@@ -130,7 +130,10 @@ local function cmd_write(path, content, tags, dir, ctx)
     return nil, tag_err
   end
   local full = helpers.encode_frontmatter(normalized) .. content
-  maki.fs.mkdir(dir, { parents = true })
+  local _, mkdir_err = maki.fs.mkdir(dir, { parents = true })
+  if mkdir_err then
+    return nil, "write error: " .. mkdir_err
+  end
   local ok, write_err = maki.fs.write(file_path, full)
   if not ok then
     return nil, "write error: " .. tostring(write_err)

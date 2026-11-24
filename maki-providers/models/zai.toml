@@ -4,10 +4,17 @@
 # carries a launch promo past its expiry and so halves the GLM-5 line. A later
 # `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
 # wrong number, but it beats the zero an unpriced model gets, which renders as
-# free.
+# free. GLM-5.4 has no published per-token API price yet (coding plan only),
+# so its row states none: models.dev supplies the rate once pay-as-you-go
+# lists it, and until then its price is unknown.
 #
-# The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
-# plan already paid for those models, so every row in it really is zero.
+# Defaults: glm-5.3 strong, the multimodal glm-5.3-flash medium, the free
+# glm-4.7-flash weak. glm-5.4 is coding-plan only for now, so it is that
+# plan's login default rather than a slot a pay-as-you-go key would fail on.
+#
+# The coding plan's models.dev entry (`zai-coding-plan`) is never priced or
+# served: the plan already paid for those models, so every rate in it is zero.
+# It still lends limits and vision to a model only the plan lists so far.
 slug = "zai"
 
 [[model]]
@@ -15,27 +22,36 @@ prefixes = ["glm-5-code"]
 tier = "strong"
 family = "glm"
 vision = false
-default = true
+default = false
 max_output_tokens = 131072
 context_window = 200000
 pricing = { input = 1.2, output = 5.0, cache_write = 0.0, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["glm-5.4"]
+tier = "strong"
+family = "glm"
+vision = true
+default = false
+max_output_tokens = 131072
+context_window = 1000000
 
 [[model]]
 prefixes = ["glm-5.3"]
 tier = "strong"
 family = "glm"
 vision = false
-default = false
+default = true
 max_output_tokens = 131072
 context_window = 1000000
 pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.26 }
 
 [[model]]
 prefixes = ["glm-5.3-flash"]
-tier = "weak"
+tier = "medium"
 family = "glm"
 vision = true
-default = false
+default = true
 max_output_tokens = 131072
 context_window = 1000000
 pricing = { input = 0.15, output = 0.5, cache_write = 0.0, cache_read = 0.03 }
@@ -85,7 +101,7 @@ prefixes = ["glm-4.7", "glm-4.6"]
 tier = "medium"
 family = "glm"
 vision = false
-default = true
+default = false
 max_output_tokens = 131072
 context_window = 200000
 pricing = { input = 0.6, output = 2.2, cache_write = 0.0, cache_read = 0.11 }

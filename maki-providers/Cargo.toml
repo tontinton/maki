@@ -35,8 +35,13 @@ keyring = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+webpki = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 test-case = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

@@ -1,3 +1,4 @@
+--!strict
 -- Moves a cursor through a list, so every picker answers the same keys. It
 -- keeps no state: you pass the key, the cursor row and a function that moves
 -- the cursor. The list and the drawing stay yours.
@@ -13,11 +14,20 @@ local ListNav = {}
 
 local UNKNOWN_ACTION_FMT = "list_nav: %s is bound to %s, but only up, down, page_up and page_down exist"
 
-local function is_selectable(row, opts)
+export type Keys = { [string]: string }
+export type Opts = {
+  count: number,
+  page: number?,
+  wrap: boolean?,
+  selectable: ((row: number) -> boolean)?,
+  keys: Keys?,
+}
+
+local function is_selectable(row: number, opts: Opts): boolean
   return not opts.selectable or opts.selectable(row)
 end
 
-local function step(cursor, delta, opts)
+local function step(cursor: number, delta: number, opts: Opts): number?
   local n = opts.count
   local i = cursor
   for _ = 1, n do
@@ -36,7 +46,7 @@ end
 
 -- A page stops at the ends instead of wrapping. When it lands on a spacer it
 -- keeps going the same way, and only turns back when nothing is left there.
-local function page(cursor, delta, opts)
+local function page(cursor: number, delta: number, opts: Opts): number?
   local n = opts.count
   local target = math.min(math.max(cursor + delta, 1), n)
   local dir = delta < 0 and -1 or 1
@@ -52,11 +62,11 @@ local function page(cursor, delta, opts)
   return nil
 end
 
-local function page_rows(opts)
+local function page_rows(opts: Opts): number
   return math.max(opts.page or opts.count, 1)
 end
 
-local ACTIONS = {
+local ACTIONS: { [string]: (cursor: number, opts: Opts) -> number? } = {
   up = function(cursor, opts)
     return step(cursor, -1, opts)
   end,
@@ -78,7 +88,7 @@ ListNav.KEYS = table.freeze({
   ["<Down>"] = "down",
   ["<PageUp>"] = "page_up",
   ["<PageDown>"] = "page_down",
-})
+} :: Keys)
 
 -- Adds j and k, for a list without a text input.
 ListNav.VIM_KEYS = table.freeze({
@@ -88,7 +98,7 @@ ListNav.VIM_KEYS = table.freeze({
   ["<PageDown>"] = "page_down",
   j = "down",
   k = "up",
-})
+} :: Keys)
 
 -- Calls {move_to}(row) for a navigation {key} and returns whether {key} is
 -- one, so you know when to pass it on. It returns true even when the cursor
@@ -103,7 +113,7 @@ ListNav.VIM_KEYS = table.freeze({
 --     spacers or headings
 --   keys: key -> "up"|"down"|"page_up"|"page_down", with keys spelled as
 --     `maki.keymap.normalize` returns them. Defaults to `ListNav.KEYS`
-function ListNav.handle_key(key, cursor, opts, move_to)
+function ListNav.handle_key(key: string, cursor: number, opts: Opts, move_to: (row: number) -> ()): boolean
   local action = (opts.keys or ListNav.KEYS)[key]
   if not action then
     return false

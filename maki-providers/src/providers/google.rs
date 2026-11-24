@@ -671,7 +671,7 @@ async fn parse_sse(
 mod tests {
     use super::*;
     use crate::error::ErrorProjection;
-    use crate::model::{ModelPricing, ModelTier};
+    use crate::model::{FactSources, ModelPricing, ModelTier};
     use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
@@ -714,6 +714,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 1_048_576,
             thinking_fields: None,
         }

@@ -5,9 +5,9 @@ local DESCRIPTION = "Stop a background task by id."
 local ID_DESCRIPTION = "Task id from its receipt"
 -- What the model reads when the final reply is not in yet.
 local STOP_REQUESTED_REPLY = "Stop requested. Its output arrives later and will not wake you, so do not wait for it."
--- A subagent inside a batch has no final reply of its own to wait for. The
--- batch's result carries what it did.
-local NESTED_STOPPED_REPLY = "Stopped. What it did so far arrives with the result of task %s."
+-- A subagent inside a batch has no final reply of its own. The batch sends
+-- what it did, named by the subagent's own id.
+local NESTED_STOPPED_REPLY = "Stopped. What it did so far arrives later as the result of task %s."
 
 local function header_buf(name)
   local buf = maki.ui.buf()
@@ -19,11 +19,9 @@ end
 -- shows the name. A handler's header is not saved with the session, so the
 -- name also goes in the state for a restore to show. A refused stop keeps
 -- the id.
-local function reply(stopped)
+local function reply(stopped, id)
   return {
-    llm_output = stopped.output
-      or (stopped.parent and NESTED_STOPPED_REPLY:format(stopped.parent))
-      or STOP_REQUESTED_REPLY,
+    llm_output = stopped.output or (stopped.parent and NESTED_STOPPED_REPLY:format(id)) or STOP_REQUESTED_REPLY,
     header = header_buf(stopped.name),
     state = { name = stopped.name },
   }
@@ -55,6 +53,6 @@ maki.api.register_tool({
     if not stopped then
       return { llm_output = err, is_error = true }
     end
-    return reply(stopped)
+    return reply(stopped, input.id)
   end,
 })

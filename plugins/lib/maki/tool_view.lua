@@ -1,3 +1,4 @@
+--!strict
 -- The shared truncate/expand body that tool plugins render through.
 --
 -- Click handlers get `ev.row`, a 1-based line in this buf; 0 means the
@@ -11,25 +12,57 @@
 local ToolView = {}
 ToolView.__index = ToolView
 
+-- A span is plain text or `{ text, style }`, a line is plain text or a list of spans.
+export type Span = string | { string }
+export type Line = string | { Span }
+export type Opts = {
+  max_lines: number?,
+  keep: ("head" | "tail")?,
+  max_expand_lines: number?,
+  max_line_bytes: number?,
+  width: number?,
+}
+type Buf = {
+  set_lines: (self: Buf, lines: { Line }, opts: { head: number }?) -> (),
+  on: (self: Buf, event: string, handler: () -> ()) -> (),
+}
+type Fields = {
+  buf: Buf,
+  max: number,
+  keep: "head" | "tail",
+  max_expand_lines: number,
+  max_line_bytes: number?,
+  header: { Line },
+  ring: { Line },
+  ring_start: number,
+  ring_count: number,
+  skipped: number,
+  all_lines: { Line },
+  all_skipped: number,
+  expanded: boolean,
+  ring_map: { [number]: number },
+}
+export type ToolView = setmetatable<Fields, typeof(ToolView)>
+
 -- Worst case is a batch child: tool body + batch body indents (2 + 2),
 -- plus the transcript's scrollbar column.
 local BODY_CHROME_COLS = 5
 local MIN_MD_WIDTH = 20
-local SEPARATOR = { { "──────", "dim" } }
+local SEPARATOR: Line = { { "──────", "dim" } }
 
-local function format_line_nr(fmt, idx)
+local function format_line_nr(fmt: string, idx: number): Span
   return { string.format(fmt, idx), "line_nr" }
 end
 
 -- Right aligned, so the content column stays put when a number gains a digit.
 -- Formats the number alone, callers add their own separator.
-function ToolView.line_nr_fmt(max_line_nr)
+function ToolView.line_nr_fmt(max_line_nr: number): string
   return "%" .. #tostring(max_line_nr) .. "d"
 end
 
 -- Truncate a UTF-8 string at a byte boundary that is also a codepoint
 -- boundary, appending an ellipsis if truncation happened.
-local function utf8_truncate_bytes(s, max_bytes)
+local function utf8_truncate_bytes(s: string, max_bytes: number): string
   if #s <= max_bytes then
     return s
   end
@@ -50,7 +83,7 @@ local function utf8_truncate_bytes(s, max_bytes)
   return s:sub(1, i) .. "…"
 end
 
-local function line_text_bytes(line)
+local function line_text_bytes(line: Line): number
   if type(line) == "string" then
     return #line
   end
@@ -65,7 +98,7 @@ local function line_text_bytes(line)
   return n
 end
 
-local function truncate_line(line, max_bytes)
+local function truncate_line(line: Line, max_bytes: number?): Line
   if not max_bytes or max_bytes <= 0 then
     return line
   end
@@ -75,13 +108,13 @@ local function truncate_line(line, max_bytes)
   if line_text_bytes(line) <= max_bytes then
     return line
   end
-  local out = {}
+  local out: { Span } = {}
   local used = 0
   for _, span in ipairs(line) do
     if used >= max_bytes then
       break
     end
-    local text, style
+    local text: string, style: string?
     if type(span) == "string" then
       text = span
     else
@@ -109,31 +142,31 @@ end
 -- With max_lines 0 only the set_header lines show until a click expands the
 -- view. The UI puts the line count in the tool header, so the row still says
 -- how much is hidden.
-function ToolView.new(buf, opts)
-  local self = setmetatable({}, ToolView)
-  self.buf = buf
-  self.max = (opts and opts.max_lines) or 80
-  self.keep = (opts and opts.keep) or "tail"
-  self.max_expand_lines = (opts and opts.max_expand_lines) or 2000
-  self.max_line_bytes = (opts and opts.max_line_bytes) or nil
-  self.header = {}
-  self.ring = {}
-  self.ring_start = 1
-  self.ring_count = 0
-  self.skipped = 0
-  self.all_lines = {}
-  self.all_skipped = 0
-  self.expanded = false
-  self.ring_map = {}
-  return self
+function ToolView.new(buf: Buf, opts: Opts?): ToolView
+  return setmetatable({
+    buf = buf,
+    max = (opts and opts.max_lines) or 80,
+    keep = (opts and opts.keep) or "tail",
+    max_expand_lines = (opts and opts.max_expand_lines) or 2000,
+    max_line_bytes = opts and opts.max_line_bytes,
+    header = {},
+    ring = {},
+    ring_start = 1,
+    ring_count = 0,
+    skipped = 0,
+    all_lines = {},
+    all_skipped = 0,
+    expanded = false,
+    ring_map = {},
+  }, ToolView)
 end
 
-function ToolView:set_header(lines)
+function ToolView.set_header(self: ToolView, lines: { Line })
   self.header = lines
   self:flush()
 end
 
-function ToolView:clear()
+function ToolView.clear(self: ToolView)
   self.ring = {}
   self.ring_start = 1
   self.ring_count = 0
@@ -144,7 +177,7 @@ function ToolView:clear()
   self:flush()
 end
 
-function ToolView:append(line)
+function ToolView.append(self: ToolView, line: Line)
   line = truncate_line(line, self.max_line_bytes)
   local all_idx
   if #self.all_lines < self.max_expand_lines then
@@ -176,7 +209,7 @@ function ToolView:append(line)
   self:flush()
 end
 
-function ToolView:append_text(text)
+function ToolView.append_text(self: ToolView, text: string)
   for _, line in ipairs(maki.split(text, "\n")) do
     self:append(line)
   end
@@ -184,8 +217,8 @@ end
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
-function ToolView:set_highlight(content: string, ext)
-  ext = ext or "md"
+function ToolView.set_highlight(self: ToolView, content: string, ext: string?): boolean
+  local lang = ext or "md"
   if content:sub(-1) == "\n" then
     content = content:sub(1, -2)
   end
@@ -200,15 +233,15 @@ function ToolView:set_highlight(content: string, ext)
   end
 
   maki.async.run(function()
-    local highlighted = maki.ui.highlight(content, ext)
+    local highlighted = maki.ui.highlight(content, lang)
     if not highlighted then
       return
     end
-    for idx, hl_line in ipairs(highlighted) do
+    for idx, hl_line in ipairs(highlighted :: { { Span } }) do
       if not self.all_lines[idx] then
         break
       end
-      local spans = { format_line_nr(fmt, idx) }
+      local spans: { Span } = { format_line_nr(fmt, idx) }
       for _, seg in ipairs(hl_line) do
         spans[#spans + 1] = seg
       end
@@ -224,20 +257,20 @@ end
 -- single hidden line is drawn as itself instead of a notice, so it counts as
 -- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
 -- prints its notice first and shifts them.
-function ToolView:visible_count()
+function ToolView.visible_count(self: ToolView): number
   if self.expanded then
     return #self.all_lines
   end
   return self.ring_count + (self.max > 0 and self.skipped == 1 and 1 or 0)
 end
 
-function ToolView:toggle()
+function ToolView.toggle(self: ToolView)
   self.expanded = not self.expanded
   self:flush()
 end
 
-function ToolView:flush()
-  local lines = {}
+function ToolView.flush(self: ToolView)
+  local lines: { Line } = {}
 
   for _, h in ipairs(self.header) do
     lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
@@ -255,9 +288,10 @@ function ToolView:flush()
     end
   elseif self.max > 0 then
     local hidden = self.skipped
-    local notice = hidden >= 2 and { { "... (" .. hidden .. " lines) (click to expand)", "dim" } }
-      or hidden == 1 and self.all_lines[self.keep == "tail" and 1 or self.ring_count + 1]
-      or nil
+    local notice: Line? = if hidden >= 2
+      then { { "... (" .. hidden .. " lines) (click to expand)", "dim" } }
+      elseif hidden == 1 then self.all_lines[if self.keep == "tail" then 1 else self.ring_count + 1]
+      else nil
 
     if self.keep == "tail" and notice then
       lines[#lines + 1] = truncate_line(notice, self.max_line_bytes)
@@ -280,7 +314,7 @@ function ToolView:flush()
   self.buf:set_lines(lines, { head = #self.header })
 end
 
-function ToolView:update_line(all_idx, line)
+function ToolView.update_line(self: ToolView, all_idx: number, line: Line)
   line = truncate_line(line, self.max_line_bytes)
   self.all_lines[all_idx] = line
   for ri = 1, self.ring_count do
@@ -292,13 +326,13 @@ function ToolView:update_line(all_idx, line)
 end
 
 -- Call once after the last append so the collapsed notice renders.
-function ToolView:finish()
+function ToolView.finish(self: ToolView)
   if (self.keep == "head" or self.max == 0) and self.skipped > 0 then
     self:flush()
   end
 end
 
-function ToolView.restore_lines(lines, opts)
+function ToolView.restore_lines(lines: { Line }, opts: Opts?): Buf
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, opts)
   for _, line in ipairs(lines) do
@@ -313,14 +347,14 @@ end
 
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
-function ToolView.restore(output, opts)
+function ToolView.restore(output: string, opts: Opts?): Buf
   return ToolView.restore_lines(maki.split(output, "\n"), opts)
 end
 
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`). {opts.width} is the wrap width and defaults to the body
 -- column of the current terminal. Errors stay plain, as they do live.
-function ToolView.restore_markdown(output, is_error, opts)
+function ToolView.restore_markdown(output: string, is_error: boolean?, opts: Opts): Buf
   if not is_error then
     local width = opts.width or math.max(maki.ui.terminal_size().cols - BODY_CHROME_COLS, MIN_MD_WIDTH)
     local ok, md_lines = pcall(maki.ui.markdown, output, width)

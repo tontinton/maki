@@ -9,7 +9,8 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use common::{
-    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, request_move,
+    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, poll_until,
+    request_move,
 };
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
@@ -56,7 +57,8 @@ const BATCH_PLUGIN: &str = "batch";
 const BATCH_TOOL: &str = "batch";
 const SECOND_NAME: &str = "check the logs";
 const LISTED_TASK: &str = "- task (task ";
-const NESTED_STOPPED: &str = "Stopped. What it did so far arrives with the result of task ";
+const NAMED_SECTION: &str = "## task (task ";
+const NESTED_STOPPED: &str = "Stopped. What it did so far arrives later as the result of task ";
 
 // Mirrors of the runtime's wording.
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
@@ -634,7 +636,8 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
 /// The model sent its background tasks out in one batch, and the batch moved
 /// as one call. The receipt lists each subagent's id. The batch's id reaches
 /// all of them, a subagent's own id reaches just that one, and stopping one
-/// leaves the rest and the batch running.
+/// leaves the rest and the batch running. Each result, early or in the final
+/// reply, names the id the receipt gave it.
 #[test]
 fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     let mut host = Host::task(Arc::new(ToolRegistry::new()));
@@ -678,9 +681,20 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     agent.mailbox = Some(chat.mailbox.clone());
     assert_eq!(
         done_text(&exec(&host.reg, STOP_TOOL, json!({ "id": second }), &agent)),
-        (format!("{NESTED_STOPPED}{CALL_ID}."), false)
+        (format!("{NESTED_STOPPED}{second}."), false)
     );
     assert_refused(&host, chat.id, second);
+    let notices = poll_until("the stopped subagent never reported", || {
+        Some(chat.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
+    });
+    let [notice] = &notices[..] else {
+        panic!("one part notice: {notices:?}");
+    };
+    let notice = notice.first_text_content().unwrap();
+    assert!(
+        notice.contains(second) && !notice.contains(CALL_ID),
+        "the part is named by the id the receipt gave it: {notice}"
+    );
     assert_eq!(
         message(&host, chat.id, first, false),
         (QUEUED.to_owned(), false)
@@ -689,5 +703,9 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     // Dropping the release sender lets every turn finish, however many the
     // queued messages add.
     drop(parked);
-    host.task_done();
+    let (last, _) = done_text(&host.task_done());
+    assert!(
+        last.contains(&format!("{NAMED_SECTION}{first})")),
+        "the last subagent's section names its id: {last}"
+    );
 }

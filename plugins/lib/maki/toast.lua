@@ -1,8 +1,11 @@
+--!strict
 -- Corner toast notifications built on floating windows. `maki.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
 
 local Toast = {}
+
+type Opts = { title: string?, timeout_secs: number? }
 
 local MAX_LINES = 5
 local MAX_WIDTH = 48
@@ -15,8 +18,8 @@ local ZINDEX = 200
 -- Show {text} as a toast, up to 5 lines of it. {opts}: title (string),
 -- timeout_secs (integer, default 4). Returns right away and the toast
 -- dismisses itself when the time is up.
-function Toast.show(text, opts)
-  opts = opts or {}
+function Toast.show(text: unknown, opts: Opts?)
+  opts = opts or ({} :: Opts)
   local lines = {}
   local width = MIN_WIDTH
   for line in tostring(text):gmatch("[^\n]+") do

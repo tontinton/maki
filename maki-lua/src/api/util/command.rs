@@ -800,6 +800,12 @@ pub enum UiAction {
         req: ModelRequest,
         reply_tx: oneshot::Sender<UiReply>,
     },
+    /// Usage from the focused session's live provider, the same instance
+    /// `/usage` reads, so key rotation and retries are already accounted for.
+    ProviderUsage {
+        slug: String,
+        reply_tx: oneshot::Sender<UiReply>,
+    },
     Plan {
         req: PlanRequest,
         reply_tx: oneshot::Sender<UiReply>,

@@ -4,18 +4,21 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use reqwest::header::HeaderMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model::{
+    Capabilities, FactSource, Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport,
+    lookup_entry,
+};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,
 };
-use crate::types::ThinkingFallback;
+use crate::types::{EffortDialect, ThinkingFallback, dialect};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 use maki_storage::id::SessionRef;
 
@@ -39,6 +42,9 @@ const DOC_API_URL: &str = "Aperture gateway (set APERTURE_HOST)";
 const FEATURES: &str =
     "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml";
 const AUTH_DOC: &str = "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)";
+/// The generic route speaks chat completions, so a model pinned to think
+/// spells it as chat's `reasoning_effort`, whatever row it borrows from.
+const GENERIC_DIALECT: &EffortDialect<'static> = &dialect::STANDARD;
 const DISCOVERY_NOTE: &str = "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
      endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.";
 
@@ -127,22 +133,37 @@ fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
 
 /// The routed provider builds the request, so it answers, about the model as
 /// its own: a plugin codec finds its declaration and discovery by its slug.
-/// A model that routes nowhere takes the generic path, which sends no effort.
 fn routed_sends_thinking(
     overrides: &Overrides,
     model: &Model,
     choice: ThinkingConfig,
 ) -> ThinkingConfig {
-    routed_model(overrides, model).map_or(choice, |(spec, routed)| {
-        (spec.sends_thinking)(&routed, choice)
-    })
+    match routed_model(overrides, model) {
+        Some((spec, routed)) => (spec.sends_thinking)(&routed, choice),
+        None if model.supports_thinking() => {
+            ThinkingFallback::Dialect(GENERIC_DIALECT).sends(model, choice)
+        }
+        None => choice,
+    }
 }
 
+/// The generic route takes no `thinking_fields`, only its own spelling.
 fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
     let config = ProvidersConfig::load_or_default();
     let overrides = config.get(SLUG).map(|def| &def.overrides);
     let (spec, routed) = routed_model(overrides.unwrap_or(&Overrides::new()), model)?;
     (spec.thinking_fields_fallback)(&routed)
+}
+
+/// The fields the generic route adds for `choice`, kept apart from the body so
+/// a refusal strips exactly these.
+fn generic_thinking(model: &Model, choice: ThinkingConfig) -> Map<String, Value> {
+    let mut fields = Value::Object(Map::new());
+    choice.apply_dialect(&mut fields, model, GENERIC_DIALECT);
+    match fields {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
+    }
 }
 
 fn routed_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
@@ -176,6 +197,14 @@ fn validate_overrides(overrides: &Overrides) {
                     model, base, "base is not an OpenAI-compatible provider, ignoring"
                 );
             }
+            if let Some(like) = &f.like
+                && Capabilities::like(like).is_none()
+            {
+                warn!(
+                    provider,
+                    model, like, "like names no model Maki knows, ignoring"
+                );
+            }
         }
     }
 }
@@ -198,6 +227,7 @@ fn merged_override(overrides: &Overrides, provider_id: &str, model_id: &str) -> 
             .path_prefix
             .clone()
             .or_else(|| po.default.path_prefix.clone()),
+        like: m.like.clone().or_else(|| po.default.like.clone()),
     }
 }
 
@@ -445,30 +475,74 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     let payload = model_registry::discovered(SLUG, &model.id);
     let payload_context = payload.as_ref().and_then(|info| info.context_window);
     let payload_output = payload.as_ref().and_then(|info| info.max_output_tokens);
-    if let Some(spec) = routed_spec(provider_id, &ov) {
+    let routed = routed_spec(provider_id, &ov);
+    if let Some(spec) = routed {
         model.family = spec.family;
-        model.thinking_override = model
-            .thinking_override
-            .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
+        if model.thinking_override.is_none() {
+            model.thinking_override =
+                ThinkingSupport::from_flags(Some(spec.supports_thinking), false);
+            model.sources.thinking = FactSource::Default;
+        }
         if let Some(entry) = lookup_entry(spec.models(), model_id) {
-            model.context_window = payload_context
-                .or(entry.context_window)
-                .unwrap_or(model.context_window);
-            model.max_output_tokens = payload_output
-                .or(entry.max_output_tokens)
-                .or(model.max_output_tokens);
-            model.supports_vision_override =
-                model.supports_vision_override.or(entry.supports_vision);
+            if let Some((tokens, source)) = sourced(payload_context, entry.context_window) {
+                model.context_window = tokens;
+                model.sources.context_window = source;
+            }
+            if let Some((tokens, source)) = sourced(payload_output, entry.max_output_tokens) {
+                model.max_output_tokens = Some(tokens);
+                model.sources.max_output_tokens = source;
+            }
+        }
+    }
+    if let Some((borrowed, source)) = borrowed_capabilities(&ov, routed, provider_id, model_id) {
+        model.family = borrowed.family;
+        model.supports_tool_examples_override = model
+            .supports_tool_examples_override
+            .or(borrowed.supports_tool_examples);
+        if model.supports_vision_override.is_none() && borrowed.supports_vision.is_some() {
+            model.supports_vision_override = borrowed.supports_vision;
+            model.sources.vision = source;
         }
     }
     if let Some(cw) = ov.context_window {
         model.context_window = cw;
+        model.sources.context_window = FactSource::Config;
     }
-    model.max_output_tokens = ov.max_output_tokens.or(model.max_output_tokens);
+    if let Some(tokens) = ov.max_output_tokens {
+        model.max_output_tokens = Some(tokens);
+        model.sources.max_output_tokens = FactSource::Config;
+    }
     if let Some(thinking) = ov.supports_thinking {
         model.thinking_override = ThinkingSupport::from_flags(Some(thinking), false);
+        model.sources.thinking = FactSource::Config;
     }
-    model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
+    if let Some(vision) = ov.supports_vision {
+        model.supports_vision_override = Some(vision);
+        model.sources.vision = FactSource::Config;
+    }
+}
+
+/// The gateway's own limit describes this deployment, so it outranks the
+/// routed table.
+fn sourced(payload: Option<u32>, table: Option<u32>) -> Option<(u32, FactSource)> {
+    payload
+        .map(|tokens| (tokens, FactSource::Discovery))
+        .or_else(|| Some((table?, FactSource::Table)))
+}
+
+/// An explicit `like` wins. Without one the gateway already names the
+/// upstream, so `aperture/openai/gpt-5.4` reads like `openai/gpt-5.4`.
+fn borrowed_capabilities(
+    ov: &OverrideFields,
+    routed: Option<&'static ProviderSpec>,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<(Capabilities, FactSource)> {
+    if let Some(borrowed) = ov.like.as_deref().and_then(Capabilities::like) {
+        return Some((borrowed, FactSource::Like));
+    }
+    let upstream = routed.or_else(|| ProviderRegistry::get(provider_id))?;
+    Some((Capabilities::of(upstream, model_id)?, FactSource::Table))
 }
 
 impl Provider for Aperture {
@@ -506,11 +580,23 @@ impl Provider for Aperture {
             let auth = routed_auth(&self.auth, &prefix);
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body =
+            let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let thinking = generic_thinking(model, opts.thinking);
+            let thinking_keys: Vec<String> = thinking.keys().cloned().collect();
+            if let Some(object) = body.as_object_mut() {
+                object.extend(thinking);
+            }
             self.compat
-                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
+                .stream_with_thinking_retry(
+                    model,
+                    &HeaderMap::new(),
+                    body,
+                    &thinking_keys,
+                    event_tx,
+                    &auth,
+                )
                 .await
         })
     }
@@ -862,6 +948,8 @@ mod tests {
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.context_window, 123_456);
         assert_eq!(model.max_output_tokens, Some(7_890));
+        assert_eq!(model.sources.context_window, FactSource::Discovery);
+        assert_eq!(model.sources.max_output_tokens, FactSource::Discovery);
         crate::model_registry::set_known_models("aperture", Vec::new());
     }
 
@@ -999,6 +1087,92 @@ mod tests {
         assert!(!model.supports_thinking());
     }
 
+    const OPAQUE_UPSTREAM: &str = "azureai";
+    const OPAQUE_MODEL: &str = "opaque-model";
+    const CLAUDE_TARGET: &str = "anthropic/claude-opus-5";
+
+    fn opaque_override(fields: OverrideFields) -> Overrides {
+        Overrides::from([(
+            OPAQUE_UPSTREAM.to_string(),
+            ProviderOverride {
+                default: OverrideFields::default(),
+                models: HashMap::from([(OPAQUE_MODEL.to_string(), fields)]),
+            },
+        )])
+    }
+
+    fn opaque_model(overrides: &Overrides) -> Model {
+        let mut model =
+            Model::from_spec(&format!("aperture/{OPAQUE_UPSTREAM}/{OPAQUE_MODEL}")).unwrap();
+        apply_adjustments(&mut model, overrides);
+        model
+    }
+
+    #[test]
+    fn like_lends_capabilities_but_not_limits_or_price() {
+        let model = opaque_model(&opaque_override(OverrideFields {
+            like: Some(CLAUDE_TARGET.into()),
+            ..Default::default()
+        }));
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert_eq!(model.vision_with_source(), (true, FactSource::Like));
+        assert!(model.supports_tool_examples());
+        assert_eq!(model.context_window, SPEC.fallback_context_window);
+        assert_eq!(model.sources.context_window, FactSource::Default);
+        assert!(model.pricing.is_zero());
+        assert_eq!(model.thinking_with_source(), (false, FactSource::Default));
+    }
+
+    #[test]
+    fn a_stated_field_wins_over_like() {
+        let model = opaque_model(&opaque_override(OverrideFields {
+            like: Some(CLAUDE_TARGET.into()),
+            supports_vision: Some(false),
+            context_window: Some(1_000),
+            ..Default::default()
+        }));
+        assert_eq!(model.family, ModelFamily::Claude);
+        assert_eq!(model.vision_with_source(), (false, FactSource::Config));
+        assert_eq!(model.context_window, 1_000);
+        assert_eq!(model.sources.context_window, FactSource::Config);
+    }
+
+    #[test]
+    fn like_does_not_change_the_route() {
+        let overrides = opaque_override(OverrideFields {
+            like: Some("zai/glm-5.3".into()),
+            ..Default::default()
+        });
+        let model = opaque_model(&overrides);
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert!(routed_model(&overrides, &model).is_none());
+    }
+
+    #[test]
+    fn the_gateway_provider_id_names_the_row() {
+        let mut model = Model::from_spec("aperture/openai/gpt-6-sol").unwrap();
+        apply_adjustments(&mut model, &Overrides::new());
+        assert_eq!(model.family, ModelFamily::Gpt);
+        assert_eq!(model.vision_with_source(), (true, FactSource::Table));
+    }
+
+    #[test]
+    fn an_unknown_like_falls_back_to_the_gateway_provider_id() {
+        let overrides = Overrides::from([(
+            "zai".to_string(),
+            ProviderOverride {
+                default: OverrideFields {
+                    like: Some("nobody/nothing".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]);
+        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        apply_adjustments(&mut model, &overrides);
+        assert_eq!(model.family, ModelFamily::Glm);
+    }
+
     /// The routed provider answers, not Aperture, which declares no thinking of
     /// its own. Expectations are spelled out rather than read back out of the
     /// spec table, or the test would agree with whatever the code found.
@@ -1038,6 +1212,10 @@ mod tests {
     }
 
     async fn ask(aperture: &Aperture, model: &Model) {
+        ask_with(aperture, model, RequestOptions::default()).await;
+    }
+
+    async fn ask_with(aperture: &Aperture, model: &Model, opts: RequestOptions) {
         let (tx, _rx) = unbounded_channel();
         aperture
             .stream_message(
@@ -1046,7 +1224,7 @@ mod tests {
                 "",
                 &json!([]),
                 &tx,
-                RequestOptions::default(),
+                opts,
                 None,
             )
             .await
@@ -1197,5 +1375,72 @@ supports_vision = true
         assert_eq!(path_prefix(Some(route("zai")), &ov), "");
         let ov2 = merged_override(&overrides, "zai", "other");
         assert_eq!(ov2.context_window, Some(128_000));
+    }
+
+    const REASONING_EFFORT: &str = "reasoning_effort";
+    const REFUSED_REASONING: Canned = Canned::json(
+        400,
+        r#"{"error":{"message":"unsupported parameter: reasoning_effort","type":"invalid_request_error"}}"#,
+    );
+    const REFUSAL_THEN_ANSWERS: &[Canned] = &[REFUSED_REASONING, ANSWER, ANSWER];
+    const ZAI_TARGET: &str = "zai/glm-5.3";
+
+    fn pinned_thinking() -> Overrides {
+        opaque_override(OverrideFields {
+            supports_thinking: Some(true),
+            like: Some(ZAI_TARGET.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test_case(pinned_thinking(), Some("high") ; "a_pin_sends_chat_effort_whatever_like_names")]
+    #[test_case(Overrides::new(), None ; "no_pin_sends_nothing")]
+    fn the_generic_route_spells_thinking_the_chat_way(
+        overrides: Overrides,
+        expected: Option<&str>,
+    ) {
+        let model = opaque_model(&overrides);
+        let fields = generic_thinking(&model, ThinkingConfig::Effort(Effort::High));
+        assert_eq!(
+            fields.get(REASONING_EFFORT).and_then(Value::as_str),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_generic_pin_reports_what_the_chat_spelling_sends() {
+        let overrides = pinned_thinking();
+        let model = opaque_model(&overrides);
+        assert_eq!(model.thinking_with_source(), (true, FactSource::Config));
+        assert_eq!(
+            routed_sends_thinking(&overrides, &model, ThinkingConfig::Effort(Effort::Max)),
+            ThinkingConfig::Effort(Effort::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_reasoning_effort_is_replayed_and_remembered() {
+        let _home = isolated_home();
+        let (base_url, requests) = serve(REFUSAL_THEN_ANSWERS);
+        let host = base_url.trim_end_matches(DEFAULT_PATH_PREFIX);
+        let auth = Arc::new(Mutex::new(gateway_auth(host, FIRST_TOKEN)));
+        let overrides = pinned_thinking();
+        let model = opaque_model(&overrides);
+        let aperture = Aperture::with_auth_and_overrides(auth, Timeouts::default(), overrides);
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Adaptive,
+            ..Default::default()
+        };
+
+        ask_with(&aperture, &model, opts).await;
+        ask_with(&aperture, &model, opts).await;
+
+        let sent: Vec<bool> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.json().get(REASONING_EFFORT).is_some())
+            .collect();
+        assert_eq!(sent, [true, false, false]);
     }
 }

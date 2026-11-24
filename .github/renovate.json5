@@ -2,12 +2,12 @@
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: [
     'config:recommended',
+    'schedule:weekly',
     'helpers:pinGitHubActionDigestsToSemver',
     'customManagers:githubActionsVersions',
   ],
   // Commits are chore(deps) by default and fix(deps) for security fixes, not fix(deps) by depType.
   ignorePresets: [':semanticPrefixFixDepsChoreOthers'],
-  schedule: ['* * * * 1'],
   labels: ['dependencies'],
   osvVulnerabilityAlerts: true,
   vulnerabilityAlerts: {
@@ -20,7 +20,6 @@
     // Transitive crates (most advisories) only move through this weekly `cargo update`.
     lockFileMaintenance: {
       enabled: true,
-      schedule: ['* * * * 1'],
       commitMessageAction: 'update',
       commitMessageTopic: 'Cargo.lock',
     },
@@ -30,7 +29,6 @@
     enabled: true,
     lockFileMaintenance: {
       enabled: true,
-      schedule: ['* * 1 * *'],
       branchTopic: 'nix-lock-file-maintenance',
       commitMessageAction: 'update',
       commitMessageTopic: 'flake.lock',
@@ -82,7 +80,6 @@
     {
       matchManagers: ['github-actions'],
       groupName: 'GitHub Actions',
-      schedule: ['* * 1 * *'],
     },
     {
       description: 'Only tags bare majors (v35), which the semver extractVersion of the pin preset drops',
@@ -90,13 +87,8 @@
       extractVersion: '^(?<version>v\\d+)$',
     },
     {
-      matchManagers: ['custom.regex'],
-      schedule: ['* * 1 * *'],
-    },
-    {
-      description: 'Weekly, unlike the other custom deps. The PR only moves the date, so the new /models shape needs a look before merging',
+      description: 'The PR only moves the date, so the new /models shape needs a look before merging',
       matchDepNames: ['copilot-api-version'],
-      schedule: ['* * * * 1'],
       prBodyNotes: ['Check that `/models` still parses with this version (`billing.token_prices`, `capabilities.limits`) before merging.'],
     },
     {

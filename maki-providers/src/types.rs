@@ -1600,13 +1600,7 @@ impl ThinkingConfig {
         }
         match fallback {
             ThinkingFallback::None => {}
-            ThinkingFallback::Dialect(dialect) => {
-                if model.supports_thinking() {
-                    dialect.as_discovered(model, |dialect| {
-                        self.apply_reasoning_effort(body, dialect, model);
-                    });
-                }
-            }
+            ThinkingFallback::Dialect(dialect) => self.apply_dialect(body, model, dialect),
             // The model has no way to spell this mode, so the budget field
             // takes over: a request must never end up saying nothing.
             ThinkingFallback::BudgetField => {
@@ -1617,6 +1611,16 @@ impl ThinkingConfig {
                 };
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
+        }
+    }
+
+    /// The effort `dialect` spells for this mode, for thinking-capable models
+    /// only.
+    pub(crate) fn apply_dialect(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
+        if model.supports_thinking() {
+            dialect.as_discovered(model, |dialect| {
+                self.apply_reasoning_effort(body, dialect, model);
+            });
         }
     }
 
@@ -1927,6 +1931,7 @@ mod tests {
     use maki_storage::sessions::generate_title;
 
     use super::*;
+    use crate::model::FactSources;
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
@@ -3085,6 +3090,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 200_000,
             thinking_fields: None,
         }

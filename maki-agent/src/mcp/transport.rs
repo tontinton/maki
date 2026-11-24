@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
-use maki_providers::strip_provider_keys;
+use maki_providers::{strip_provider_keys, with_system_trust};
 use maki_storage::{StateDir, blocking};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::{Action, Attempt, Policy};
@@ -90,6 +90,7 @@ pub struct Connection {
     /// the DELETE that ends an HTTP session.
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
     timeout: Duration,
+    startup_timeout: Duration,
     process: Option<StdioProcess>,
 }
 
@@ -98,14 +99,14 @@ struct StdioProcess {
     _stderr: AbortOnDropHandle<()>,
 }
 
-/// `timeout` bounds the handshake and each request after it, as the server
-/// config says.
+/// `startup_timeout` bounds the handshake and each listing, `timeout` every
+/// other request, as the server config says.
 pub async fn connect(
     config: &ServerConfig,
     storage: Option<&StateDir>,
 ) -> Result<Connection, McpError> {
     let name = config.name.as_str();
-    let (service, process) = within(config.timeout, name, async {
+    let (service, process) = within(config.startup_timeout, name, async {
         match &config.transport {
             Transport::Stdio {
                 program,
@@ -133,6 +134,7 @@ pub async fn connect(
         peer: service.peer().clone(),
         service: Mutex::new(Some(service)),
         timeout: config.timeout,
+        startup_timeout: config.startup_timeout,
         process,
     })
 }
@@ -151,25 +153,26 @@ impl Connection {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
-        paginate(|params| async move {
+        self.listing(paginate(|params| async move {
             let page = match self.send(ListToolsRequest::with_param(params)).await? {
                 ServerResult::ListToolsResult(page) => page,
                 other => reparse(&self.name, ListToolsRequestMethod::VALUE, &other)?,
             };
             Ok((page.tools, page.next_cursor))
-        })
+        }))
         .await
     }
 
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
-        let listed = paginate(|params| async move {
-            let page = match self.send(ListPromptsRequest::with_param(params)).await? {
-                ServerResult::ListPromptsResult(page) => page,
-                other => reparse(&self.name, ListPromptsRequestMethod::VALUE, &other)?,
-            };
-            Ok((page.prompts, page.next_cursor))
-        })
-        .await;
+        let listed = self
+            .listing(paginate(|params| async move {
+                let page = match self.send(ListPromptsRequest::with_param(params)).await? {
+                    ServerResult::ListPromptsResult(page) => page,
+                    other => reparse(&self.name, ListPromptsRequestMethod::VALUE, &other)?,
+                };
+                Ok((page.prompts, page.next_cursor))
+            }))
+            .await;
         match listed {
             Err(McpError::RpcError { code, .. })
                 if code == i64::from(ErrorCode::METHOD_NOT_FOUND.0) =>
@@ -186,7 +189,19 @@ impl Connection {
     /// "unexpected response", so this hands back the raw result for
     /// [`reparse`].
     async fn send(&self, request: impl Into<ClientRequest>) -> Result<ServerResult, McpError> {
-        self.request(self.peer.send_request(request.into())).await
+        self.peer
+            .send_request(request.into())
+            .await
+            .map_err(|e| service_error(&self.name, e))
+    }
+
+    /// Listing runs at startup, so all its pages share the startup timeout,
+    /// not the request one meant for long tool calls.
+    async fn listing<T>(
+        &self,
+        pages: impl Future<Output = Result<Vec<T>, McpError>>,
+    ) -> Result<Vec<T>, McpError> {
+        within(self.startup_timeout, &self.name, pages).await
     }
 
     /// Bounds a request by the server's timeout. A tool call dropped
@@ -463,7 +478,7 @@ fn client_builder(certs: Option<&[Certificate]>) -> ClientBuilder {
     let builder = Client::builder().user_agent(CLIENT_NAME);
     match certs {
         Some(certs) => builder.tls_certs_only(certs.iter().cloned()),
-        None => builder,
+        None => with_system_trust(builder),
     }
 }
 
@@ -661,6 +676,7 @@ mod tests {
     /// The server is in-process on loopback, so this only has to catch a
     /// client that never gets an answer at all.
     const TIMEOUT: Duration = Duration::from_secs(10);
+    const LISTING_TIMEOUT: Duration = Duration::from_secs(1);
     const SESSION_ID: &str = "session-1";
     const TOOL_TEXT: &str = "hi";
     const FIRST_TOOL: &str = "first";
@@ -848,6 +864,7 @@ mod tests {
         ServerConfig {
             name: SERVER.into(),
             timeout: TIMEOUT,
+            startup_timeout: TIMEOUT,
             always_load: false,
             transport: Transport::Http {
                 url: format!("{base}{MCP_PATH}"),
@@ -1341,6 +1358,36 @@ mod tests {
         .await;
 
         assert_eq!(cancelled_id, Some(call_id));
+        drop(release_tx);
+    }
+
+    #[test_case("tools/list" ; "tools")]
+    #[test_case("prompts/list" ; "prompts")]
+    #[tokio::test]
+    async fn hung_listing_ends_on_the_startup_timeout(method: &'static str) {
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let base = spawn_server(move |req| {
+            if req.body["method"] == method {
+                let _ = release_rx.lock().unwrap().recv_timeout(TIMEOUT);
+            }
+            mcp_reply(req)
+        });
+        let mut config = http_config(&base, &[]);
+        config.timeout = Duration::from_millis(HOUR_MS);
+        let mut connection = connect(&config, None).await.unwrap();
+        connection.startup_timeout = LISTING_TIMEOUT;
+
+        let listed = async {
+            connection.list_tools().await?;
+            connection.list_prompts().await
+        }
+        .await;
+
+        let Err(McpError::Timeout { timeout_ms, .. }) = listed else {
+            panic!("expected Timeout, got {listed:?}");
+        };
+        assert_eq!(u128::from(timeout_ms), LISTING_TIMEOUT.as_millis());
         drop(release_tx);
     }
 

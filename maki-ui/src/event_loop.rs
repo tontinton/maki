@@ -40,7 +40,7 @@ use maki_lua::session_snapshot::{
 use maki_lua::{
     EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
     LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiReply, WinEvent,
+    SessionRequest, TaskRequest, UiAction, UiReply, WinEvent, fetch_provider_usage,
 };
 use maki_providers::Timeouts;
 use maki_providers::model_registry;
@@ -48,6 +48,7 @@ use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model, ModelTier};
 use maki_storage::StateDir;
+use maki_storage::blocking;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::{persist_model, push_recent, read_expanded_providers, read_recents};
 use maki_storage::sessions::normalize_title;
@@ -559,6 +560,28 @@ impl SpawnCtx {
             last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
             slot: cell,
+        }
+    }
+}
+
+/// A plugin polling a slug needs the live instance whatever tab it is in:
+/// after a failover the original slug may only be served by a background
+/// session. Fresh providers keep headless and no-session answers consistent.
+async fn provider_usage_reply(slots: Vec<Arc<ArcSwap<ModelSlot>>>, slug: String) -> UiReply {
+    let live = slots.iter().find_map(|slot| {
+        let slot = slot.load_full();
+        (slot.model.provider.as_ref() == slug.as_str()).then(|| Arc::clone(&slot.provider))
+    });
+    match live {
+        Some(provider) => fetch_provider_usage(provider.as_ref(), &slug).await,
+        None => {
+            let lookup = slug.clone();
+            let provider = blocking(move || {
+                maki_providers::provider::provider_for_slug(&lookup, Timeouts::default())
+            })
+            .await
+            .map_err(|e| e.user_message())?;
+            fetch_provider_usage(provider.as_ref(), &slug).await
         }
     }
 }
@@ -1348,6 +1371,16 @@ impl<'t> EventLoop<'t> {
                     .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
             },
             UiAction::Model { req, reply_tx } => self.handle_model_request(req, reply_tx),
+            UiAction::ProviderUsage { slug, reply_tx } => {
+                let slots = self
+                    .sessions
+                    .iter()
+                    .map(|rt| Arc::clone(&rt.slot))
+                    .collect();
+                tokio::spawn(async move {
+                    let _ = reply_tx.send(provider_usage_reply(slots, slug).await);
+                });
+            }
             UiAction::Input { req, reply_tx } => {
                 let (reply, actions) = self.handle_input_request(req);
                 let _ = reply_tx.send(reply);
@@ -2727,7 +2760,12 @@ mod tests {
     use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
-    use maki_providers::TokenUsage;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{
+        AgentError, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+        TokenUsage, UsageLimit,
+    };
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::oneshot;
@@ -2773,6 +2811,61 @@ mod tests {
         ];
         let (_, title) = select_program_status(candidates.into_iter()).unwrap();
         assert_eq!(title, expected_title);
+    }
+
+    struct QuotaProvider {
+        usage: Option<ProviderUsage>,
+    }
+
+    impl Provider for QuotaProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+            let usage = self.usage.clone();
+            Box::pin(async move { Ok(usage) })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_reply_finds_the_session_running_that_slug() {
+        let provider = QuotaProvider {
+            usage: Some(ProviderUsage {
+                plan: Some("lite".into()),
+                limits: vec![UsageLimit {
+                    label: "rotated key".into(),
+                    percentage: Some(7),
+                    reset_at: None,
+                    detail: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        let model = Model::from_spec("anthropic/claude-opus-4-6").unwrap();
+        let slots = vec![Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model,
+            provider: Arc::new(provider),
+        }))];
+
+        let reply = provider_usage_reply(slots, "anthropic".into())
+            .await
+            .unwrap();
+        assert_eq!(reply["plan"], json!("lite"));
+        assert_eq!(reply["limits"][0]["label"], json!("rotated key"));
     }
 
     #[test]

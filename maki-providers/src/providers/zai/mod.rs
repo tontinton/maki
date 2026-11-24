@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-use crate::model::{Model, ModelFamily, ThinkingSupport};
+use crate::model::{FactSource, Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -28,11 +28,12 @@ const DISPLAY_NAME: &str = "Z.AI";
 const ENV_VAR: &str = "ZHIPU_API_KEY";
 const BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-const DEFAULT_MODEL: &str = "zai/glm-5.1";
-const CODING_MODEL: &str = "zai/glm-5-code";
+const DEFAULT_MODEL: &str = "zai/glm-5.3";
+const CODING_MODEL: &str = "zai/glm-5.4";
 const LOGIN_URL: &str = "https://z.ai/manage-apikey/apikey-list";
 const MAX_TOKENS_FIELD: &str = "max_tokens";
 const AUTH_NOTE: &str = "(shared across both endpoints)";
+const MODELS_NOTE: &str = "The model list comes from the `/models` endpoint of the plan you log in with, so a model Z.AI adds shows up without a Maki update. A model missing from the table above reads its limits, vision and rates from models.dev, and its tier from the closest row (`glm-5.5` is strong like `glm-5`). The coding plan's models.dev entry lends limits and vision to a model only that plan serves so far, and never its zero rates.";
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: Cow::Borrowed(SLUG),
@@ -103,7 +104,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         features: None,
         auth: AuthDoc::EnvVarWith(AUTH_NOTE),
         catalog: CatalogDoc::Table,
-        trailing_notes: &[],
+        trailing_notes: &[MODELS_NOTE],
     },
 };
 
@@ -124,6 +125,7 @@ const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 /// First GLM that takes thinking parameters at all. A floor instead of a prefix
 /// allowlist, so the next GLM gets thinking without us shipping a release.
 const THINKING_SINCE: (u32, u32) = (5, 2);
+const GLM_PREFIX: &str = "glm-";
 
 #[derive(Deserialize)]
 struct QuotaResponse {
@@ -284,12 +286,14 @@ impl Provider for Zai {
     }
 }
 
-/// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
+/// `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`, `glm-5.4v` ->
+/// `(5, 4)`. Only the version token counts, so a date stamp never reads as a
+/// minor (`glm-5-20260101` is `(5, 0)`).
 fn glm_version(model_id: &str) -> Option<(u32, u32)> {
-    let mut parts = model_id.strip_prefix("glm-")?.split(['-', '.']);
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    Some((major, minor))
+    let version = model_id.strip_prefix(GLM_PREFIX)?.split('-').next()?;
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    let number = |part: &str| part.trim_end_matches(char::is_alphabetic).parse().ok();
+    Some((number(major)?, number(minor)?))
 }
 
 fn adjust_model(model: &mut Model) {
@@ -298,14 +302,19 @@ fn adjust_model(model: &mut Model) {
     };
     if version >= THINKING_SINCE {
         model.thinking_override = Some(ThinkingSupport::Yes);
+        model.sources.thinking = FactSource::Default;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::StateDir;
+    use test_case::test_case;
+
     use super::*;
     use crate::model::ModelTier;
-    use test_case::test_case;
+    use crate::model_registry;
+    use crate::providers::catalog::seed_catalog_for_tests;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[
         {"type":"TOKENS_LIMIT","unit":3,"percentage":16,"nextResetTime":1777819631597},
@@ -315,10 +324,14 @@ mod tests {
 
     const LONG_CONTEXT: u32 = 1_000_000;
     const GLM_5_CONTEXT: u32 = 200_000;
+    const UNCURATED_TEXT_MODEL: &str = "glm-5.5";
+    const UNCURATED_VISION_MODEL: &str = "glm-5.5-flash";
+    const UNCURATED_TEXT_CONTEXT: u32 = 256_000;
+    const UNCURATED_OUTPUT: u32 = 64_000;
 
     #[test_case("zai/glm-5.3", Some(ThinkingSupport::Yes) ; "glm_5_3_supports_thinking")]
     #[test_case("zai/glm-5.3-flash", Some(ThinkingSupport::Yes) ; "glm_5_3_flash_supports_thinking")]
-    #[test_case("zai/glm-5.4", Some(ThinkingSupport::Yes) ; "future_glm_stays_above_the_floor")]
+    #[test_case("zai/glm-5.4", Some(ThinkingSupport::Yes) ; "glm_5_4_supports_thinking")]
     #[test_case("zai/glm-5.2", Some(ThinkingSupport::Yes) ; "glm_5_2_supports_thinking")]
     #[test_case("zai/glm-5.1", None ; "glm_5_1_no_thinking")]
     #[test_case("zai/glm-5-code", None ; "glm_5_code_reads_as_5_0")]
@@ -329,12 +342,79 @@ mod tests {
         assert_eq!(model.thinking_override, expected);
     }
 
+    #[test_case("glm-5.3", Some((5, 3)) ; "main_line")]
+    #[test_case("glm-5.3-flash", Some((5, 3)) ; "variant")]
+    #[test_case("glm-5-code", Some((5, 0)) ; "bare_major_with_variant")]
+    #[test_case("glm-6", Some((6, 0)) ; "bare_major")]
+    #[test_case("glm-5.4v", Some((5, 4)) ; "vision_suffix")]
+    #[test_case("glm-5.1-20260101", Some((5, 1)) ; "date_stamp_is_not_the_minor")]
+    #[test_case("glm-5-20260101", Some((5, 0)) ; "date_stamp_after_bare_major")]
+    #[test_case("claude-opus-4-8", None ; "foreign_id")]
+    fn glm_version_parses(id: &str, expected: Option<(u32, u32)>) {
+        assert_eq!(glm_version(id), expected);
+    }
+
     #[test_case("zai/glm-5.3", LONG_CONTEXT ; "glm_5_3_1m_context")]
     #[test_case("zai/glm-5.3-flash", LONG_CONTEXT ; "glm_5_3_flash_1m_context")]
     #[test_case("zai/glm-5.1", GLM_5_CONTEXT ; "glm_5_1_keeps_200k")]
-    #[test_case("zai/glm-5.4", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
+    #[test_case("zai/glm-5.4", LONG_CONTEXT ; "glm_5_4_has_its_own_1m_row")]
+    #[test_case("zai/glm-5", GLM_5_CONTEXT ; "glm_5_keeps_its_own_200k_row")]
     fn model_entry_context_window(spec: &str, expected: u32) {
         assert_eq!(Model::from_spec(spec).unwrap().context_window, expected);
+    }
+
+    /// A GLM nobody curated yet, listed only under the coding plan, the way
+    /// glm-5.4 launched. Its limits and vision come from models.dev, and the
+    /// provider adjusts nothing the catalog states.
+    #[test_case(UNCURATED_TEXT_MODEL, UNCURATED_TEXT_CONTEXT, false ; "text_only_release")]
+    #[test_case(UNCURATED_VISION_MODEL, LONG_CONTEXT, true ; "multimodal_release")]
+    fn uncurated_glm_reads_the_coding_plan_catalog(id: &str, context: u32, vision: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = serde_json::from_str(&uncurated_plan_catalog()).unwrap();
+        seed_catalog_for_tests(index, StateDir::from_path(tmp.path().to_path_buf()));
+
+        let mut model = Model::from_spec(&format!("{SLUG}/{id}")).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.context_window, context);
+        assert_eq!(model.max_output_tokens, Some(UNCURATED_OUTPUT));
+        assert_eq!(model.supports_vision(), vision);
+        assert!(
+            !model.pricing.is_zero(),
+            "a prepaid plan's zero is not a rate"
+        );
+    }
+
+    fn uncurated_plan_catalog() -> String {
+        format!(
+            r#"{{"zai-coding-plan": {{"name": "Z.AI Coding Plan", "npm": "@ai-sdk/openai-compatible",
+            "api": "{CODING_BASE_URL}", "models": {{
+                "{UNCURATED_TEXT_MODEL}": {{"limit": {{"context": {UNCURATED_TEXT_CONTEXT}, "output": {UNCURATED_OUTPUT}}},
+                    "cost": {{"input": 0, "output": 0}}, "modalities": {{"input": ["text"]}}}},
+                "{UNCURATED_VISION_MODEL}": {{"limit": {{"context": {LONG_CONTEXT}, "output": {UNCURATED_OUTPUT}}},
+                    "cost": {{"input": 0, "output": 0}}, "modalities": {{"input": ["text", "image"]}}}}
+            }}}}}}"#
+        )
+    }
+
+    /// No published per-token price, so the row states none, and the model is
+    /// neither free nor metered until models.dev prices it.
+    #[test]
+    fn unpriced_row_is_unknown_rather_than_free() {
+        let model = Model::from_spec("zai/glm-5.4").unwrap();
+        assert!(model.pricing.is_zero());
+        assert_eq!(model.free(), None);
+    }
+
+    /// Both plans share these, so each must be callable by a pay-as-you-go
+    /// key: the coding-plan-only glm-5.4 is none of them.
+    #[test_case(ModelTier::Strong, "zai/glm-5.3" ; "strong_default")]
+    #[test_case(ModelTier::Medium, "zai/glm-5.3-flash" ; "medium_default")]
+    #[test_case(ModelTier::Weak, "zai/glm-4.7-flash" ; "weak_default")]
+    fn slot_defaults(tier: ModelTier, expected: &str) {
+        assert_eq!(
+            model_registry::spec_for_tier("zai", tier),
+            Some(expected.into())
+        );
     }
 
     /// The longest prefix wins, so without its own entry the cheap flash model
@@ -342,7 +422,7 @@ mod tests {
     #[test]
     fn glm_5_3_flash_does_not_ride_the_glm_5_3_entry() {
         let flash = Model::from_spec("zai/glm-5.3-flash").unwrap();
-        assert_eq!(flash.tier, ModelTier::Weak);
+        assert_eq!(flash.tier, ModelTier::Medium);
         assert!(flash.supports_vision());
     }
 

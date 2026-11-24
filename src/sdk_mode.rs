@@ -48,6 +48,9 @@ use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 /// live only, since the SDK has no history replay.
 pub(crate) const NOTICE_SUBTYPE: &str = "notice";
 const BACKGROUND_USAGE_SUBTYPE: &str = "background_usage";
+const RESULT_SUCCESS: &str = "success";
+const RESULT_ERROR_DURING_EXECUTION: &str = "error_during_execution";
+const RESULT_ERROR_MAX_BUDGET_USD: &str = "error_max_budget_usd";
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
@@ -1013,7 +1016,7 @@ impl EventPump {
 
     fn emit_turn_result(
         &mut self,
-        is_error: bool,
+        subtype: &'static str,
         result: String,
         num_turns: u32,
         totals: RunTotals,
@@ -1029,12 +1032,8 @@ impl EventPump {
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = totals.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
-            subtype: if is_error {
-                "error_during_execution"
-            } else {
-                "success"
-            },
-            is_error,
+            subtype,
+            is_error: subtype != RESULT_SUCCESS,
             duration_ms,
             duration_api_ms: duration_ms,
             num_turns,
@@ -1243,14 +1242,16 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
-                let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
+                // An interrupted run leaves a partial answer, a dropped one
+                // never ran and a spent budget cut the answer off, so none is
+                // a success.
+                let subtype = match reason {
+                    DoneReason::Cancelled | DoneReason::Dropped => RESULT_ERROR_DURING_EXECUTION,
+                    DoneReason::MaxBudget => RESULT_ERROR_MAX_BUDGET_USD,
                     DoneReason::EndTurn
                     | DoneReason::MaxTokens
                     | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
+                    | DoneReason::Compact => RESULT_SUCCESS,
                 };
                 let result = mem::take(&mut self.result_text);
                 let totals = RunTotals {
@@ -1258,12 +1259,12 @@ impl EventPump {
                     cost: *cost,
                     list_cost: *list_cost,
                 };
-                self.emit_turn_result(is_error, result, *num_turns, totals)?;
+                self.emit_turn_result(subtype, result, *num_turns, totals)?;
             }
             AgentEvent::Error {
                 message, totals, ..
             } => {
-                self.emit_turn_result(true, message.clone(), 0, *totals)?;
+                self.emit_turn_result(RESULT_ERROR_DURING_EXECUTION, message.clone(), 0, *totals)?;
             }
         }
         Ok(())
@@ -1856,7 +1857,7 @@ mod tests {
         let (mut pump, _out_rx) = test_pump(PermissionMode::Default, answer_tx);
         pump.handle(permission_request()).unwrap();
 
-        pump.emit_turn_result(false, String::new(), 1, RunTotals::default())
+        pump.emit_turn_result(RESULT_SUCCESS, String::new(), 1, RunTotals::default())
             .unwrap();
         pump.shared
             .lock()
@@ -2007,6 +2008,28 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    #[test_case(DoneReason::MaxBudget, RESULT_ERROR_MAX_BUDGET_USD, true ; "spent_budget")]
+    #[test_case(DoneReason::Cancelled, RESULT_ERROR_DURING_EXECUTION, true ; "cancelled")]
+    #[test_case(DoneReason::EndTurn, RESULT_SUCCESS, false ; "finished")]
+    fn a_run_result_names_why_it_ended(reason: DoneReason, subtype: &str, is_error: bool) {
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason,
+        }))
+        .unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["subtype"], subtype);
+        assert_eq!(wire["is_error"], is_error);
     }
 
     /// The SDK has no history replay, so the line goes out live as a system
