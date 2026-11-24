@@ -14,6 +14,7 @@ use tokio::task::spawn_blocking;
 use super::util::convert::TableExt;
 use super::util::pair::{Pair, pair};
 
+const PRE_TAG: &str = "pre";
 /// Elements that sit inside a line of text. Every other element starts and
 /// ends a line.
 const INLINE_TAGS: [&str; 32] = [
@@ -67,7 +68,7 @@ async fn html_to_markdown(
 }
 
 /// Convert an HTML string to plain text.
-/// Entities are decoded and whitespace is collapsed. Inline elements such as
+/// Entities are decoded and whitespace is collapsed outside `pre`. Inline elements such as
 /// `b` or `a` leave no trace, and every other element starts a new line.
 /// Invalid UTF-8 becomes U+FFFD.
 ///
@@ -101,11 +102,13 @@ enum Gap {
 enum Step {
     Visit(Rc<Node>),
     EndLine,
+    EndPre,
 }
 
 fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
     let mut text = String::new();
     let mut gap = Gap::None;
+    let mut pre_depth = 0usize;
     // Dropping an rcdom node empties its whole subtree, so the root outlives the walk.
     let document = HtmlToMarkdown::new().html_to_tree(html)?;
     let mut steps = vec![Step::Visit(Rc::clone(&document))];
@@ -116,11 +119,16 @@ fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
                 gap = Gap::Line;
                 continue;
             }
+            Step::EndPre => {
+                pre_depth -= 1;
+                text.truncate(text.trim_end_matches('\n').len());
+                continue;
+            }
         };
         match &node.data {
             NodeData::Text { contents } => {
                 for c in contents.borrow().chars() {
-                    if c.is_whitespace() {
+                    if pre_depth == 0 && c.is_whitespace() {
                         gap = gap.max(Gap::Space);
                         continue;
                     }
@@ -143,6 +151,10 @@ fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
                 if !INLINE_TAGS.contains(&tag) {
                     gap = Gap::Line;
                     steps.push(Step::EndLine);
+                }
+                if tag == PRE_TAG {
+                    pre_depth += 1;
+                    steps.push(Step::EndPre);
                 }
             }
             NodeData::Document => {}
@@ -483,6 +495,7 @@ mod tests {
     #[test_case("<p>fish &amp; chips &lt;3 &#233;</p>", "fish & chips <3 \u{e9}" ; "entities_decoded")]
     #[test_case(r#"<p title="a > b">x<!-- c > d -->y</p>"#, "xy" ; "gt_in_attributes_and_comments")]
     #[test_case("a<SCRIPT>var x = '<div>no</div>';</SCRIPT>b<style>p{}</style><noscript>js</noscript>", "ab" ; "skipped_tags_drop_their_content")]
+    #[test_case("<p>run:</p><pre><code>fn main() {\n    body();\n}\n</code></pre><p>done</p>", "run:\nfn main() {\n    body();\n}\ndone" ; "pre_keeps_its_whitespace")]
     #[test_case("hello<div", "hello" ; "unclosed_tag")]
     #[test_case("<div><span></span></div>", "" ; "no_text")]
     fn html_to_text_keeps_what_a_reader_sees(html: &str, expected: &str) {

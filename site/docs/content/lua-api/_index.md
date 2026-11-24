@@ -6257,7 +6257,7 @@ maki.text.html_to_text({html}, {opts?})
 ```
 
 Convert an HTML string to plain text.
-Entities are decoded and whitespace is collapsed. Inline elements such as
+Entities are decoded and whitespace is collapsed outside `pre`. Inline elements such as
 `b` or `a` leave no trace, and every other element starts a new line.
 Invalid UTF-8 becomes U+FFFD.
 
