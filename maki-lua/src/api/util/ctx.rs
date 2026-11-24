@@ -583,13 +583,17 @@ impl UserData for LuaCtx {
         // The matching check before a write is not exposed: the dispatcher
         // runs it under the file lock for every tool declaring `mutable_path`,
         // and a handler-side copy would race its own sibling.
-        methods.add_method("record_read", |_, this, path: String| {
+        //
+        // Off the VM thread, because recording hashes the file and grep
+        // records every file it matched.
+        methods.add_async_method("record_read", |_, this, path: String| async move {
             let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("record_read"));
             };
-            agent
-                .file_access
-                .record_read(&FileKey::new(Path::new(&path)));
+            let file_access = Arc::clone(&agent.file_access);
+            spawn_blocking(move || file_access.record_read(&FileKey::new(Path::new(&path))))
+                .await
+                .map_err(mlua::Error::external)?;
             Ok((Some(true), None))
         });
 
