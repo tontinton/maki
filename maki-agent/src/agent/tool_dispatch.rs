@@ -37,6 +37,7 @@ use maki_storage::id::SessionRef;
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const INVALID_ARGUMENTS_PREFIX: &str = "invalid tool input: the arguments were not valid JSON";
 /// A frame never drops a tool, so a server that went away, or stopped
 /// publishing one, leaves its names listed. Saying so stops the model from
 /// retrying them.
@@ -1349,10 +1350,17 @@ pub(super) async fn process_tool_calls(
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
 ) -> Result<bool, AgentError> {
-    let tool_uses: Vec<(String, String, Value)> = response
+    let tool_uses: Vec<(String, String, Value, Option<String>)> = response
         .message
-        .tool_uses()
-        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+        .tool_uses_with_input_errors()
+        .map(|(id, name, input, input_error)| {
+            (
+                id.to_owned(),
+                name.to_owned(),
+                input.clone(),
+                input_error.map(ToOwned::to_owned),
+            )
+        })
         .collect();
 
     history.push(response.message);
@@ -1360,17 +1368,28 @@ pub(super) async fn process_tool_calls(
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
-    for (id, name, input) in tool_uses {
-        debug!(
-            tool = %name,
-            id = %id,
-            input_preview = %crate::tools::schema::preview(&input.to_string()),
-            "parsing tool call"
-        );
+    for (id, name, input, input_error) in tool_uses {
         if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+        } else if let Some(error) = input_error {
+            warn!(tool = %name, error = %error, "tool call arguments were not valid JSON");
+            let text = format!(
+                "{INVALID_ARGUMENTS_PREFIX} ({error}). Send the call again with complete JSON arguments."
+            );
+            immediate_errors.push(ToolDoneEvent::new(
+                id,
+                Arc::from(name.as_str()),
+                ToolOutput::Plain(text.into()),
+                true,
+            ));
         } else {
+            debug!(
+                tool = %name,
+                id = %id,
+                input_preview = %crate::tools::schema::preview(&input.to_string()),
+                "parsing tool call"
+            );
             runnable.push((id, name.clone(), input.clone()));
         }
         recent_calls.record(name, &input);
@@ -1598,6 +1617,7 @@ mod tests {
     const MOVED_RECEIPT: &str = "moved to the background";
     const MOVED_FINAL: &str = "the secret result";
     const MOVED_PANIC: &str = "the moved work blew up";
+    const PARSE_ERROR: &str = "expected value at line 1 column 12";
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -3589,6 +3609,93 @@ mod tests {
         .await
         .unwrap();
         std::mem::take(&mut *views.lock().unwrap())
+    }
+
+    fn malformed_response() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::invalid_tool_use(
+                    "bad",
+                    PROBE_TOOL,
+                    PARSE_ERROR.to_owned(),
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_answer_with_an_error_and_never_run_the_tool() {
+        let (tx, mut rx) = unbounded_channel::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+        let executed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&executed);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            PROBE_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), move |_input, _ctx| {
+                flag.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+
+        process_tool_calls(
+            malformed_response(),
+            &mut RecentCalls::new(),
+            &mut History::new(Vec::new()),
+            &event_tx,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
+        let done = iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|env| match env.event {
+                AgentEvent::ToolDone(done) => Some(done),
+                _ => None,
+            })
+            .expect("an error result");
+        assert!(done.is_error);
+        let text = done.output.as_text();
+        assert!(text.starts_with(INVALID_ARGUMENTS_PREFIX), "got: {text}");
+        assert!(text.contains(PARSE_ERROR), "got: {text}");
+    }
+
+    /// Malformed calls hash as `{}`, so an identical broken retry still counts
+    /// toward the doom loop.
+    #[tokio::test]
+    async fn repeated_malformed_arguments_trip_the_doom_loop() {
+        let (tx, mut rx) = unbounded_channel::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let ctx = stub_ctx(&AgentMode::Build);
+        let mut recent_calls = RecentCalls::new();
+        let mut history = History::new(Vec::new());
+
+        for attempt in 1..=DOOM_LOOP_THRESHOLD {
+            process_tool_calls(
+                malformed_response(),
+                &mut recent_calls,
+                &mut history,
+                &event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let text = iter::from_fn(|| rx.try_recv().ok())
+                .find_map(|env| match env.event {
+                    AgentEvent::ToolDone(done) => Some(done.output.as_text()),
+                    _ => None,
+                })
+                .expect("a tool result");
+            if attempt == DOOM_LOOP_THRESHOLD {
+                assert_eq!(text, DOOM_LOOP_MESSAGE);
+            } else {
+                assert!(text.starts_with(INVALID_ARGUMENTS_PREFIX), "got: {text}");
+            }
+        }
     }
 
     #[tokio::test]

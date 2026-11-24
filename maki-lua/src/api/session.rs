@@ -1941,6 +1941,7 @@ mod tests {
                     name: TOOL_NAME.into(),
                     input: json!({ "path": TOOL_PATH, "offset": null, "files": [] }),
                     thought_signature: Some(SIGNATURE.into()),
+                    input_error: None,
                 },
             ]),
             user(vec![ContentBlock::ToolResult {

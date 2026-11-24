@@ -76,6 +76,26 @@ pub fn user_agent() -> &'static str {
     )
 }
 
+/// Decode a tool call's JSON arguments. Empty arguments are valid, since a
+/// tool without parameters sends none. `Err` carries why the arguments are
+/// not JSON, which dispatch reports instead of validating an empty object.
+pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Result<Value, String> {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    match serde_json::from_str(arguments) {
+        Ok(input) => {
+            debug!(tool = %tool, json = %arguments, "tool input JSON");
+            Ok(input)
+        }
+        Err(e) => {
+            warn!(error = %e, tool = %tool, json = %arguments, "malformed tool JSON");
+            Err(e.to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub connect: Duration,
@@ -828,6 +848,19 @@ mod tests {
         body: "",
         path: None,
     }];
+
+    #[test]
+    fn parse_tool_input_treats_empty_arguments_as_no_arguments() {
+        let empty = Value::Object(Default::default());
+        assert_eq!(parse_tool_input("batch", "").unwrap(), empty);
+        assert_eq!(parse_tool_input("batch", "  ").unwrap(), empty);
+    }
+
+    #[test]
+    fn parse_tool_input_returns_the_json_error() {
+        let err = parse_tool_input("bash", "{broken").unwrap_err();
+        assert!(err.contains("line 1"), "err: {err}");
+    }
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");

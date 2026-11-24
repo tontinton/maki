@@ -12,10 +12,8 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
-use crate::providers::openai_compat::{
-    StreamedText, assistant_response, parse_tool_input, tool_parameters,
-};
-use crate::providers::{ResolvedAuth, SseBody, ok_sse, sse_error_status};
+use crate::providers::openai_compat::{StreamedText, assistant_response, tool_parameters};
+use crate::providers::{ResolvedAuth, SseBody, ok_sse, parse_tool_input, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -550,8 +548,11 @@ pub(crate) async fn parse_sse(
     let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
-        let input = parse_tool_input(&acc.name, &acc.arguments);
-        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        let block = match parse_tool_input(&acc.name, &acc.arguments) {
+            Ok(input) => ContentBlock::tool_use(acc.call_id, acc.name, input),
+            Err(error) => ContentBlock::invalid_tool_use(acc.call_id, acc.name, error),
+        };
+        content_blocks.push(block);
     }
 
     Ok(assistant_response(content_blocks, usage, stop_reason))
@@ -1046,7 +1047,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"o
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
@@ -1060,10 +1061,15 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
 
         let (resp, _) = run_sse(sse).await;
         let resp = resp.unwrap();
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "bash");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     // llama.cpp's /v1/responses endpoint omits output_index in SSE events

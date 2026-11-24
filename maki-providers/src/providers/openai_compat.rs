@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::copilot::copilot_usd;
-use super::{ResolvedAuth, SseBody};
+use super::{ResolvedAuth, SseBody, parse_tool_input};
 use crate::model::{Model, ModelFamily};
 use crate::types::rejects_sampling;
 use crate::{
@@ -686,19 +686,6 @@ impl StreamedText {
     }
 }
 
-pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Value {
-    match serde_json::from_str(arguments) {
-        Ok(input) => {
-            debug!(tool = %tool, json = %arguments, "tool input JSON");
-            input
-        }
-        Err(e) => {
-            warn!(error = %e, tool = %tool, json = %arguments, "malformed tool JSON, falling back to {{}}");
-            Value::Object(Default::default())
-        }
-    }
-}
-
 pub(crate) fn assistant_response(
     content: Vec<ContentBlock>,
     usage: TokenUsage,
@@ -851,14 +838,17 @@ pub async fn parse_sse(
     let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
-        let input = parse_tool_input(&acc.name, &acc.arguments);
         let name = if acc.name.is_empty() {
             warn!(id = %acc.id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
             "maki_unknown_tool".to_owned()
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
+        let block = match parse_tool_input(&name, &acc.arguments) {
+            Ok(input) => ContentBlock::tool_use(acc.id, name, input),
+            Err(error) => ContentBlock::invalid_tool_use(acc.id, name, error),
+        };
+        content_blocks.push(block);
     }
 
     Ok(assistant_response(content_blocks, usage, stop_reason))
@@ -1386,7 +1376,7 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\
 \n\
@@ -1401,10 +1391,15 @@ data: [DONE]\n\n";
             .await
             .unwrap();
 
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "bash");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     #[tokio::test]
