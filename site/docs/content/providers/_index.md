@@ -159,29 +159,29 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
-| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-| Weak | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
+| Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 328K ctx / 128K out |
+| Weak | gpt-6-luna | $0.10 / $0.50 | 400K ctx / 128K out |
 | Weak | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
-| Weak | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 64K out |
-| Weak | mai-code-1.1-flash | $0.20 / $1.20 | 200K ctx / 100K out |
-| Weak | mai-code-2-flash | $0.05 / $0.25 | 200K ctx / 100K out |
-| Medium | gemini-3.8-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| Weak | claude-haiku-5.5 | $0.10 / $0.50 | 228K ctx / 128K out |
+| Weak | mai-code-1.1-flash | $0.20 / $1.20 | 256K ctx / 128K out |
+| Weak | mai-code-2-flash | $0.10 / $0.50 | 1050K ctx / 128K out |
+| Medium | gemini-3.8-flash | $0.75 / $3.75 | 265K ctx / 65K out |
 | Medium | claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
-| Medium | **claude-sonnet-5.5** (default) | $2.00 / $10.00 | 200K ctx / 100K out |
+| Medium | claude-sonnet-5 | $2.00 / $10.00 | 264K ctx / 64K out |
+| Medium | **claude-sonnet-5.5** (default) | $2.00 / $10.00 | 328K ctx / 128K out |
 | Medium | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
 | Medium | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Strong | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
-| Strong | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |
-| Strong | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
-| Strong | gpt-6.1-sol | $2.00 / $10.00 | 200K ctx / 100K out |
-| Strong | gpt-6-astra | $10.00 / $50.00 | 200K ctx / 100K out |
-| Strong | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
-| Strong | mai-code-2 | $0.50 / $2.50 | 200K ctx / 100K out |
-| Strong | **claude-opus-5.5** (default) | $4.00 / $20.00 | 200K ctx / 64K out |
-| Strong | claude-opus-5, claude-opus-4.8 | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+| Strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Strong | gpt-5.6-sol | $4.00 / $20.00 | 400K ctx / 128K out |
+| Strong | gpt-6-sol | $2.00 / $10.00 | 400K ctx / 128K out |
+| Strong | gpt-6.1-sol | $2.00 / $10.00 | 400K ctx / 128K out |
+| Strong | gpt-6-astra | $10.00 / $50.00 | 400K ctx / 128K out |
+| Strong | kimi-k3 | $3.00 / $15.00 | 1048K ctx / 131K out |
+| Strong | mai-code-2 | $1.00 / $5.00 | 1050K ctx / 128K out |
+| Strong | **claude-opus-5.5** (default) | $4.00 / $20.00 | 328K ctx / 128K out |
+| Strong | claude-opus-5, claude-opus-4.8 | $5.00 / $25.00 | 264K ctx / 64K out |
+| Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 264K ctx / 64K out |
 
 Defaults: gpt-5.6-luna (weak), claude-sonnet-5.5 (medium), claude-opus-5.5 (strong)
 

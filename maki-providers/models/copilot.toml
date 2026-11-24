@@ -13,8 +13,8 @@ tier = "weak"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 0.2, output = 1.25, cache_write = 0.0, cache_read = 0.02 }
 
 [[model]]
@@ -23,8 +23,8 @@ tier = "weak"
 family = "generic"
 vision = true
 default = true
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 328000
 pricing = { input = 0.2, output = 1.2, cache_write = 0.25, cache_read = 0.02 }
 
 [[model]]
@@ -33,8 +33,8 @@ tier = "weak"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 0.1, output = 0.5, cache_write = 0.125, cache_read = 0.01 }
 
 [[model]]
@@ -53,8 +53,8 @@ tier = "weak"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 64000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 228000
 pricing = { input = 0.1, output = 0.5, cache_write = 0.125, cache_read = 0.01 }
 
 [[model]]
@@ -63,9 +63,9 @@ tier = "weak"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
-pricing = { input = 0.2, output = 1.2, cache_write = 0.0, cache_read = 0.02 }
+max_output_tokens = 128000
+context_window = 256000
+pricing = { input = 0.2, output = 1.2, cache_write = 0.25, cache_read = 0.02 }
 
 [[model]]
 prefixes = ["mai-code-2-flash"]
@@ -73,9 +73,9 @@ tier = "weak"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
-pricing = { input = 0.05, output = 0.25, cache_write = 0.0, cache_read = 0.005 }
+max_output_tokens = 128000
+context_window = 1050000
+pricing = { input = 0.1, output = 0.5, cache_write = 0.0, cache_read = 0.01 }
 
 [[model]]
 prefixes = ["gemini-3.8-flash"]
@@ -84,7 +84,7 @@ family = "generic"
 vision = true
 default = false
 max_output_tokens = 65536
-context_window = 200000
+context_window = 265536
 pricing = { input = 0.75, output = 3.75, cache_write = 0.0, cache_read = 0.075 }
 
 [[model]]
@@ -103,8 +103,8 @@ tier = "medium"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 64000
+context_window = 264000
 pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
 
 [[model]]
@@ -113,8 +113,8 @@ tier = "medium"
 family = "generic"
 vision = true
 default = true
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 328000
 pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.1 }
 
 [[model]]
@@ -143,8 +143,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 1.75, output = 14.0, cache_write = 0.0, cache_read = 0.175 }
 
 [[model]]
@@ -153,8 +153,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 4.0, output = 20.0, cache_write = 5.0, cache_read = 0.4 }
 
 [[model]]
@@ -163,8 +163,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
 
 [[model]]
@@ -173,8 +173,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.1 }
 
 [[model]]
@@ -183,8 +183,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 400000
 pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 1.0 }
 
 [[model]]
@@ -193,8 +193,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 131072
+context_window = 1048576
 pricing = { input = 3.0, output = 15.0, cache_write = 0.0, cache_read = 0.3 }
 
 [[model]]
@@ -203,9 +203,9 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
-pricing = { input = 0.5, output = 2.5, cache_write = 0.0, cache_read = 0.025 }
+max_output_tokens = 128000
+context_window = 1050000
+pricing = { input = 1.0, output = 5.0, cache_write = 0.0, cache_read = 0.05 }
 
 [[model]]
 prefixes = ["claude-opus-5.5"]
@@ -213,8 +213,8 @@ tier = "strong"
 family = "generic"
 vision = true
 default = true
-max_output_tokens = 64000
-context_window = 200000
+max_output_tokens = 128000
+context_window = 328000
 pricing = { input = 4.0, output = 20.0, cache_write = 5.0, cache_read = 0.2 }
 
 [[model]]
@@ -224,7 +224,7 @@ family = "generic"
 vision = true
 default = false
 max_output_tokens = 64000
-context_window = 200000
+context_window = 264000
 pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
 
 [[model]]
@@ -233,6 +233,6 @@ tier = "strong"
 family = "generic"
 vision = true
 default = false
-max_output_tokens = 100000
-context_window = 200000
+max_output_tokens = 64000
+context_window = 264000
 pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 1.0 }
