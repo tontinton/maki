@@ -492,7 +492,7 @@ local opts = maki.api.register_options(output_limits.extend({
   },
   file_tool_note = {
     default = false,
-    desc = "Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does. The command still runs.",
+    desc = "Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does. The command still runs. The note also shows under the command's output.",
   },
   background_log_bytes = {
     default = LOG_MAX_BYTES,
@@ -558,9 +558,9 @@ maki.api.register_tool({
   restore = function(input, output, is_error, ctx)
     local command = parse_cd_hint(input)
     local buf, view = create_bash_view(command, ctx)
-    -- The note is for the model; the live view never showed it.
+    local file_note
     if output:sub(1, #FILE_TOOL_NOTE_HEAD) == FILE_TOOL_NOTE_HEAD then
-      output = output:match("^[^\n]*\n(.*)$") or ""
+      file_note, output = output:match("^([^\n]*)\n?(.*)$")
     end
     local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
     local text, log_file = output:match(FULL_OUTPUT_PATTERN)
@@ -586,6 +586,9 @@ maki.api.register_tool({
     if log_file then
       view:append({ { FULL_OUTPUT_LINE:format(tostring(log_file)), "dim" } })
     end
+    if file_note then
+      view:append({ { file_note, "dim" } })
+    end
     view:finish()
     return buf
   end,
@@ -603,7 +606,8 @@ maki.api.register_tool({
     ctx:set_deadline(timeout_secs, opts.background_on_timeout and EXPIRE_BACKGROUND or nil)
 
     -- Code that calls bash parses the reply, so a note would corrupt it.
-    local notes = { opts.file_tool_note and ctx:output_mode() ~= "full" and file_tool_note(command, ctx) or nil }
+    local file_note = opts.file_tool_note and ctx:output_mode() ~= "full" and file_tool_note(command, ctx) or nil
+    local notes = { file_note }
 
     local rewritten = rtk_rewrite(command, ctx)
     if rewritten then
@@ -737,6 +741,10 @@ maki.api.register_tool({
         local log_line = FULL_OUTPUT_LINE:format(log.path)
         view:append({ { log_line, "dim" } })
         llm_output = llm_output .. "\n" .. log_line
+      end
+      -- The model acts on the note, so the user gets to see what it was told.
+      if file_note then
+        view:append({ { file_note, "dim" } })
       end
       return table.concat(notes, "\n") .. (#notes > 0 and "\n" or "") .. llm_output
     end

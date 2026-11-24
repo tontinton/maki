@@ -244,7 +244,7 @@ fn bash_restore_titles_a_call_and_shows_its_command(
 
 #[test_case("hi", "hi" ; "with_output")]
 #[test_case("Exit code: 0", "No output" ; "without_output")]
-fn bash_restore_leaves_out_the_file_tool_note(reply: &str, shown: &str) {
+fn bash_restore_shows_the_file_tool_note_below_the_output(reply: &str, shown: &str) {
     let host = load_host();
     let r = restore(
         &host,
@@ -254,8 +254,9 @@ fn bash_restore_leaves_out_the_file_tool_note(reply: &str, shown: &str) {
         None,
         Vec::new(),
     );
-    assert!(!r.body.contains(FILE_TOOL_NOTE), "{}", r.body);
-    assert!(r.body.contains(shown), "{}", r.body);
+    let (output, note) = r.body.split_once(FILE_TOOL_NOTE).expect(&r.body);
+    assert!(output.contains(shown), "{}", r.body);
+    assert_eq!(note.trim(), "", "{}", r.body);
 }
 
 /// The session's own directory tells the reader nothing.
