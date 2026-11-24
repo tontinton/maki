@@ -187,6 +187,7 @@ maki.api.register_tool({
       command = {
         type = "string",
         enum = { "list", "read", "write", "delete" },
+        hint = "memory has no search or append. Use list or read with tags to find an entry, then write it back with the new content.",
         description = "- `list`: tag-grouped index, no bodies; optional `tags`.\n"
           .. "- `read`: one body by `path`, or collated bodies by `tags`.\n"
           .. "- `write`: create/overwrite `path` with `content`; optional `tags`.\n"
