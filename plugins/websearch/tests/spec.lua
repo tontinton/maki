@@ -128,7 +128,7 @@ case("providers_carry_what_init_consumes", function()
     assert(type(p.label) == "string", name .. " is missing label")
     assert(type(p.env) == "string", name .. " is missing env")
     if p.transport ~= nil then
-      eq(p.transport, "get", name .. " has an unknown transport")
+      eq(p.transport, name, name .. " has an unknown transport")
     else
       for _, field in ipairs({ "endpoint", "auth_header", "tool" }) do
         assert(type(p[field]) == "string", name .. " is missing " .. field)
@@ -144,43 +144,83 @@ case("providers_count_argument_matches_the_backend", function()
   eq(providers.exa.arguments(QUERY, 5).numResults, 5)
   eq(providers.youcom.arguments(QUERY, 5).count, 5)
   eq(providers.youcom.arguments(QUERY, 5).numResults, nil)
-  eq(providers.kagi.arguments(QUERY, 5).limit, 5)
-  eq(providers.kagi.arguments(QUERY, 5).numResults, nil)
+end)
+
+-- ── kagi (POST /api/v1/search backend) ──
+
+local kagi = require("kagi")
+local KAGI_TRACE = "a91c48be9851b1c8"
+local KAGI_TOKEN_MSG = "Failed to verify token."
+local KAGI_UNAUTHORIZED = '{"meta":{"trace":"'
+  .. KAGI_TRACE
+  .. '"},"data":null,"errors":[{"code":"general.invalid_token","message":"'
+  .. KAGI_TOKEN_MSG
+  .. '"}]}'
+
+case("kagi_request_body_caps_with_limit", function()
+  local body = maki.json.decode(kagi.request_body(QUERY, 5))
+  eq(body.query, QUERY)
+  eq(body.limit, 5)
 end)
 
 -- Video ahead of search, so only the category order can put search first.
-local KAGI_JSON = '{"video":[{"title":"Tokio vs Smol","url":"https://youtu.be/x","published":"2025-10-15",'
-  .. '"snippet":"Smol & async"}],"search":[{"title":"smol","url":"https://docs.rs/smol",'
-  .. '"snippet":"A small and fast async runtime."},{"title":"smol-rs","url":"https://github.com/smol-rs/smol",'
-  .. '"snippet":"Contribute to smol-rs/smol."}]}'
-
-case("kagi_format_lists_every_category_in_kagimcp_order", function()
+case("kagi_format_results_lists_known_categories_in_order", function()
+  local body = '{"meta":{"ms":3},"data":{'
+    .. '"video":[{"title":"Tokio vs Smol","url":"https://youtu.be/x","time":"2025-10-15T08:00:00Z"}],'
+    .. '"related_search":[{"title":"smol runtime","url":"/search?q=smol+runtime"}],'
+    .. '"search":[{"title":"<strong>smol</strong>","url":"https://docs.rs/smol",'
+    .. '"snippet":"A small &amp; fast <strong>async</strong> runtime.","props":{"language":"en"}},'
+    .. '{"title":"smol-rs","url":"https://github.com/smol-rs/smol"}]}}'
   eq(
-    providers.kagi.format(KAGI_JSON),
+    kagi.format_results(body),
     table.concat({
       "1. smol",
       "   https://docs.rs/smol",
-      "   A small and fast async runtime.",
+      "   A small & fast async runtime.",
       "2. smol-rs",
       "   https://github.com/smol-rs/smol",
-      "   Contribute to smol-rs/smol.",
+      "   ",
       "3. Tokio vs Smol (2025-10-15)",
       "   https://youtu.be/x",
-      "   Smol & async",
+      "   ",
     }, "\n")
   )
 end)
 
-case("kagi_format_empty_object_is_no_results", function()
-  eq(providers.kagi.format("{}"), NO_RESULTS_MSG)
+case("kagi_format_results_decodes_entities_once", function()
+  local body = '{"data":{"search":[{"url":"https://a.example","title":"t","snippet":'
+    .. '"it&#39;s &#x41;&quot;b&quot; <span class=\\"ln-search-highlight\\">x</span> &amp;lt; &bogus; &#99999999;"}]}}'
+  local text = kagi.format_results(body)
+  assert(text:find('it\'s A"b" x &lt; &bogus; &#99999999;', 1, true), text)
 end)
 
-case("kagi_format_passes_through_what_it_cannot_read", function()
-  local markdown = "## Search Results\n\n### [smol](https://docs.rs/smol)"
-  eq(providers.kagi.format(markdown), markdown)
-  eq(providers.kagi.format(NO_RESULTS_MSG), NO_RESULTS_MSG)
-  local renamed = '{"web":[{"title":"smol","url":"https://docs.rs/smol"}]}'
-  eq(providers.kagi.format(renamed), renamed)
+case("kagi_format_results_without_known_categories_is_no_results", function()
+  eq(kagi.format_results('{"data":{}}'), NO_RESULTS_MSG)
+  eq(kagi.format_results('{"data":{"related_search":[{"title":"x","url":"/search?q=x"}]}}'), NO_RESULTS_MSG)
+end)
+
+case("kagi_format_results_bad_payload_is_error", function()
+  local text, err = kagi.format_results(KAGI_UNAUTHORIZED)
+  eq(text, nil, "an error envelope must not read as results")
+  assert(err:find(KAGI_TOKEN_MSG, 1, true), err)
+  local html, html_err = kagi.format_results("<html>gateway</html>")
+  eq(html, nil)
+  assert(html_err:find("gateway", 1, true), html_err)
+end)
+
+case("kagi_error_text_joins_messages_and_names_the_trace", function()
+  eq(kagi.error_text(KAGI_UNAUTHORIZED), KAGI_TOKEN_MSG .. " (trace id: " .. KAGI_TRACE .. ")")
+  -- The spec calls the array `error`, and a detail may carry only a code.
+  eq(
+    kagi.error_text('{"error":[{"code":"2","message":"Unauthorized"},{"code":"search.bad"}]}'),
+    "Unauthorized; search.bad"
+  )
+end)
+
+case("kagi_error_text_is_nil_for_other_bodies", function()
+  eq(kagi.error_text(""), nil)
+  eq(kagi.error_text("<html>gateway</html>"), nil)
+  eq(kagi.error_text('{"errors":[]}'), nil)
 end)
 
 -- ── searxng (plain GET /search?format=json backend) ──

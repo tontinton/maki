@@ -4291,8 +4291,8 @@ fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str)
     assert!(description.contains(expected), "got: {description}");
 }
 
-/// Kagi answers a keyless request with a bodiless 401, which would leave the
-/// model guessing, so the missing key is named before anything goes out.
+/// Kagi has no keyless tier, so the missing key is named before anything goes
+/// out.
 #[test]
 fn websearch_kagi_without_key_names_the_env_var() {
     unsafe { std::env::remove_var(KAGI_KEY_ENV) };
