@@ -972,6 +972,7 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
         commands_watch,
         mcp,
         pending,
+        _hosted: hosted,
         ..
     } = state;
     info!(session_id = %handle.session_id, %reason, "closing ACP session");
@@ -996,6 +997,8 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
         if let Some(hook) = on_session_end {
             hook(id, reason).await;
         }
+        // Held through the hook, so a `SessionEnd` handler reads the full tally.
+        drop(hosted);
         // Only after the hook, which stops the session's background work, so
         // the track this drops saves the full bill.
         handle.task.abort();
@@ -3045,6 +3048,34 @@ mod tests {
 
         close_all_sessions(&mut srv, SessionEndReason::Shutdown).await;
         assert!(read(Some(&first_id)).is_err());
+    }
+
+    /// A `SessionEnd` handler reads the session's tally, so the registration
+    /// outlives the hook and only then goes.
+    #[tokio::test]
+    async fn a_session_end_hook_still_reads_the_closing_session() {
+        let (mut srv, _out_rx) = empty_server();
+        let read = srv.stack.plugins.provider();
+        let mut fixture = fixture_session();
+        fixture.state._hosted = fixture_hosted(
+            &srv.stack.plugins,
+            &fixture.state.handle.session_id,
+            &fixture.state.current_mode,
+        );
+        let id = fixture.state.handle.session_id.to_string();
+        let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hook_read, hook_id) = (srv.stack.plugins.provider(), id.clone());
+        srv.stack.on_session_end = Some(Arc::new(move |_, _| {
+            let _ = read_tx.send(hook_read(Some(&hook_id)).map(|read| read["cost"].clone()));
+            Box::pin(future::ready(()))
+        }));
+        let sid = install(&mut srv, fixture.state);
+
+        close_session(&mut srv, &sid, SessionEndReason::Delete).await;
+        finish_teardowns(&mut srv).await;
+
+        assert!(read_rx.try_recv().unwrap().is_ok());
+        assert!(read(Some(&id)).is_err());
     }
 
     /// The snapshot plugins read and the mode the next prompt runs under are
