@@ -6253,6 +6253,7 @@ the built-in pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local plain = maki.text.html_to_text(html)
 local text = maki.text.to_utf8(bytes)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
@@ -6284,6 +6285,34 @@ if err then return end
 print(md) -- "# Hello\n\nworld"
 
 local article = maki.text.html_to_markdown(page, { skip_tags = { "script", "style", "nav" } })
+```
+
+---
+
+### `maki.text.html_to_text()` {#maki-text-html_to_text}
+
+```lua
+maki.text.html_to_text({html}, {opts?})
+```
+
+Convert an HTML string to plain text.
+Entities are decoded and whitespace is collapsed. Inline elements such as
+`b` or `a` leave no trace, and every other element starts a new line.
+Invalid UTF-8 becomes U+FFFD.
+
+**Parameters:**
+
+- `{html}` (`string`) HTML source text.
+- `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+
+**Returns:** (`string?`, `string?`) Plain text on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local text, err = maki.text.html_to_text("<h1>Fish &amp; chips</h1><p>to <b>go</b></p>")
+if err then return end
+print(text) -- "Fish & chips\nto go"
 ```
 
 ---

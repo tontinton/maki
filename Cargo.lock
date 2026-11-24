@@ -3818,6 +3818,7 @@ dependencies = [
  "maki-pack",
  "maki-providers",
  "maki-storage",
+ "markup5ever_rcdom",
  "mlua",
  "nucleo-matcher",
  "open",
