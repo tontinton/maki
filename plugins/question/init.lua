@@ -43,6 +43,7 @@ maki.api.register_tool({
       questions = {
         type = "array",
         description = "List of questions to ask the user",
+        accept_single = true,
         items = {
           type = "object",
           required = { "question" },
