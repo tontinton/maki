@@ -8,7 +8,7 @@ end
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
-  markdown = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+  markdown = "text/markdown,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.5",
 }
 
 local LT, GT, SLASH, SPACE, TAB, CR, LF = 60, 62, 47, 32, 9, 13, 10
