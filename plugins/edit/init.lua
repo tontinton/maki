@@ -4,15 +4,15 @@ local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
+local snippet = require("edit_helpers").snippet
 
-local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 5
 
 local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
 
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. `expect` is the current text of line `start`: line numbers from before your last edit of the file are stale, and a mismatch refuses the edit. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
@@ -361,12 +361,7 @@ register_tool_if(opts.multiedit, {
         local replaced, replace_err =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
         if replace_err then
-          local snippet = edit.old_string:match("[^\n]*")
-          local cut = utf8.offset(snippet, SNIPPET_MAX_CHARS + 1)
-          if cut then
-            snippet = snippet:sub(1, cut - 1) .. "…"
-          end
-          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet, replace_err)
+          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet(edit.old_string), replace_err)
         end
         content = replaced
       end
@@ -410,6 +405,11 @@ register_tool_if(opts.edit_lines, {
         description = "Last line, inclusive",
         required = true,
       },
+      expect = {
+        type = "string",
+        description = "Current text of line `start`, indentation optional",
+        required = true,
+      },
       new_string = {
         type = "string",
         description = "Replacement text",
@@ -425,7 +425,7 @@ register_tool_if(opts.edit_lines, {
 
   handler = function(input)
     local result, err = apply_edit(input.path, function(content)
-      return replace_lines(content, input.start, input["end"], input.new_string)
+      return replace_lines(content, input.start, input["end"], input.new_string, input.expect)
     end)
     if not result then
       return { llm_output = err, is_error = true }

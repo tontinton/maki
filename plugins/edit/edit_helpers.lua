@@ -2,6 +2,7 @@ local M = {}
 
 local LF = "\n"
 local CRLF = "\r\n"
+local SNIPPET_MAX_CHARS = 32
 
 -- A tie stays LF, so the answer never depends on which ending the file happens
 -- to show first.
@@ -35,7 +36,49 @@ local function split_lines(s)
   return maki.split(s, "\n")
 end
 
-function M.replace_lines(content, start_line, end_line, new_string)
+function M.snippet(text: string): string
+  local line = text:match("[^\n]*") or ""
+  local cut = utf8.offset(line, SNIPPET_MAX_CHARS + 1)
+  if cut then
+    return line:sub(1, cut - 1) .. "…"
+  end
+  return line
+end
+
+local function trim(s)
+  return (s:match("^%s*(.-)%s*$"))
+end
+
+local function nearest_line(lines, wanted, from)
+  for distance = 1, #lines do
+    for _, i in ipairs({ from - distance, from + distance }) do
+      if lines[i] and trim(lines[i]) == wanted then
+        return i
+      end
+    end
+  end
+  return nil
+end
+
+-- The model's line numbers go stale after its own earlier edit, and nothing
+-- else can tell: the file is exactly as maki left it.
+local function stale_line_error(lines, start_line, expected)
+  local wanted = trim(expected)
+  if trim(lines[start_line]) == wanted then
+    return nil
+  end
+  local found = wanted ~= "" and nearest_line(lines, wanted, start_line)
+  local hint = found and string.format("that text is at line %d, shift the range", found) or "read the file again"
+  return string.format(
+    "line %d is %q, not %q: line numbers are stale, %s",
+    start_line,
+    M.snippet(lines[start_line]),
+    M.snippet(expected),
+    hint
+  )
+end
+
+function M.replace_lines(content, start_line, end_line, new_string, expected_first_line)
   local trailing_nl = content:sub(-1) == "\n"
   local lines = split_lines(content)
   local inserting = end_line == nil
@@ -50,6 +93,10 @@ function M.replace_lines(content, start_line, end_line, new_string)
     end
     if end_line < start_line or end_line > #lines then
       return nil, string.format("end line %d out of range (%d-%d)", end_line, start_line, #lines)
+    end
+    local stale = expected_first_line and stale_line_error(lines, start_line, expected_first_line)
+    if stale then
+      return nil, stale
     end
   end
 

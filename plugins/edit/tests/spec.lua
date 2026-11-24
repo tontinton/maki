@@ -360,6 +360,38 @@ case("replace_lines_range_replace_and_delete", function()
   has(e3, "out of range")
 end)
 
+local STALE_MSG = "line numbers are stale"
+
+case("replace_lines_accepts_the_expected_first_line", function()
+  local content = "aaa\n  bbb\n\nddd\n"
+  eq(replace_lines(content, 2, 2, "XXX", "bbb"), "aaa\nXXX\n\nddd\n")
+  eq(replace_lines(content, 2, 2, "XXX", "\tbbb  "), "aaa\nXXX\n\nddd\n")
+  eq(replace_lines(content, 3, 3, "XXX", ""), "aaa\n  bbb\nXXX\nddd\n")
+end)
+
+case("replace_lines_refuses_stale_line_numbers", function()
+  local content = "aaa\nbbb\nccc\nbbb\nddd\n"
+
+  local r1, shifted_down = replace_lines(content, 1, 1, "XXX", "bbb")
+  eq(r1, nil)
+  has(shifted_down, STALE_MSG)
+  has(shifted_down, 'line 1 is "aaa", not "bbb"')
+  has(shifted_down, "at line 2")
+
+  local _, nearest_wins = replace_lines(content, 5, 5, "XXX", "bbb")
+  has(nearest_wins, "at line 4")
+
+  local _, gone = replace_lines(content, 1, 1, "XXX", "zzz")
+  has(gone, STALE_MSG)
+  has(gone, "read the file again")
+
+  local _, blank = replace_lines("aaa\n\n", 1, 1, "XXX", "")
+  has(blank, "read the file again")
+
+  local _, range_first = replace_lines(content, 9, 9, "XXX", "bbb")
+  has(range_first, "out of range")
+end)
+
 case("replace_lines_insert_mode", function()
   local content = "aaa\nbbb\nccc\n"
 
