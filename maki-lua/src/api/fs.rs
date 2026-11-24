@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
-use maki_agent::tools::grep::{GrepParams, GrepResults, grep_search};
+use maki_agent::tools::grep::{GrepParams, GrepResults, grep_count, grep_search};
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
@@ -1152,6 +1152,42 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     Ok((Some(tbl), None))
 }
 
+/// Count the lines matching a regex {pattern} in each file, without
+/// returning the lines.
+///
+/// @param pattern string Regular expression to search for.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+/// @return (table?, string?) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
+/// @example
+/// local counts, err = maki.fs.grep_count("TODO", { path = "src" })
+/// if err then return end
+/// for _, file in ipairs(counts) do print(file.path .. ": " .. file.matches) end
+#[lua_fn(guard = FsRead, name = "grep_count")]
+async fn grep_counts(
+    lua: Lua,
+    pattern: String,
+    opts: Option<Table>,
+) -> LuaResult<(Option<Table>, Option<String>)> {
+    let mut params = GrepParams::new(pattern);
+    params.path = opts.as_ref().opt("path")?;
+    params.include = opts.as_ref().opt("include")?;
+    let counts = match spawn_blocking(move || grep_count(&params))
+        .await
+        .map_err(mlua::Error::external)?
+    {
+        Ok(counts) => counts,
+        Err(e) => return Ok((None, Some(e))),
+    };
+    let arr = lua.create_table()?;
+    for (i, file) in counts.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("path", file.path.to_string_lossy().as_ref())?;
+        entry.set("matches", file.matches)?;
+        arr.set(i + 1, entry)?;
+    }
+    Ok((Some(arr), None))
+}
+
 /// Search file contents for a regex {pattern}. Returns structured matches
 /// grouped by file, similar to ripgrep output.
 ///
@@ -1536,7 +1572,7 @@ lua_table! {
         read(perms), read_bytes(perms), read_lines(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms),
-        rm(perms), mkdir(perms), glob(perms), grep(perms), fuzzy_files(perms, plugin),
+        rm(perms), mkdir(perms), glob(perms), grep(perms), grep_counts(perms), fuzzy_files(perms, plugin),
     ]
 }
 

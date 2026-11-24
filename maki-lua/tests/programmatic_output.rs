@@ -41,6 +41,8 @@ const TOOLS: &[&str] = &[
 const NO_OUTPUT: &str = "(no output)";
 const GREP_NOTE_TWO_LEFT: &str = "[limit of 1 reached, 2 more match groups from 2 files not shown]";
 const GREP_NOTE_ONE_LEFT: &str = "[limit of 1 reached, 1 more match group from 1 file not shown]";
+const GREP_COUNT_TOTAL: &str = "2 matching lines in 1 file";
+const GREP_COUNT_FILE: &str = "a.rs: 2";
 const GREP_FILES: &[&str] = &["a.rs", "b.toml", "c.md"];
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
@@ -264,6 +266,20 @@ fn grep_tells_the_model_what_the_limit_cut(files: usize, limit: i64, expected: &
         "include": "*.{rs,toml,md}", "limit": limit });
     let model_output = run(&ctx, "grep", input).unwrap();
     assert!(model_output.ends_with(expected), "{model_output}");
+}
+
+#[test]
+fn grep_count_returns_counts_without_the_matching_lines() {
+    let (_registry, _host, ctx) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.rs"), "needle one\nhay\nneedle two\n").unwrap();
+    fs::write(dir.path().join("b.rs"), "hay\n").unwrap();
+    let input = json!({ "pattern": "needle", "path": dir.path(), "count": true });
+    let model_output = run(&ctx, "grep", input).unwrap();
+    let (total, files) = model_output.split_once('\n').unwrap();
+    assert_eq!(total, GREP_COUNT_TOTAL);
+    assert!(files.ends_with(GREP_COUNT_FILE), "{model_output}");
+    assert!(!model_output.contains("needle"), "{model_output}");
 }
 
 #[test]

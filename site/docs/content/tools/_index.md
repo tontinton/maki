@@ -134,6 +134,7 @@ Search file contents using regex.
 |-----------|------|----------|---------|-------------|
 | `context_after` | integer | no |  | Context lines after match |
 | `context_before` | integer | no |  | Context lines before match |
+| `count` | boolean | no |  | Return how many lines match in each file instead of the lines |
 | `include` | string | no |  | File glob filter (e.g. *.c) |
 | `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |

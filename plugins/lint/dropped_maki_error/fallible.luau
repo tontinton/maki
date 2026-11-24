@@ -22,6 +22,7 @@ return {
   ["maki.fs.dir"] = true,
   ["maki.fs.fuzzy_files"] = true,
   ["maki.fs.glob"] = true,
+  ["maki.fs.grep_count"] = true,
   ["maki.fs.metadata"] = true,
   ["maki.fs.mkdir"] = true,
   ["maki.fs.read"] = true,
