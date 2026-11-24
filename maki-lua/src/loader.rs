@@ -41,7 +41,7 @@ use crate::runtime::{
     MoveRequest, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
-use maki_storage::id::MakiId;
+use maki_storage::id::SessionRef;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The runtime a host built outside `main`'s gets, which is every test.
@@ -1303,9 +1303,9 @@ impl EventHandle {
     ///
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
-    pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
+    pub fn end_session(&self, session: impl Into<SessionRef>, reason: SessionEndReason) {
         let _ = self.tx.send(Request::EndSession(EndSession {
-            session,
+            session: session.into(),
             reason,
             wait: None,
         }));
@@ -1319,14 +1319,16 @@ impl EventHandle {
     /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
     pub async fn end_sessions(
         &self,
-        sessions: impl IntoIterator<Item = MakiId>,
+        sessions: impl IntoIterator<Item = impl Into<SessionRef>>,
         reason: SessionEndReason,
     ) {
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let waits: Vec<_> = sessions
             .into_iter()
             .filter_map(|session| {
-                Some((session, self.send_end_session(session, reason, deadline)?))
+                let session = session.into();
+                let reply = self.send_end_session(session.clone(), reason, deadline)?;
+                Some((session, reply))
             })
             .collect();
         for (session, reply_rx) in waits {
@@ -1341,7 +1343,7 @@ impl EventHandle {
 
     fn send_end_session(
         &self,
-        session: MakiId,
+        session: SessionRef,
         reason: SessionEndReason,
         deadline: Instant,
     ) -> Option<oneshot::Receiver<()>> {

@@ -992,10 +992,11 @@ async fn end_session(srv: &mut Server, state: SessionState, reason: SessionEndRe
         srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
     }
     let id = handle.session_id.id();
+    let session = handle.session_id.clone();
     let on_session_end = srv.stack.on_session_end.clone();
     let teardown = tokio::spawn(async move {
         if let Some(hook) = on_session_end {
-            hook(id, reason).await;
+            hook(session, reason).await;
         }
         // Held through the hook, so a `SessionEnd` handler reads the full tally.
         drop(hosted);
@@ -1960,7 +1961,7 @@ mod tests {
     fn record_session_ends(srv: &mut Server) -> UnboundedReceiver<(MakiId, SessionEndReason)> {
         let (ended_tx, ended_rx) = unbounded_channel();
         let hook: SessionEndHook = Arc::new(move |id, reason| {
-            let _ = ended_tx.send((id, reason));
+            let _ = ended_tx.send((id.id(), reason));
             Box::pin(future::ready(()))
         });
         srv.stack.on_session_end = Some(hook);

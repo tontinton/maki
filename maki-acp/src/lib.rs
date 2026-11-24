@@ -22,10 +22,10 @@ use maki_lua::headless::HeadlessHost;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_storage::id::MakiId;
+use maki_storage::id::SessionRef;
 
 pub type SessionEndHook =
-    Arc<dyn Fn(MakiId, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(SessionRef, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// What the launch folder's plugin host, `init.lua` and model give every
 /// session this process runs.

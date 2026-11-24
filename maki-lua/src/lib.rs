@@ -217,7 +217,7 @@ pub mod test_support {
         pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
             while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::EndSession(end) = req {
-                    return Some((end.session, end.reason));
+                    return Some((end.session.id(), end.reason));
                 }
             }
             None

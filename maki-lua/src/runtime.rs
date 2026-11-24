@@ -652,7 +652,8 @@ enum HostHook {
 
 /// Reap session-owned jobs and fire `SessionEnd`.
 pub struct EndSession {
-    pub session: MakiId,
+    /// As the host named it, so a legacy hex id reads back the way it came in.
+    pub session: SessionRef,
     pub reason: SessionEndReason,
     /// Set on the paths that wait for the dispatch: the instant the caller
     /// stops waiting, and where to answer it. Absent on the queued paths.
@@ -2596,14 +2597,15 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
                 None,
                 data,
                 None,
-                Some(SessionRef::from(end.session)),
+                Some(end.session.clone()),
             )
             .await;
-            with_jobs(lua, |store| store.kill_session(lua, end.session));
-            BackgroundTasks::of(lua).end_session(end.session);
+            let session = end.session.id();
+            with_jobs(lua, |store| store.kill_session(lua, session));
+            BackgroundTasks::of(lua).end_session(session);
             // Nothing can pick from this session's plan form again.
-            clear_session_rows(lua, &end.session.to_string());
-            clear_session_hints(lua, end.session);
+            clear_session_rows(lua, &session.to_string());
+            clear_session_hints(lua, session);
             if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }

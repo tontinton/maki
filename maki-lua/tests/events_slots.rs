@@ -642,6 +642,37 @@ end }})
     );
 }
 
+/// A resumed legacy session is spelled in hex everywhere else, so a
+/// `SessionEnd` handler must see `current()` and `session_id` spelled alike.
+#[test]
+fn session_end_names_a_legacy_session_the_way_it_came_in() {
+    let (reg, host) = host();
+    let listener = format!(
+        r#"
+local seen
+maki.api.create_autocmd("SessionEnd", {{ callback = function(ev)
+    seen = ev.data.session_id .. "|" .. maki.session.current()
+end }})
+{}
+"#,
+        probe_tool("probe_end_spelling", "return seen")
+    );
+    load(&host, "listener", &listener);
+    let id = MakiId::generate();
+    let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let session: SessionRef = hex.parse().unwrap();
+
+    runtime().block_on(
+        host.event_handle()
+            .end_sessions([session], SessionEndReason::Completed),
+    );
+
+    assert_eq!(
+        exec_tool(&reg, "probe_end_spelling"),
+        format!("{hex}|{hex}")
+    );
+}
+
 /// A handler has to tell the teardown paths apart, so every reason arrives
 /// naming the session it left behind. Only the paths someone waits on carry a
 /// deadline, and by the time `end_sessions` is back the handler has

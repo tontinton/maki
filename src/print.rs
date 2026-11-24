@@ -495,7 +495,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     }
     let track = headless::await_shutdown(task).await;
     lua_handle
-        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .end_sessions([session_id.clone()], SessionEndReason::Completed)
         .await;
     if let Some(out) = &mut verbose_out {
         out.emit_tasks(tasks.finish(), &session_id)?;
