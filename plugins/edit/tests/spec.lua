@@ -369,6 +369,14 @@ case("replace_lines_accepts_the_expected_first_line", function()
   eq(replace_lines(content, 3, 3, "XXX", ""), "aaa\n  bbb\nXXX\nddd\n")
 end)
 
+case("replace_lines_accepts_a_line_as_read_cut_it", function()
+  local content = "aaa\n  a long line that read cut short\nccc\n"
+  eq(replace_lines(content, 2, 2, "XXX", "a long line..."), "aaa\nXXX\nccc\n")
+
+  local _, other_line = replace_lines(content, 1, 1, "XXX", "a long line...")
+  has(other_line, "at line 2")
+end)
+
 case("replace_lines_refuses_stale_line_numbers", function()
   local content = "aaa\nbbb\nccc\nbbb\nddd\n"
 
