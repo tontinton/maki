@@ -3,6 +3,7 @@ local M = {}
 local LF = "\n"
 local CRLF = "\r\n"
 local SNIPPET_MAX_CHARS = 32
+local LINE_CUT_MARKER = "..."
 
 -- A tie stays LF, so the answer never depends on which ending the file happens
 -- to show first.
@@ -49,10 +50,24 @@ local function trim(s)
   return (s:match("^%s*(.-)%s*$"))
 end
 
+-- `read` cuts a long line and ends it with the marker, so that is all the model
+-- can quote of it. A re-read shows the same cut line, hence the prefix match.
+local function line_matches(line, wanted)
+  local text = trim(line)
+  if text == wanted then
+    return true
+  end
+  if wanted:sub(-#LINE_CUT_MARKER) ~= LINE_CUT_MARKER then
+    return false
+  end
+  local shown = wanted:sub(1, -#LINE_CUT_MARKER - 1)
+  return text:sub(1, #shown) == shown
+end
+
 local function nearest_line(lines, wanted, from)
   for distance = 1, #lines do
     for _, i in ipairs({ from - distance, from + distance }) do
-      if lines[i] and trim(lines[i]) == wanted then
+      if lines[i] and line_matches(lines[i], wanted) then
         return i
       end
     end
@@ -64,7 +79,7 @@ end
 -- else can tell: the file is exactly as maki left it.
 local function stale_line_error(lines, start_line, expected)
   local wanted = trim(expected)
-  if trim(lines[start_line]) == wanted then
+  if line_matches(lines[start_line], wanted) then
     return nil
   end
   local found = wanted ~= "" and nearest_line(lines, wanted, start_line)
