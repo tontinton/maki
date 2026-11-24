@@ -34,8 +34,9 @@ use maki_lua::{
     INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, InitFiles, Interaction, KEY_WARNING,
     MAX_INFLIGHT_TOOLS, MCP_HINT, NO_UI_ERR, PERMISSION_NAME_WARNING, PERMISSION_SHAPE_ERR,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
+    UNDECLARED_REACH, UNPAID_REACH_ERR, UiAction, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
+use maki_providers::Timeouts;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -9381,4 +9382,150 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
+}
+
+/// Answer the usage roundtrip the way the UI does: from the provider instance
+/// registered for the slug. The host has no event loop, so a plugin calling
+/// `maki.provider.usage` would otherwise wait for a reply nobody sends.
+fn answer_provider_usage(host: &mut PluginHost, slug: &str) {
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let slug = slug.to_owned();
+    std::thread::spawn(move || {
+        let Some(UiAction::ProviderUsage { reply_tx, .. }) = ui.blocking_recv() else {
+            return;
+        };
+        let provider =
+            maki_providers::provider::provider_for_slug(&slug, Timeouts::default()).unwrap();
+        let reply = runtime().block_on(maki_lua::fetch_provider_usage(provider.as_ref(), &slug));
+        let _ = reply_tx.send(reply);
+    });
+}
+
+#[test]
+fn a_plugin_can_read_a_providers_usage() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-usage",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+  fetch_usage = function(ctx)
+    return {
+      plan = "lite",
+      limits = { { label = "5-hour", percentage = 42, reset_at = 1800000000000 } },
+    }
+  end,
+})
+maki.api.register_tool({
+  name = "read_usage",
+  description = "reads provider usage",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-usage")
+    if not usage then return { llm_output = "err: " .. tostring(err), is_error = true } end
+    return { llm_output = usage.plan .. " " .. usage.limits[1].label .. " " .. tostring(usage.limits[1].percentage) }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    assert!(
+        maki_providers::plugin::is_registered("acme-usage"),
+        "provider not registered"
+    );
+    answer_provider_usage(&mut host, "acme-usage");
+    let out = exec_tool(&reg, "read_usage", json!({})).unwrap();
+    assert_eq!(out, "lite 5-hour 42");
+}
+
+/// A provider with no usage hook must answer from its own declaration, not
+/// resolve an unknown slug through the network catalog. The registered plugin
+/// provider keeps this test local and covers the "does not report usage" branch.
+#[test]
+fn a_provider_without_a_usage_hook_reports_that_it_has_none() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "no_usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-no-usage",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+})
+maki.api.register_tool({
+  name = "read_missing_usage",
+  description = "reads usage from a provider with no usage hook",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-no-usage")
+    if usage then return { llm_output = "unexpected usage" } end
+    return { llm_output = err }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    answer_provider_usage(&mut host, "acme-no-usage");
+    assert_eq!(
+        exec_tool(&reg, "read_missing_usage", json!({})).unwrap(),
+        "acme-no-usage does not report usage"
+    );
+}
+
+/// Without a UI the call builds the provider from the slug and uses the same
+/// fetch helper as the UI path, so the two modes cannot drift apart.
+#[test]
+fn headless_usage_answers_for_any_slug() {
+    let reg = fresh_registry();
+    let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(vec!["api.acme.test".to_owned()].into()));
+    host.load_source_with_permissions(
+        "headless_usage_provider",
+        r#"
+maki.provider.register({
+  slug = "acme-headless",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.test/v1",
+  fetch_usage = function(ctx)
+    return { plan = "lite", limits = { { label = "5-hour", percentage = 42 } } }
+  end,
+})
+maki.api.register_tool({
+  name = "read_headless_usage",
+  description = "reads usage with no UI",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function()
+    local usage, err = maki.provider.usage("acme-headless")
+    if not usage then return { llm_output = "err: " .. tostring(err) } end
+    return { llm_output = usage.plan .. " " .. usage.limits[1].label .. " " .. tostring(usage.limits[1].percentage) }
+  end,
+})
+"#,
+        perms,
+    )
+    .unwrap();
+
+    maki_providers::plugin::commit_load();
+    assert_eq!(
+        exec_tool(&reg, "read_headless_usage", json!({})).unwrap(),
+        "lite 5-hour 42"
+    );
 }

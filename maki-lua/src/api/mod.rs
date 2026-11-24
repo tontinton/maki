@@ -113,7 +113,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "provider",
-        provider::create_provider_namespace(lua, permissions, owner, egress)?,
+        provider::create_provider_namespace(lua, permissions, owner, egress, ui_action_tx.clone())?,
     )?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(

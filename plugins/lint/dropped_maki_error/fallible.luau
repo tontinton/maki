@@ -52,6 +52,7 @@ return {
   ["maki.provider.auth.clear"] = true,
   ["maki.provider.auth.get"] = true,
   ["maki.provider.auth.set"] = true,
+  ["maki.provider.usage"] = true,
   ["maki.session.current"] = true,
   ["maki.session.data_dir"] = true,
   ["maki.session.delete"] = true,

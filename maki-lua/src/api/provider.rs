@@ -11,7 +11,7 @@ use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
 use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registration};
-use maki_providers::provider::BoxFuture;
+use maki_providers::provider::{BoxFuture, Provider};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth_async, lock_credentials_async, save_plugin_auth,
@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
+use crate::api::util::command::{UiAction, ui_json_roundtrip};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
@@ -650,6 +651,77 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
     Ok(owner.granted_providers.contains(&slug))
 }
 
+/// The provider's own usage limits, the data behind `/usage`. A limit carries
+/// a provider label, a used percentage, its reset time in epoch milliseconds
+/// and a free-form detail. `plan` and `by_model_today` come back when the
+/// provider reports them.
+///
+/// With a UI attached the answer comes from a live session using that slug,
+/// the instance `/usage` reads, so a key rotated after a 429 is the one
+/// reported. Headless drivers build a fresh provider from the slug instead,
+/// which starts at the first key.
+///
+/// A provider with no usage endpoint answers nil and an error, as does a
+/// failed fetch. The call fetches live data, so a plugin that polls should
+/// space its calls out.
+///
+/// @param slug string Provider name, such as `"zai"`.
+/// @return (table|nil, string|nil) Usage, or nil and an error string.
+/// @example
+/// local usage, err = maki.provider.usage("zai")
+/// if usage then
+///   for _, limit in ipairs(usage.limits or {}) do
+///     maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+///   end
+/// end
+#[lua_fn]
+async fn usage(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    slug: String,
+) -> LuaResult<Pair<LuaValue>> {
+    if let Some(tx) = tx.as_ref() {
+        return ui_json_roundtrip(&lua, Some(tx), |reply_tx| UiAction::ProviderUsage {
+            slug: slug.clone(),
+            reply_tx,
+        })
+        .await;
+    }
+    let lookup = slug.clone();
+    let provider = try_pair!(
+        maki_storage::blocking(move || {
+            maki_providers::provider::provider_for_slug(
+                &lookup,
+                maki_providers::Timeouts::default(),
+            )
+        })
+        .await
+        .map_err(|e| e.user_message())
+    );
+    let value = try_pair!(fetch_provider_usage(provider.as_ref(), &slug).await);
+    Ok((Some(json_to_lua(&lua, &value)?), None))
+}
+
+/// The one usage fetch, with the same error mapping and JSON shape whether it
+/// answers a headless call, a UI roundtrip or a test host.
+pub fn fetch_provider_usage<'a>(
+    provider: &'a dyn Provider,
+    slug: &'a str,
+) -> BoxFuture<'a, Result<Value, String>> {
+    Box::pin(async move {
+        let usage = provider
+            .fetch_usage()
+            .await
+            .map_err(|e| e.user_message())?
+            .ok_or_else(|| format!("{slug} does not report usage"))?;
+        usage_value(&usage)
+    })
+}
+
+fn usage_value(usage: &maki_providers::ProviderUsage) -> Result<Value, String> {
+    serde_json::to_value(usage).map_err(|e| e.to_string())
+}
+
 /// Register a provider this plugin implements. Its models are addressed as
 /// `<slug>/<model>` and appear in the model picker and in `/model`.
 ///
@@ -1108,9 +1180,10 @@ lua_table! {
     ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
     /// })
     /// ```
-    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
+    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions, tx: Option<UnboundedSender<UiAction>>), DOCS [
         register(perms, owner, egress, grants),
         is_selected(owner),
+        usage(tx),
         http_error,
     ]
 }
@@ -1124,9 +1197,10 @@ pub(crate) fn create_provider_namespace(
     permissions: &PluginPermissions,
     owner: Owner,
     egress: NetEgress,
+    tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let owned = egress.owned();
-    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone())?;
+    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone(), tx)?;
     provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
 }
@@ -1201,6 +1275,39 @@ mod tests {
         for slot in HookSlot::ALL {
             assert_eq!(hook_slot(slot.spec().name), Some(slot));
         }
+    }
+
+    #[test]
+    fn usage_table_carries_the_limits_and_plan() {
+        let lua = Lua::new();
+        let usage = maki_providers::ProviderUsage {
+            plan: Some("lite".into()),
+            by_model_today: vec![maki_providers::ModelUsageRow {
+                model: "glm-5".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                spend_microdollars: 250_000,
+            }],
+            limits: vec![maki_providers::UsageLimit {
+                label: "5-hour".into(),
+                percentage: Some(42),
+                reset_at: Some(1_800_000_000_000),
+                detail: None,
+            }],
+        };
+
+        let value = json_to_lua(&lua, &usage_value(&usage).unwrap()).unwrap();
+        let json = lua_to_json(&lua, &value).unwrap();
+        assert_eq!(json["plan"], json!("lite"));
+        assert_eq!(json["by_model_today"][0]["model"], json!("glm-5"));
+        assert_eq!(
+            json["by_model_today"][0]["spend_microdollars"],
+            json!(250_000)
+        );
+        assert_eq!(json["limits"][0]["label"], json!("5-hour"));
+        assert_eq!(json["limits"][0]["percentage"], json!(42));
+        assert_eq!(json["limits"][0]["reset_at"], json!(1_800_000_000_000u64));
     }
 
     /// `build_body(ctx, body, model, opts)`: the fields the signature names
@@ -1601,6 +1708,7 @@ mod tests {
             },
             NetEgress::default(),
             grants,
+            None,
         )
         .unwrap();
         lua.globals().set("provider", table).unwrap();
