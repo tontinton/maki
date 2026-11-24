@@ -1,66 +1,11 @@
 local VALID_FORMATS = { markdown = true, text = true, html = true }
 local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { "script", "style", "noscript" }
-local IS_SKIP_TAG = {}
-for _, tag in ipairs(SKIP_TAGS) do
-  IS_SKIP_TAG[tag] = true
-end
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
   markdown = "text/markdown,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.5",
 }
-
-local LT, GT, SLASH, SPACE, TAB, CR, LF = 60, 62, 47, 32, 9, 13, 10
-local function is_ws(b)
-  return b == SPACE or b == TAB or b == CR or b == LF
-end
-
-local function strip_html(html)
-  local out = {}
-  local in_tag = false
-  local tag_start = 0
-  local skip_tag = nil
-  local last_was_space = true
-
-  for i = 1, #html do
-    local b = html:byte(i)
-    if b == LT then
-      in_tag = true
-      tag_start = i + 1
-    elseif b == GT then
-      in_tag = false
-      local tag_str = html:sub(tag_start, i - 1):lower()
-      local tag_name = tag_str:match("^%s*(%S+)")
-
-      if skip_tag then
-        if tag_name and tag_name:byte(1) == SLASH and tag_name:sub(2) == skip_tag then
-          skip_tag = nil
-        end
-      elseif tag_name and IS_SKIP_TAG[tag_name] then
-        skip_tag = tag_name
-      end
-
-      if not skip_tag and #out > 0 and not last_was_space then
-        out[#out + 1] = " "
-        last_was_space = true
-      end
-    elseif not in_tag and not skip_tag then
-      if is_ws(b) then
-        if not last_was_space and #out > 0 then
-          out[#out + 1] = " "
-          last_was_space = true
-        end
-      else
-        out[#out + 1] = html:sub(i, i)
-        last_was_space = false
-      end
-    end
-  end
-
-  local result = table.concat(out)
-  return result:match("^%s*(.-)%s*$")
-end
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
@@ -158,7 +103,8 @@ maki.api.register_tool({
       local converted = maki.text.html_to_markdown(body, { skip_tags = SKIP_TAGS })
       body = converted or body
     elseif fmt == "text" and is_html then
-      body = strip_html(body)
+      local stripped = maki.text.html_to_text(body, { skip_tags = SKIP_TAGS })
+      body = stripped or body
     end
 
     local llm_output = truncate(body, max_lines, max_bytes)
