@@ -496,7 +496,7 @@ local opts = maki.api.register_options(output_limits.extend({
   },
   file_tool_note = {
     default = false,
-    desc = "Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does. The command still runs. The note also shows under the command's output.",
+    desc = "Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does, so the model stops using bash to read and search files. The command still runs. The note also shows under the command's output.",
   },
   background_log_bytes = {
     default = LOG_MAX_BYTES,
