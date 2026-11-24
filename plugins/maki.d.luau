@@ -59,7 +59,7 @@ declare maki: {
   },
   fn: {
     jobstart: @checked (cmd: any, opts: any) -> (number?, string?),
-    jobstop: @checked (job_id: number) -> (),
+    jobstop: @checked (job_id: number, session: string?) -> (),
     jobforget: @checked (job_id: number) -> (),
     jobwait: @checked (job_id: number, timeout_ms: number?) -> (any, string?),
     jobinfo: @checked (job_id: number) -> (any, string?),
@@ -230,6 +230,8 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    chat_item: @checked (opts: any) -> (),
+    status_segment: @checked (opts: any) -> (),
   },
   uv: {
     cwd: @checked () -> (string?),

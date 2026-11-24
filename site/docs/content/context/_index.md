@@ -238,6 +238,8 @@ Tasks started in one `batch` move together. The batch id reaches all of them at 
 
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
 
+`/tasks` lists the session's jobs that a plugin started with `shared = true`, running ones first and exited ones after them. Ctrl+S kills a running one the same way; Ctrl+R filters the jobs down to the running ones.
+
 Background and blocking tasks share `plugins.task.max_concurrent`. Plan mode still blocks its file writes. [Background Tasks](/docs/background-tasks/) covers permission prompts, what stops a task, and headless runs.
 
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.

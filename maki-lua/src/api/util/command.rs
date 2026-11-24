@@ -113,9 +113,26 @@ pub struct HintEntry {
 
 pub type HintEntries = Vec<HintEntry>;
 
+/// One status bar segment a plugin asked for. The id names it, so a plugin
+/// updates and removes its own segments exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentEntry {
+    pub plugin: Arc<str>,
+    pub id: String,
+    /// `None` shows in every tab.
+    pub session: Option<MakiId>,
+    pub text: String,
+    pub style: String,
+}
+
+/// One snapshot of what plugins asked the status bar to show: their key
+/// hints and their segments. Plugin-keyed on the way in, flattened here in
+/// plugin order, so every tab renders the same spans.
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
+    /// The segments, rendered as `[ text ]` on the right of the bar.
+    pub segments: Vec<SegmentEntry>,
 }
 
 impl HintSnapshot {
@@ -131,6 +148,22 @@ impl HintSnapshot {
                     .entries
                     .iter()
                     .any(|other| other.plugin == entry.plugin && other.session == Some(session)),
+            })
+    }
+
+    /// The segments of this session, with the every-tab ones of a plugin
+    /// left out when that plugin has a segment for this session: the same
+    /// rule the hints follow.
+    pub fn visible_segments(&self, session: MakiId) -> impl Iterator<Item = &SegmentEntry> {
+        self.segments
+            .iter()
+            .filter(move |entry| match entry.session {
+                Some(owner) => owner == session,
+                None => !self.segments.iter().any(|other| {
+                    other.plugin == entry.plugin
+                        && other.id == entry.id
+                        && other.session == Some(session)
+                }),
             })
     }
 }
@@ -166,8 +199,9 @@ impl HintWriter {
         )
     }
 
-    pub fn publish(&self, entries: HintEntries) {
-        self.store.store(Arc::new(HintSnapshot { entries }));
+    pub fn publish(&self, entries: HintEntries, segments: Vec<SegmentEntry>) {
+        self.store
+            .store(Arc::new(HintSnapshot { entries, segments }));
     }
 }
 
@@ -875,6 +909,30 @@ pub enum UiAction {
         id: String,
         end: TaskEnd,
     },
+    /// A plugin-owned transcript item for one chat session: `running` creates
+    /// or re-titles it, `done` / `failed` closes it. The `id` is already
+    /// plugin-scoped.
+    ChatItem {
+        session: MakiId,
+        item: ChatItem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
 }
 
 // Lives on the Lua thread so `ui_roundtrip` can consult it without threading
@@ -1197,10 +1255,16 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)]);
+        writer.publish(
+            vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)],
+            vec![segment(OTHER_PLUGIN, "2 running")],
+        );
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.segments.len(), 1);
+        assert_eq!(snap.segments[0].text, "2 running");
+        assert_eq!(snap.segments[0].style, "status_dim");
     }
 
     const SHADOWED_PLUGIN: &str = "shadowed";
@@ -1216,6 +1280,16 @@ mod tests {
         }
     }
 
+    fn segment(plugin: &str, text: &str) -> SegmentEntry {
+        SegmentEntry {
+            plugin: Arc::from(plugin),
+            id: "jobs".into(),
+            session: None,
+            text: text.into(),
+            style: "status_dim".into(),
+        }
+    }
+
     #[test_case(true, &[EVERY_TAB_HINT, SESSION_HINT] ; "own_tab_swaps_in_the_session_hint")]
     #[test_case(false, &[EVERY_TAB_HINT, EVERY_TAB_HINT] ; "other_tab_keeps_the_every_tab_hint")]
     fn session_hint_shadows_the_plugins_every_tab_hint(own_tab: bool, expected: &[&str]) {
@@ -1226,6 +1300,7 @@ mod tests {
                 hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
                 hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
             ],
+            segments: Vec::new(),
         };
         let tab = if own_tab { owner } else { MakiId::generate() };
 
