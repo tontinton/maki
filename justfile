@@ -42,15 +42,15 @@ fmt:
 # Same command as CI. lute reads `plugins/.config.luau` from the working directory.
 # Not part of `ci` yet: it needs the lute nightly pinned in `.github/workflows/rust.yml`.
 check-lua:
-    cd plugins && lute check $(find . -name '*.lua')
+    cd plugins && lute check $(find . \( -name '*.lua' -o -name '*.luau' \) ! -name '*.d.luau')
 
 # Same command as CI: lute's default rules plus maki's own in `plugins/lint`. Prefix a deliberately unused variable with `_`.
 lint-lua:
-    cd plugins && lute lint --sequential $(find . -name '*.lua')
+    cd plugins && lute lint --sequential $(find . \( -name '*.lua' -o -name '*.luau' \) ! -name '*.d.luau')
 
 # Same command as CI: Luau's built-in lints, minus the type errors `lute check` covers.
 analyze-lua:
-    cd plugins && ! luau-analyze --formatter=plain $(find . -name '*.lua') | grep -vE ': \([EW][0-9]+\) TypeError:'
+    cd plugins && ! luau-analyze --formatter=plain $(find . \( -name '*.lua' -o -name '*.luau' \) ! -name '*.d.luau') | grep -vE ': \([EW][0-9]+\) TypeError:'
 
 pylint:
     ruff check scripts/
