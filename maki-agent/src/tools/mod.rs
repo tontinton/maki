@@ -714,6 +714,8 @@ pub fn cli_tool_ctx() -> ToolContext {
 
 pub mod test_support {
     use std::borrow::Cow;
+    #[cfg(test)]
+    use std::io::Write;
 
     use arc_swap::ArcSwap;
     use maki_providers::Timeouts;
@@ -908,9 +910,20 @@ pub mod test_support {
         ctx
     }
 
-    /// Plays someone else's edit. It pushes the mtime ahead instead of writing
-    /// again, because two writes close together can share one mtime on
-    /// filesystems with coarse timestamps.
+    /// Plays someone else's edit. It pushes the mtime ahead as well, because
+    /// two writes close together can share one mtime on filesystems with
+    /// coarse timestamps.
+    #[cfg(test)]
+    pub(crate) fn foreign_edit(path: &Path) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(b"foreign"))
+            .unwrap();
+        future_mtime(path);
+    }
+
+    /// Plays a rewrite that leaves the content as it was.
     #[cfg(test)]
     pub(crate) fn future_mtime(path: &Path) {
         fs::File::options()
