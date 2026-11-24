@@ -1530,7 +1530,7 @@ mod tests {
     };
     use crate::template::Vars;
     use crate::tools::registry::{ToolRegistry, ToolSource};
-    use crate::tools::schema::{JsonPath, ToolInputErrorKind};
+    use crate::tools::schema::JsonPath;
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx, stub_ctx_with,
         stub_ctx_with_permissions, stub_seed,
@@ -1779,12 +1779,7 @@ mod tests {
     /// Shared by the mock and the assertion, so the test cannot pass against
     /// some other error.
     fn missing_command() -> ParseError {
-        ParseError {
-            path: JsonPath::default(),
-            kind: ToolInputErrorKind::Missing {
-                expected: HOOK_FIELD_TYPE,
-            },
-        }
+        ParseError::missing(&JsonPath::default(), HOOK_FIELD_TYPE)
     }
 
     impl Tool for HookMock {

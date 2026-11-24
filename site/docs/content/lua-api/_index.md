@@ -489,6 +489,7 @@ only in compact mode.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
     A property can also carry keys the model never sees:
     - `alias` (`string|string[]`) Other names the model may send for this property, with the real name winning when both arrive.
+    - `hint` (`string`) Appended to the error when this required property is missing or its enum value does not match.
     - `value_alias` (`table`) Enum values the model may send in place of a variant, e.g. `{ done = "completed" }`. Each target must be a variant.
     - `accept_single` (`boolean`) When this required array of objects is missing, accept its item's fields sent at the parent level and wrap them into a one-item array.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.

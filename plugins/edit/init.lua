@@ -245,6 +245,9 @@ local function register_tool_if(enabled, tool)
   end
 end
 
+local SEVERAL_EDITS_HINT = opts.multiedit and "Use multiedit for several edits."
+  or "edit takes one old_string/new_string pair. Call it once per edit."
+
 maki.api.register_tool({
   name = "edit",
   kind = "edit",
@@ -268,12 +271,14 @@ maki.api.register_tool({
         description = "Exact string to find (must match uniquely unless replace_all is true)",
         required = true,
         alias = "old",
+        hint = SEVERAL_EDITS_HINT,
       },
       new_string = {
         type = "string",
         description = "Replacement string",
         required = true,
         alias = "new",
+        hint = SEVERAL_EDITS_HINT,
       },
       replace_all = {
         type = "boolean",

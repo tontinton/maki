@@ -117,7 +117,7 @@ local function normalize_entry(entry)
   end
   local tool = entry.tool
   if type(tool) ~= "string" then
-    return nil, "batch entry missing 'tool'"
+    return nil, "batch entry missing 'tool'. Each entry needs a tool name: { tool = \"read\", parameters = {...} }."
   end
   -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
   -- `functions.` prefix so headers and the nested-batch guard match.
