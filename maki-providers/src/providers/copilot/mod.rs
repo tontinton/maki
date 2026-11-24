@@ -1147,14 +1147,7 @@ mod tests {
     #[test_case(ModelTier::Weak, "gpt-5.6-luna"; "weak defaults to luna")]
     #[test_case(ModelTier::Medium, "claude-sonnet-5.5"; "medium defaults to sonnet")]
     #[test_case(ModelTier::Strong, "claude-opus-5.5"; "strong defaults to opus")]
-    fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
-        let defaults: Vec<_> = SPEC
-            .models()
-            .iter()
-            .filter(|entry| entry.default && entry.tier == tier)
-            .collect();
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].prefixes[0], expected_prefix);
+    fn manifest_tier_default(tier: ModelTier, expected_prefix: &str) {
         assert_eq!(
             ProviderRegistry::find_default_for_tier("copilot", tier)
                 .unwrap()

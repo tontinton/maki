@@ -180,7 +180,7 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 | Strong | kimi-k3 | $3.00 / $15.00 | 1048K ctx / 131K out |
 | Strong | mai-code-2 | $1.00 / $5.00 | 1050K ctx / 128K out |
 | Strong | **claude-opus-5.5** (default) | $4.00 / $20.00 | 328K ctx / 128K out |
-| Strong | claude-opus-5, claude-opus-4.8 | $5.00 / $25.00 | 264K ctx / 64K out |
+| Strong | **claude-opus-5, claude-opus-4.8** (fallback) | $5.00 / $25.00 | 264K ctx / 64K out |
 | Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 264K ctx / 64K out |
 
 Defaults: gpt-5.6-luna (weak), claude-sonnet-5.5 (medium), claude-opus-5.5 (strong)

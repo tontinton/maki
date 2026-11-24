@@ -2,6 +2,7 @@ use maki_providers::Effort;
 use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::spec::{AuthDoc, BASES, CatalogDoc, ProviderRegistry, ProviderSpec};
 use std::fmt::Write;
+use std::iter::repeat;
 
 use crate::lua_util::with_bundled_providers;
 
@@ -20,6 +21,8 @@ const PLUGIN_PROVIDER_MANIFEST: &str =
     include_str!("../../maki-lua/tests/fixtures/provider_plugin/plugin.toml");
 
 const UNKNOWN_PRICING: &str = "unknown";
+const DEFAULT_LABEL: &str = "default";
+const FALLBACK_LABEL: &str = "fallback";
 const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
 
 const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
@@ -577,16 +580,16 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     // A row per model, not per tier: prices and context sizes differ inside a
     // tier, so one merged row would quote a single model's numbers for all.
     for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
+        let mut default_labels = [DEFAULT_LABEL].into_iter().chain(repeat(FALLBACK_LABEL));
         for entry in entries.iter().filter(|e| e.tier == tier) {
             let names = entry.prefixes.join(", ");
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} |",
                 tier_label(tier),
-                if entry.default {
-                    format!("**{names}** (default)")
-                } else {
-                    names
+                match entry.default.then(|| default_labels.next()).flatten() {
+                    Some(label) => format!("**{names}** ({label})"),
+                    None => names,
                 },
                 format_pricing(entry),
                 format_context(entry),
@@ -596,8 +599,14 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
 
     let defaults: Vec<String> = entries
         .iter()
-        .filter(|e| e.default)
-        .map(|e| {
+        .enumerate()
+        .filter(|(index, e)| {
+            e.default
+                && !entries[..*index]
+                    .iter()
+                    .any(|earlier| earlier.default && earlier.tier == e.tier)
+        })
+        .map(|(_, e)| {
             format!(
                 "{} ({})",
                 e.prefixes.first().map_or("?", String::as_str),

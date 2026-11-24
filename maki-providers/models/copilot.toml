@@ -222,7 +222,7 @@ prefixes = ["claude-opus-5", "claude-opus-4.8"]
 tier = "strong"
 family = "generic"
 vision = true
-default = false
+default = true
 max_output_tokens = 64000
 context_window = 264000
 pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
