@@ -3044,6 +3044,7 @@ mod tests {
         }
 
         close_session(&mut srv, &last_sid, SessionEndReason::Delete).await;
+        finish_teardowns(&mut srv).await;
         assert!(read(Some(&last_id)).is_err());
         assert_eq!(read(Some(&first_id)).unwrap()["id"], *first_id);
 
