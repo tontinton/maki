@@ -360,6 +360,23 @@ case("replace_lines_range_replace_and_delete", function()
   has(e3, "out of range")
 end)
 
+local shift_note = require("edit_helpers").shift_note
+
+case("shift_note_says_how_far_the_lines_below_moved", function()
+  local content = "aaa\nbbb\nccc\nddd\n"
+  eq(shift_note(content, "aaa\nXXX\nYYY\nZZZ\nccc\nddd\n"), "lines after 2 shifted by +2")
+  eq(shift_note(content, "aaa\nddd\n"), "lines after 3 shifted by -2")
+  eq(shift_note(content, "TOP\naaa\nbbb\nccc\nddd\n"), "lines after 0 shifted by +1")
+  eq(shift_note("a\r\nb\r\nc\r\n", "a\r\nc\r\n"), "lines after 2 shifted by -1")
+end)
+
+case("shift_note_is_silent_when_no_line_below_moved", function()
+  local content = "aaa\nbbb\nccc\n"
+  eq(shift_note(content, "aaa\nXXX\nccc\n"), nil)
+  eq(shift_note(content, "aaa\nbbb\nccc\nddd\n"), nil)
+  eq(shift_note(content, "aaa\n"), nil)
+end)
+
 local STALE_MSG = "line numbers are stale"
 
 case("replace_lines_accepts_the_expected_first_line", function()
