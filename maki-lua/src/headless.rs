@@ -6,8 +6,8 @@
 
 use maki_agent::Envelope;
 use maki_agent::session::Resumed;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
+use maki_providers::{TokenUsage, settle_session};
 use maki_storage::id::SessionRef;
 
 use crate::EventHandle;
@@ -77,24 +77,30 @@ pub struct SessionOpening {
     /// What the session spent before this process opened it.
     pub usage: TokenUsage,
     pub context_size: u32,
-    /// `None` on an unpriced model, or when the driver does not price what a
-    /// resumed session spent before.
+    /// What that spend billed, `None` on an unpriced model.
     pub cost: Option<f64>,
 }
 
 impl SessionOpening {
+    /// Prices what a resumed session spent before against `model`, so `usage`
+    /// and `cost` start from the same restored session.
     pub fn new(resumed: &Resumed, model: &Model) -> Self {
+        let (usage, cost) = resumed.session.as_ref().map_or_else(
+            || (TokenUsage::default(), None),
+            |session| {
+                // A copy: settling fills estimates the run must not save back.
+                let mut by_model = session.usage_by_model().clone();
+                let cost = settle_session(&session.token_usage, &mut by_model, model, false);
+                (session.token_usage, cost)
+            },
+        );
         Self {
             id: resumed.id.clone(),
             model: model.spec(),
             context_window: model.context_window,
-            usage: resumed
-                .session
-                .as_ref()
-                .map(|session| session.token_usage)
-                .unwrap_or_default(),
+            usage,
             context_size: resumed.context_size,
-            cost: None,
+            cost,
         }
     }
 }
@@ -146,5 +152,51 @@ impl SessionObserver {
             session,
             snapshot: HeadlessSnapshot::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use maki_agent::session::StoredSession;
+    use maki_storage::sessions::StoredTokenUsage;
+
+    use super::*;
+
+    const SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const RECORDED_COST: f64 = 3.0;
+
+    #[test]
+    fn a_resumed_opening_starts_from_the_bill_it_recorded() {
+        let model = Model::from_spec(SPEC).expect("a shipped model");
+        let mut session = StoredSession::new(SPEC, "/work");
+        session.token_usage = TokenUsage {
+            input: 1_000,
+            ..Default::default()
+        };
+        session.add_model_usage(
+            &model.id,
+            StoredTokenUsage {
+                input: 1_000,
+                cost: Some(RECORDED_COST),
+                ..Default::default()
+            },
+        );
+        let resumed = Resumed::stored(SessionRef::generate(), session);
+
+        let opening = SessionOpening::new(&resumed, &model);
+
+        assert_eq!(opening.cost, Some(RECORDED_COST));
+        assert_eq!(opening.usage.input, 1_000);
+    }
+
+    #[test]
+    fn a_new_opening_has_spent_nothing() {
+        let model = Model::from_spec(SPEC).expect("a shipped model");
+        let resumed = Resumed::empty(SessionRef::generate());
+
+        let opening = SessionOpening::new(&resumed, &model);
+
+        assert_eq!(opening.cost, None);
+        assert_eq!(opening.usage, TokenUsage::default());
     }
 }
