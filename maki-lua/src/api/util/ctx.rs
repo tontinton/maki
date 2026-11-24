@@ -185,7 +185,7 @@ enum Caps {
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
-        config: AgentConfig,
+        config: Box<AgentConfig>,
         workflow: bool,
         audience: ToolAudience,
         output_mode: ToolOutputMode,
@@ -232,7 +232,7 @@ impl LuaCtx {
         Self::new(
             ctx,
             Caps::Start {
-                config: ctx.config.clone(),
+                config: Box::new(ctx.config.clone()),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 output_mode: ctx.output_mode,
