@@ -4506,9 +4506,13 @@ On the generic ladder, a model whose API has no adaptive mode leaves
 Declared effort fields keep `adaptive` separate because their fragments can
 differ from the provider fallback.
 
+`context_window` is the window the session runs with, under any cap.
+`context_window_override` is the session's cap, nil when it has none.
+
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
   thinking_shown, thinking_options, fast, supports_thinking,
-  supports_fast}`, or nil and an error.
+  supports_fast, context_window, context_window_override?}`, or nil and an
+  error.
 
 **Example:**
 
@@ -4548,9 +4552,10 @@ local specs = maki.model.available()
 maki.model.set({opts})
 ```
 
-Switches the focused session's model, thinking level, or fast mode. Fields
-you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the new state, in the same shape `get` returns.
+Switches the focused session's model, thinking level, fast mode, or context
+window cap. Fields you leave out stay as they are, so this doubles as a
+thinking-only switch. Answers with the new state, in the same shape `get`
+returns.
 
 Requires the `session_settings` [plugin permission](#plugin-permissions).
 
@@ -4562,7 +4567,14 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 
   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
 
-  - `fast` (`boolean`) Anthropic fast mode.
+  - `fast` (`boolean`) Anthropic fast mode;
+  - `context_window_override` (`integer|false`) caps this session's context
+
+  window in tokens, or `false` (or `0`) to lift the cap. A cap only lowers
+  the window, so a session compacts earlier. It is not `context_window`, the
+  effective window `get` reports, so `get` fed back into `set` never pins
+  it. The model is told the window while a cap applies.
+
 
 **Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
 
@@ -4571,6 +4583,7 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
 ```lua
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
+maki.model.set({ context_window_override = 50000 })
 maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 

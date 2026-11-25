@@ -309,6 +309,8 @@ pub enum Action {
     /// A copy of this session, to run beside it and take the focus.
     OpenFork(Box<OpenSession>),
     ChangeModel(String),
+    /// The session's context window cap moved; re-derive its model slot.
+    ReapplyModel,
     RefreshProvider {
         slug: String,
     },

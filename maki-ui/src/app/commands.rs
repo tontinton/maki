@@ -118,6 +118,7 @@ impl App {
                 }
                 vec![]
             }
+            "/context" => self.cmd_context(&cmd.args),
             "/workflow" => {
                 self.state.workflow = !self.state.workflow;
                 self.flash(
@@ -266,5 +267,44 @@ impl App {
             Err(e) => self.flash(format!("cd: {e}")),
         }
         vec![]
+    }
+
+    /// `/context 50000` caps this session's context window, `/context default`
+    /// (or `auto`) lifts the cap, and a bare `/context` shows where the session
+    /// stands, the way `/autocompact` reads.
+    fn cmd_context(&mut self, args: &str) -> Vec<Action> {
+        let args = args.trim();
+        let catalog = self.state.catalog_context_window();
+        if args.is_empty() {
+            let window = self.state.model.context_window;
+            self.flash(match self.state.context_window {
+                Some(cap) => format!(
+                    "context window: {window} tokens (capped at {cap}; the model's own is {catalog})"
+                ),
+                None => format!("context window: {window} tokens (the model's own)"),
+            });
+            return vec![];
+        }
+        let cap = match args {
+            "default" | "auto" | "off" | "0" => None,
+            other => match other.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    self.flash(format!(
+                        "context: expected a token count, default or auto, got {args:?}"
+                    ));
+                    return vec![];
+                }
+            },
+        };
+        self.state.set_context_window(cap);
+        self.flash(match cap {
+            Some(n) if n < catalog => format!("context window: {n} tokens for this session"),
+            Some(n) => format!(
+                "context window: capped at {n}, the model's own {catalog} is smaller, so it applies"
+            ),
+            None => format!("context window restored to {catalog}"),
+        });
+        vec![Action::ReapplyModel]
     }
 }

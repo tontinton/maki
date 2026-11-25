@@ -29,6 +29,11 @@ pub(crate) struct SessionState {
     /// lands; unaffected by ordinary, per-token-billed turns.
     pub subsidised_list_cost: Option<f64>,
     pub context_size: u32,
+    /// This session's context window cap. `None` means the model's own
+    /// window applies.
+    pub context_window: Option<u32>,
+    /// The model's own window, under any cap.
+    catalog_context_window: u32,
     pub mode: Mode,
     pub plan: PlanState,
     pub warnings: Vec<String>,
@@ -70,7 +75,11 @@ impl SessionState {
     pub fn from_session(open: OpenSession, model: &Model, storage: &StateDir) -> Self {
         let OpenSession { mut session, claim } = open;
         session.set_model(model.spec());
-        let model = model.clone();
+        let catalog_context_window = model.context_window;
+        let context_window = session.meta.context_window;
+        let model = model
+            .capped_context(context_window)
+            .unwrap_or_else(|| model.clone());
 
         let mode = match session.meta.mode {
             Some(StoredMode::Plan) => Mode::Plan,
@@ -124,6 +133,8 @@ impl SessionState {
             session: Arc::new(session),
             claim,
             model,
+            context_window,
+            catalog_context_window,
             token_usage,
             cost,
             subsidised_list_cost,
@@ -148,6 +159,11 @@ impl SessionState {
         self.pending_thinking.unwrap_or(self.thinking)
     }
 
+    /// The model's own window, before any session cap.
+    pub fn catalog_context_window(&self) -> u32 {
+        self.catalog_context_window
+    }
+
     pub fn set_fast(&mut self, fast: bool) {
         (
             self.thinking,
@@ -165,7 +181,18 @@ impl SessionState {
             self.pending_fast,
         ) = clamp(self.thinking_intent(), self.fast_intent(), model);
         self.session_mut().set_model(model.spec());
-        self.model = model.clone();
+        self.catalog_context_window = model.context_window;
+        self.model = model
+            .capped_context(self.context_window)
+            .unwrap_or_else(|| model.clone());
+    }
+
+    /// Sets or lifts this session's context window cap. It reaches the model
+    /// and the agent on the next `update_model`, which takes the uncapped
+    /// model.
+    pub fn set_context_window(&mut self, window: Option<u32>) {
+        self.context_window = window;
+        self.session_mut().set_context_window(window);
     }
 }
 
@@ -250,7 +277,7 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{test_model, test_pricing};
+    use crate::components::{TEST_CONTEXT_WINDOW, test_model, test_pricing};
     use maki_providers::model::FastSupport;
     use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
     use maki_storage::sessions::{Effort, SessionClaim, SessionError, SessionLog, StoredThinking};
@@ -504,6 +531,33 @@ mod tests {
         state.update_model(&required);
 
         assert_ne!(state.thinking, ThinkingConfig::Off, "{THINKING_NOT_LIFTED}");
+    }
+
+    const CAP: u32 = 50_000;
+    const SMALL_WINDOW: u32 = 30_000;
+
+    /// The stored cap holds on resume and across model switches, never raises
+    /// a smaller model's window, and lifting it brings the model's own back.
+    #[test]
+    fn context_window_cap_follows_the_session_across_models() {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.context_window = Some(CAP);
+        let mut state = resumed(session, &test_model());
+        assert_eq!(state.model.context_window, CAP);
+        assert_eq!(state.catalog_context_window(), TEST_CONTEXT_WINDOW);
+
+        let mut small = test_model();
+        small.context_window = SMALL_WINDOW;
+        state.update_model(&small);
+        assert_eq!(state.model.context_window, SMALL_WINDOW);
+
+        state.update_model(&test_model());
+        assert_eq!(state.model.context_window, CAP);
+
+        state.set_context_window(None);
+        state.update_model(&test_model());
+        assert_eq!(state.model.context_window, TEST_CONTEXT_WINDOW);
+        assert_eq!(state.session.meta.context_window, None);
     }
 
     /// Resume no longer re-derives the model, so the stored toggle now meets

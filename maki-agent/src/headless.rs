@@ -558,6 +558,11 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
     let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let mut provider = connect(&mut model, params.timeouts, &base_tx).await?;
+        let context_cap = params
+            .resumed
+            .session
+            .as_ref()
+            .and_then(|session| session.meta.context_window);
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
@@ -630,6 +635,10 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
             // The host or another session can discover the provider long after
             // our own listing gave up, so every turn reads the registry again.
             provider::refresh_model(&mut model, provider.as_ref());
+            // The cap a TUI session stored holds wherever it is resumed.
+            if let Some(capped) = model.capped_context(context_cap) {
+                model = capped;
+            }
             // Plugin work started off the seed must run on this turn's model.
             if let Some(seed) = &seed {
                 seed.model_slot.store(Arc::new(ModelSlot {
@@ -947,6 +956,8 @@ mod tests {
     const ANSWERING_SLUG: &str = "answering";
     const HANGING_SLUG: &str = "hanging";
     const FAILING_SLUG: &str = "failing";
+    const CAPPED_SLUG: &str = "capped";
+    const CONTEXT_CAP: u32 = 50_000;
     const PLUGIN_ORIGIN: &str = "https://example.com";
     const PLUGIN_HOST: &str = "example.com";
     const LISTED_ONCE: &str = "an answered listing must not be asked again for the same model";
@@ -1152,8 +1163,27 @@ mod tests {
         model: Model,
         background: BackgroundMode,
     ) -> (InteractiveHandle, SessionEvents) {
+        spawn_resumed_listing_session(tmp, model, background, None).await
+    }
+
+    /// With a cap, the session resumes from a stored one that set it.
+    async fn spawn_resumed_listing_session(
+        tmp: &TempDir,
+        model: Model,
+        background: BackgroundMode,
+        context_cap: Option<u32>,
+    ) -> (InteractiveHandle, SessionEvents) {
         let id = MakiId::generate();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let resumed = match context_cap {
+            Some(cap) => {
+                let mut session = StoredSession::new("", &tmp.path().to_string_lossy());
+                session.id = id;
+                session.meta.context_window = Some(cap);
+                Resumed::stored(SessionRef::from(id), session)
+            }
+            None => Resumed::empty(SessionRef::from(id)),
+        };
         spawn_interactive(InteractiveParams {
             model,
             config: AgentConfig {
@@ -1166,7 +1196,7 @@ mod tests {
             excluded_tools: Vec::new(),
             mcp_handle: None,
             initial_wd: tmp.path().to_path_buf(),
-            resumed: Resumed::empty(SessionRef::from(id)),
+            resumed,
             claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
             yolo: false,
             unattended: true,
@@ -1261,6 +1291,36 @@ mod tests {
         next_done(&mut events).await;
         assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
         assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
+    }
+
+    /// The cap rides on the stored session, and every turn's refresh from
+    /// the registry would drop it if the loop did not put it back.
+    #[tokio::test]
+    async fn a_resumed_session_keeps_its_context_window_cap() {
+        plugin::begin_load();
+        let _listed = register_listed(CAPPED_SLUG, lists_window);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) = spawn_resumed_listing_session(
+            &tmp,
+            plugin_model(CAPPED_SLUG),
+            BackgroundMode::Detached,
+            Some(CONTEXT_CAP),
+        )
+        .await;
+        for _ in 0..2 {
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
+            next_done(&mut events).await;
+            let slot = AgentSeed::live(handle.session_id.id())
+                .expect(SEED_PUBLISHED)
+                .model_slot
+                .load_full();
+            assert_eq!(slot.model.context_window, CONTEXT_CAP);
+        }
     }
 
     /// A summary request would go to the plugin's host and end in an `Error`,

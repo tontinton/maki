@@ -109,7 +109,10 @@ pub fn build_system_prompt(
         return slots.render(PromptId::System, &vars, instructions);
     }
     let env = vars.apply("\n\n{environment}");
-    let env = format!("{env}\n- Model: {}", model.spec());
+    let mut env = format!("{env}\n- Model: {}", model.spec());
+    if let Some(window) = model.session_context_window() {
+        env.push_str(&format!("\n- Context window: {window} tokens"));
+    }
     let instructions = format!("{env}{instructions}");
     slots.render(PromptId::System, &vars, &instructions)
 }

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// What a rendered system prompt states that can change later, kept as data
@@ -16,6 +16,10 @@ pub struct PromptFacts {
     pub date: String,
     pub cwd: String,
     pub model: String,
+    /// The context window the model runs with, in tokens. `None` when the
+    /// prompt does not state one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instructions: String,
     /// Prompt hint content keyed by `plugin/slot`.
@@ -54,6 +58,14 @@ pub struct FactsUpdate {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// `Some(None)` when a session cap was lifted, stored as `null`; `None`
+    /// (no key) when it did not change.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +73,13 @@ pub struct FactsUpdate {
     /// `None` for a hint that no longer applies.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hints: BTreeMap<String, Option<String>>,
+}
+
+/// A key that is there, `null` included, is a change.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 impl FactsUpdate {
@@ -89,6 +108,9 @@ impl LiveFacts {
                 value.clone_into(field);
             }
         }
+        if let Some(window) = &update.context_window {
+            prompt.context_window = *window;
+        }
         for (key, content) in &update.hints {
             match content {
                 Some(content) => prompt.hints.insert(key.clone(), content.clone()),
@@ -114,6 +136,9 @@ impl LiveFacts {
         update.date = changed(&told.date, &now.date);
         update.model = changed(&told.model, &now.model);
         update.cwd = changed(&told.cwd, &now.cwd);
+        if told.context_window != now.context_window {
+            update.context_window = Some(now.context_window);
+        }
         update.instructions = changed(&told.instructions, &now.instructions);
         for (key, content) in &now.hints {
             if told.hints.get(key) != Some(content) {
@@ -218,6 +243,7 @@ mod tests {
             date: "2026-10-02".into(),
             cwd: "/repo".into(),
             model: "anthropic/claude-opus-5-5".into(),
+            context_window: Some(200_000),
             instructions: "be nice".into(),
             hints: BTreeMap::from([(HINT.into(), "tags: a".into())]),
         }
@@ -239,6 +265,8 @@ mod tests {
     #[test_case(|f: &mut LiveFacts| f.prompt.as_mut().unwrap().instructions.clear() ; "instructions_gone")]
     #[test_case(|f: &mut LiveFacts| { f.prompt.as_mut().unwrap().hints.insert(HINT.into(), "tags: b".into()); } ; "hint_changed")]
     #[test_case(|f: &mut LiveFacts| f.prompt.as_mut().unwrap().hints.clear() ; "hint_removed")]
+    #[test_case(|f: &mut LiveFacts| f.prompt.as_mut().unwrap().context_window = Some(50_000) ; "context_window_capped")]
+    #[test_case(|f: &mut LiveFacts| f.prompt.as_mut().unwrap().context_window = None ; "context_window_cap_lifted")]
     fn applying_the_changes_reaches_now(change: fn(&mut LiveFacts)) {
         let told = rendered();
         let mut now = rendered();
@@ -246,6 +274,11 @@ mod tests {
 
         let update = told.changes_to(&now);
         assert!(!update.is_empty());
+        let stored = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FactsUpdate>(stored).unwrap(),
+            update
+        );
         let mut heard = told;
         heard.apply(&update);
         assert_eq!(heard, now);

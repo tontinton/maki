@@ -434,6 +434,7 @@ mod tests {
             date: STALE_DATE.into(),
             cwd: ORIGIN_CWD.into(),
             model: MODEL.into(),
+            context_window: None,
             instructions: "be nice".into(),
             hints: BTreeMap::from([("memory/after_instructions".into(), "tags: a".into())]),
         }

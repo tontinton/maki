@@ -228,6 +228,7 @@ impl App {
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
+            context_window: state.context_window,
             input_draft_writers: stored_writers(writers).filter(|_| has_draft),
             input_draft: has_draft.then_some(draft),
             queued_messages: if self.recoverable_queue.is_empty() {
@@ -545,6 +546,7 @@ impl App {
             plan_written: false,
             session_rules: Vec::new(),
             context_size: 0,
+            context_window: self.state.context_window,
             input_draft: None,
             input_draft_writers: None,
             queued_messages: Vec::new(),

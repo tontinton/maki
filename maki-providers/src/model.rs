@@ -37,6 +37,7 @@ pub const FACT_SOURCE_TABLE: &str = "table";
 pub const FACT_SOURCE_LIKE: &str = "like";
 pub const FACT_SOURCE_CATALOG: &str = "catalog";
 pub const FACT_SOURCE_DEFAULT: &str = "default";
+pub const FACT_SOURCE_SESSION: &str = "session";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -612,6 +613,8 @@ pub enum FactSource {
     /// Nothing described this model, so a provider or family default applies.
     #[default]
     Default,
+    /// The session's own cap, set with `/context`.
+    Session,
 }
 
 impl FactSource {
@@ -623,6 +626,7 @@ impl FactSource {
             Self::Like => FACT_SOURCE_LIKE,
             Self::Catalog => FACT_SOURCE_CATALOG,
             Self::Default => FACT_SOURCE_DEFAULT,
+            Self::Session => FACT_SOURCE_SESSION,
         }
     }
 }
@@ -1057,6 +1061,21 @@ impl Model {
 
     pub fn spec(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    /// This model under a session's context window cap, `None` when the cap
+    /// leaves the window as it is. A cap only ever lowers the window.
+    pub fn capped_context(&self, cap: Option<u32>) -> Option<Model> {
+        let cap = cap.filter(|&cap| cap < self.context_window)?;
+        let mut model = self.clone();
+        model.context_window = cap;
+        model.sources.context_window = FactSource::Session;
+        Some(model)
+    }
+
+    /// The window a session cap set, `None` while the model's own applies.
+    pub fn session_context_window(&self) -> Option<u32> {
+        (self.sources.context_window == FactSource::Session).then_some(self.context_window)
     }
 
     /// What the provider charges right now, so it is only ever correct for a
@@ -1619,6 +1638,26 @@ mod tests {
         };
 
         assert_eq!(model.output_tokens(), expected);
+    }
+
+    const CATALOG_WINDOW: u32 = 200_000;
+
+    #[test_case(Some(50_000), Some(50_000) ; "a_lower_cap_bites")]
+    #[test_case(Some(CATALOG_WINDOW), None ; "a_cap_at_the_window_leaves_it")]
+    #[test_case(Some(1_000_000), None ; "a_cap_never_raises_the_window")]
+    #[test_case(None, None ; "no_cap")]
+    fn capped_context_only_lowers_the_window(cap: Option<u32>, expected: Option<u32>) {
+        let model = Model {
+            context_window: CATALOG_WINDOW,
+            ..Model::from_spec("openai/gpt-5.6-sol").unwrap()
+        };
+
+        let capped = model.capped_context(cap);
+
+        assert_eq!(capped.as_ref().map(|m| m.context_window), expected);
+        if let Some(capped) = capped {
+            assert_eq!(capped.sources.context_window, FactSource::Session);
+        }
     }
 
     #[tokio::test]

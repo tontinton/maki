@@ -12,9 +12,9 @@ use tracing::{debug, error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
-    forgive_refused_images, model_registry, refuse_sent_images,
+    ContentBlock, ContextGauge, FactSource, IMAGE_PLACEHOLDER, ImageSource, InputTransformation,
+    Message, Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse,
+    accept_sent_images, forgive_refused_images, model_registry, refuse_sent_images,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
@@ -648,6 +648,11 @@ impl<'h> Agent<'h> {
         };
         let planned = self.model.context_window;
         if served == planned {
+            return Ok(());
+        }
+        // A session cap only ever lowers the window, so a server reporting
+        // more room than the cap must not lift it back.
+        if served > planned && self.model.sources.context_window == FactSource::Session {
             return Ok(());
         }
         info!(session = ?self.session_id, model = %self.model.id, served, planned, "following the served context window");
@@ -2580,6 +2585,58 @@ mod tests {
         assert_eq!(slot.unwrap().load().model.context_window, served);
     }
 
+    /// A session cap only lowers the window, so a local server reporting more
+    /// room than the cap must not lift it back into the slot or the prompt.
+    #[tokio::test]
+    async fn a_session_cap_survives_a_larger_served_window() {
+        let mut h = Harness::new(Vec::new());
+        let cap = 16_384;
+        h.model = small_context_model(cap, 8_192);
+        h.model.sources.context_window = FactSource::Session;
+        h.served_window = Some(32_768);
+        let replies = vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let mut slot = None;
+        let (_, events) = h
+            .run(default_input(), replies, |agent| {
+                let shared = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                    model: start,
+                    provider: Arc::clone(&agent.provider),
+                }));
+                agent.model_sync = Some(Arc::clone(&shared));
+                agent.auto_compact = true;
+                slot = Some(shared);
+            })
+            .await;
+
+        let notice = served_window_notice(&h.model.id, 32_768, cap);
+        assert!(
+            !has_event(
+                &events,
+                |event| matches!(event, AgentEvent::Notice { text } if *text == notice)
+            ),
+            "a larger served window must not lift a session cap"
+        );
+        let slot = slot.unwrap().load().model.clone();
+        assert_eq!(slot.context_window, cap, "the slot keeps the cap");
+        assert_eq!(
+            slot.sources.context_window,
+            FactSource::Session,
+            "the cap keeps its source"
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(cap),
+            "the model is told the cap, not the served window"
+        );
+    }
+
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
@@ -3172,6 +3229,7 @@ mod tests {
             date: ORIGIN_DATE.into(),
             cwd: ORIGIN_CWD.into(),
             model: default_model().spec(),
+            context_window: Some(default_model().context_window),
             instructions: ORIGIN_INSTRUCTIONS.into(),
             hints: BTreeMap::from([(MEMORY_HINT.into(), ORIGIN_HINT.into())]),
         }

@@ -416,6 +416,10 @@ pub struct SessionMeta {
     pub session_rules: Vec<StoredRule>,
     #[serde(default)]
     pub context_size: u32,
+    /// Per-session override of the model's own context window, in tokens.
+    /// `None` means the catalog value for the spec applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
     /// The plugins that changed `input_draft`, `None` when none did. Enter
@@ -2354,6 +2358,16 @@ where
         self.rewrite();
     }
 
+    /// Header field, see [`Self::set_cwd`]. A per-session override of the
+    /// model's own context window; `None` restores it.
+    pub fn set_context_window(&mut self, window: Option<u32>) {
+        if self.meta.context_window == window {
+            return;
+        }
+        self.meta.context_window = window;
+        self.rewrite();
+    }
+
     pub fn add_model_usage(&mut self, model: &str, usage: StoredTokenUsage) {
         *self.usage_by_model.entry(model.to_owned()).or_default() += usage;
         self.touch();
@@ -3250,6 +3264,7 @@ mod tests {
                 date: "2026-10-02".into(),
                 cwd: "/project".into(),
                 model: "m".into(),
+                context_window: None,
                 instructions: " \n".into(),
                 hints: BTreeMap::from([("memory/tags".into(), "rust, cache".into())]),
             }),
