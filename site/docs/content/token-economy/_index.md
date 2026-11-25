@@ -58,7 +58,7 @@ maki.setup({
 [Use dedicated tools for files, not bash: the grep tool instead of grep.]
 ```
 
-The command still runs. The same line shows dimmed under its output, so you see what the model was told. Only a plain command that a tool fully replaces gets the note. A pipe such as `cargo test | tail`, a redirect into a file, a here-document or a flag the tool has no match for gets none. The option is off by default.
+The command still runs. The same line shows dimmed under its output, so you see what the model was told. Only a plain command that a tool fully replaces gets the note. A pipe such as `cargo test | tail`, a redirect into a file, a here-document or a flag the tool has no match for gets none. The one pipe that does is a read or search cut by `head`, like `rg foo | head -20`, since `limit` does that. The option is off by default.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
