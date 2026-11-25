@@ -76,6 +76,8 @@ local FILE_TOOLS = {
       ["-l"] = true,
       ["-g"] = true,
       ["--glob"] = true,
+      ["-t"] = true,
+      ["--type"] = true,
     },
   },
   find = {
