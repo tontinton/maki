@@ -6,6 +6,7 @@ local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
 local snippet = require("edit_helpers").snippet
 local shift_note = require("edit_helpers").shift_note
+local last_line_note = require("edit_helpers").last_line_note
 
 local FALLBACK_VIEW_LINES = 5
 local APPROX_NOTE = "matched approximately. Re-read the file before editing it again"
@@ -461,10 +462,9 @@ register_tool_if(opts.edit_lines, {
     if not result then
       return { llm_output = err, is_error = true }
     end
-    return diff_result(
-      result,
-      string.format("replaced lines %d-%d in %s", input.start, input["end"], shorten_path(result.path))
-    )
+    local summary = string.format("replaced lines %d-%d in %s", input.start, input["end"], shorten_path(result.path))
+    local last_line = last_line_note(result.before, input.start, input["end"])
+    return diff_result(result, last_line and summary .. "; " .. last_line or summary)
   end,
 })
 

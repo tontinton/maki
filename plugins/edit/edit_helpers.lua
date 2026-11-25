@@ -4,6 +4,7 @@ local LF = "\n"
 local CRLF = "\r\n"
 local SNIPPET_MAX_CHARS = 32
 local LINE_CUT_MARKER = "..."
+local LAST_LINE_NOTE = "line %d was %q"
 
 -- A tie stays LF, so the answer never depends on which ending the file happens
 -- to show first.
@@ -133,6 +134,15 @@ function M.replace_lines(content, start_line, end_line, new_string, expected_fir
 
   local joined = table.concat(result, "\n")
   return trailing_nl and joined .. "\n" or joined
+end
+
+-- `expect` only pins line `start`, so a range that runs one line too far is
+-- silent. Naming the last line it took lets the model see the overrun.
+function M.last_line_note(before, start_line, end_line)
+  if end_line <= start_line then
+    return nil
+  end
+  return string.format(LAST_LINE_NOTE, end_line, M.snippet(trim(split_lines(before)[end_line])))
 end
 
 -- What the model needs to keep its line numbers right after an edit: every
