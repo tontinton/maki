@@ -86,8 +86,8 @@ const IS_PARKED_TEXT: &str = "true";
 const MOVED_HEADER: &str = "Still running in the background, each reports back as it finishes:";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
-const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
-const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.\n\n";
+const FOREGROUND_NOTE_HEAD: &str = "[Could not start in the background (";
+const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.]\n\n";
 const WAITING_ON_EDIT: &str = "batch is waiting on edit";
 const MARKDOWN_FORMAT: &str = "markdown";
 

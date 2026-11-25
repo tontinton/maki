@@ -63,7 +63,7 @@ const SECOND_CALL_ID: &str = "toolu_second";
 const MOVED_RECEIPT: &str = "Subagent parked";
 const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
 /// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
-const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
+const FOREGROUND_NOTE_HEAD: &str = "[Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
 
 const SCENARIO_PLAIN: &str = "plain";
