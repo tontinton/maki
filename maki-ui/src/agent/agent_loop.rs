@@ -279,6 +279,7 @@ impl AgentLoop {
             &hooks,
             &self.seed.config,
             compaction.instructions.as_deref(),
+            compaction.carry_turns,
             self.seed.timeouts.retry,
             compaction.reason,
             ledger,

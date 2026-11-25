@@ -1652,7 +1652,12 @@ impl<'t> EventLoop<'t> {
         for index in 0..self.sessions.len() {
             if let Some(request) = self.sessions[index].app.take_requested_compact() {
                 self.sessions[index].app.mark_compacting();
-                self.queue_compact(index, request.instructions, CompactReason::Requested);
+                self.queue_compact(
+                    index,
+                    request.instructions,
+                    request.carry_turns,
+                    CompactReason::Requested,
+                );
                 dirty = Dirty::YES;
             }
             let actions = self.sessions[index].app.start_woken_run();
@@ -1664,12 +1669,19 @@ impl<'t> EventLoop<'t> {
 
     /// Pushes a compaction to the queue, so a mid-run request lands at the
     /// run's next boundary instead of racing its history.
-    fn queue_compact(&mut self, idx: usize, instructions: Option<String>, reason: CompactReason) {
+    fn queue_compact(
+        &mut self,
+        idx: usize,
+        instructions: Option<String>,
+        carry_turns: usize,
+        reason: CompactReason,
+    ) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
         rt.handles.queue.push(QueueItem::Compact(Compaction {
             run_id: rt.app.run_id,
             instructions,
+            carry_turns,
             reason,
             workflow: rt.app.state.workflow,
         }));
@@ -2470,7 +2482,7 @@ impl<'t> EventLoop<'t> {
                 self.persist_tiers(model_registry::unset(&spec, tier));
             }
             Action::Compact(instructions) => {
-                self.queue_compact(idx, instructions, CompactReason::Manual);
+                self.queue_compact(idx, instructions, 0, CompactReason::Manual);
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {

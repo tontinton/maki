@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
 use maki_agent::session::{StoredSession, store_new};
-use maki_agent::{SessionMailbox, Transcript};
+use maki_agent::{CompactRequest, SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::StateDir;
@@ -1237,11 +1237,17 @@ async fn set_mode(
 ///     the `data.id` that `TurnComplete` reports.
 ///   instructions (string?) guidance for this one summary, like
 ///     `/compact <text>`.
+///   carry_turns (integer?) keep the newest `carry_turns` complete user
+///     turns verbatim instead of summarizing them. A turn runs from the
+///     user message through every tool call it answers, so the kept part
+///     never starts mid-turn, and at least one turn is always summarized.
+///     Defaults to 0, which summarizes all of it like `/compact`.
 /// @return (boolean|nil, string|nil) true once queued, or nil and an error.
 /// @example
 /// maki.session.request_compact({
 ///   session = ctx:session_id(),
 ///   instructions = "keep the failing test names",
+///   carry_turns = 4,
 /// })
 #[lua_fn(guard = [Agent, SessionWrite])]
 fn request_compact(_lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<bool>> {
@@ -1256,9 +1262,19 @@ fn request_compact(_lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<bool>> {
         .map(|t| t.opt::<String>("instructions"))
         .transpose()?
         .flatten();
+    let carry_turns = opts
+        .as_ref()
+        .map(|t| t.opt::<usize>("carry_turns"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(0);
+    let request = CompactRequest {
+        instructions,
+        carry_turns,
+    };
     let queued = match task {
-        Some(task) => SessionMailbox::request_compact_task(session_id, &task, instructions),
-        None => SessionMailbox::request_compact(session_id, instructions),
+        Some(task) => SessionMailbox::request_compact_task(session_id, &task, request),
+        None => SessionMailbox::request_compact(session_id, request),
     };
     match queued {
         Ok(()) => Ok((Some(true), None)),
@@ -1528,9 +1544,14 @@ mod tests {
         assert!(val);
     }
 
-    #[test_case(r#"return session.request_compact({ session = session_id, instructions = 'keep tests' })"#, Some(COMPACT_INSTRUCTIONS) ; "with_instructions")]
-    #[test_case("return session.request_compact({ session = session_id })", None ; "without_instructions")]
-    fn request_compact_queues_one_claimable_request(code: &str, expected: Option<&str>) {
+    #[test_case(r#"return session.request_compact({ session = session_id, instructions = 'keep tests' })"#, Some(COMPACT_INSTRUCTIONS), 0 ; "with_instructions")]
+    #[test_case("return session.request_compact({ session = session_id })", None, 0 ; "without_instructions")]
+    #[test_case("return session.request_compact({ session = session_id, carry_turns = 4 })", None, 4 ; "carrying_turns")]
+    fn request_compact_queues_one_claimable_request(
+        code: &str,
+        expected: Option<&str>,
+        expected_carry_turns: usize,
+    ) {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         let lua = lua_with_session(None);
@@ -1540,10 +1561,9 @@ mod tests {
 
         assert!(value);
         assert_eq!(error, None);
-        assert_eq!(
-            mailbox.take_compact().unwrap().instructions.as_deref(),
-            expected
-        );
+        let request = mailbox.take_compact().unwrap();
+        assert_eq!(request.instructions.as_deref(), expected);
+        assert_eq!(request.carry_turns, expected_carry_turns);
     }
 
     #[test]
@@ -1564,9 +1584,9 @@ mod tests {
         assert!(value);
         assert_eq!(error, None);
         assert!(
-            subagent
-                .take_compact()
-                .is_some_and(|request| request.instructions.is_none())
+            subagent.take_compact().is_some_and(|request| {
+                request.instructions.is_none() && request.carry_turns == 0
+            })
         );
         subagent.untrack_task(&task_id);
     }
@@ -1591,7 +1611,7 @@ mod tests {
     fn request_compact_rejects_a_second_request_while_pending() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        SessionMailbox::request_compact(id, None).unwrap();
+        SessionMailbox::request_compact(id, CompactRequest::default()).unwrap();
         let lua = lua_with_session(None);
         lua.globals().set("session_id", id.to_string()).unwrap();
 
