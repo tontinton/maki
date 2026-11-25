@@ -205,7 +205,7 @@ declare maki: {
     query: {
       parse: @checked (lang: string, query: string) -> (any),
       get: @checked (lang: string, name: string) -> (any),
-      set: @checked (lang: string, name: string, text: string) -> (),
+      set: @checked (lang: string, name: string, text: string) -> (boolean?, string?),
     },
   },
   ui: {

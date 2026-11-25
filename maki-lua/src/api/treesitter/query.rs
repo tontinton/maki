@@ -7,6 +7,7 @@ use mlua::{Lua, MultiValue, Value as LuaValue};
 use regex::Regex;
 use tree_sitter::{Language as TsLanguage, Query, QueryCursor, StreamingIterator};
 
+use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 
 use super::language::resolve_language;
@@ -14,6 +15,7 @@ use super::node::LuaNode;
 
 const HIGHLIGHTS_QUERY: &str = "highlights";
 const UNKNOWN_LANGUAGE: &str = "unknown language";
+const QUERY_PARSE_ERROR: &str = "query parse error";
 
 struct SetQuery {
     owner: Arc<str>,
@@ -148,17 +150,18 @@ lua_class! {
 /// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
 #[lua_fn]
 fn parse(_lua: &Lua, lang: String, query: String) -> mlua::Result<LuaQuery> {
-    let q = compile(&known_language(&lang)?, &query)?;
+    let q = known_language(&lang)
+        .and_then(|ts_lang| compile(&ts_lang, &query))
+        .map_err(mlua::Error::runtime)?;
     Ok(LuaQuery { inner: Arc::new(q) })
 }
 
-fn known_language(lang: &str) -> mlua::Result<TsLanguage> {
-    resolve_language(lang)
-        .ok_or_else(|| mlua::Error::runtime(format!("{UNKNOWN_LANGUAGE}: {lang}")))
+fn known_language(lang: &str) -> Result<TsLanguage, String> {
+    resolve_language(lang).ok_or_else(|| format!("{UNKNOWN_LANGUAGE}: {lang}"))
 }
 
-fn compile(ts_lang: &TsLanguage, query: &str) -> mlua::Result<Query> {
-    Query::new(ts_lang, query).map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))
+fn compile(ts_lang: &TsLanguage, query: &str) -> Result<Query, String> {
+    Query::new(ts_lang, query).map_err(|e| format!("{QUERY_PARSE_ERROR}: {e}"))
 }
 
 /// Looks up the query {name} for {lang} that `set()` gave it. There are no
@@ -180,11 +183,11 @@ fn get(_lua: &Lua, lang: String, name: String) -> mlua::Result<Option<LuaQuery>>
 /// Sets the query {name} for {lang} to {text}, like `vim.treesitter.query.set`.
 /// A `highlights` query makes code in {lang} highlight with tree-sitter instead
 /// of the built-in syntaxes, in chat code blocks and `maki.ui.highlight`.
-/// Throws if the language is unknown or the query has a syntax error.
 ///
 /// @param lang string Language name.
 /// @param name string Query name, e.g. `"highlights"`.
 /// @param text string Tree-sitter S-expression query.
+/// @return (boolean?, string?) `true`, or nil plus an error if {lang} is unknown or the query has a syntax error.
 /// @example
 /// maki.treesitter.language.add("nu", { path = "~/.local/share/nvim/site/parser/nu.so" })
 /// local text = assert(maki.fs.read("~/.local/share/nvim/site/queries/nu/highlights.scm"))
@@ -196,9 +199,9 @@ fn set(
     lang: String,
     name: String,
     text: String,
-) -> mlua::Result<()> {
-    let ts_lang = known_language(&lang)?;
-    let query = Arc::new(compile(&ts_lang, &text)?);
+) -> mlua::Result<Pair<bool>> {
+    let ts_lang = try_pair!(known_language(&lang));
+    let query = Arc::new(try_pair!(compile(&ts_lang, &text)));
     if name == HIGHLIGHTS_QUERY {
         maki_highlight::treesitter::register(&plugin, &lang, ts_lang, Arc::clone(&query));
     }
@@ -212,7 +215,7 @@ fn set(
                 query,
             },
         );
-    Ok(())
+    Ok((Some(true), None))
 }
 
 pub(crate) fn forget_plugin_queries(plugin: &str) {
@@ -439,6 +442,7 @@ fn lua_to_usize(v: LuaValue) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use mlua::{Lua, Table};
+    use test_case::test_case;
 
     use super::*;
 
@@ -458,12 +462,16 @@ mod tests {
         create_query_module(lua, Arc::from(plugin)).unwrap()
     }
 
-    fn set_query(query: &Table, name: &str) {
+    fn call_set(query: &Table, lang: &str, name: &str, text: &str) -> Pair<bool> {
         query
             .get::<mlua::Function>("set")
             .unwrap()
-            .call::<()>((LANG, name, FOLDS_QUERY))
-            .unwrap();
+            .call((lang, name, text))
+            .unwrap()
+    }
+
+    fn set_query(query: &Table, name: &str) {
+        assert_eq!(call_set(query, LANG, name, FOLDS_QUERY), (Some(true), None));
     }
 
     fn get_query(query: &Table, name: &str) -> Option<mlua::AnyUserData> {
@@ -496,14 +504,13 @@ mod tests {
         assert!(get_query(&other, LOCALS).is_none());
     }
 
-    #[test]
-    fn set_rejects_an_unknown_language() {
+    #[test_case("cobol", FOLDS_QUERY, UNKNOWN_LANGUAGE ; "unknown_language")]
+    #[test_case(LANG, "(no_such_node) @x", QUERY_PARSE_ERROR ; "invalid_query")]
+    fn set_answers_an_error_instead_of_throwing(lang: &str, text: &str, expected: &str) {
         let lua = Lua::new();
-        let err = query_module(&lua)
-            .get::<mlua::Function>("set")
-            .unwrap()
-            .call::<()>(("cobol", HIGHLIGHTS_QUERY, FOLDS_QUERY))
-            .unwrap_err();
-        assert!(err.to_string().contains(UNKNOWN_LANGUAGE), "{err}");
+        let (ok, err) = call_set(&query_module(&lua), lang, HIGHLIGHTS_QUERY, text);
+        assert_eq!(ok, None);
+        let err = err.unwrap();
+        assert!(err.contains(expected), "{err}");
     }
 }

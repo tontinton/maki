@@ -6896,13 +6896,14 @@ maki.treesitter.query.set({lang}, {name}, {text})
 Sets the query {name} for {lang} to {text}, like `vim.treesitter.query.set`.
 A `highlights` query makes code in {lang} highlight with tree-sitter instead
 of the built-in syntaxes, in chat code blocks and `maki.ui.highlight`.
-Throws if the language is unknown or the query has a syntax error.
 
 **Parameters:**
 
 - `{lang}` (`string`) Language name.
 - `{name}` (`string`) Query name, e.g. `"highlights"`.
 - `{text}` (`string`) Tree-sitter S-expression query.
+
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error if {lang} is unknown or the query has a syntax error.
 
 **Example:**
 
