@@ -147,7 +147,7 @@ The batch receipt gives each running subagent its own task id. Each subagent's r
 | Subagent id | That subagent | That subagent |
 | Batch id | Every subagent still running in the batch | The whole batch |
 
-If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
+If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `[Could not start in the background (<reason>). Ran in the foreground.]`
 
 ### Move a slow command instead of killing it
 
