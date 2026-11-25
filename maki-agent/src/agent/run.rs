@@ -787,7 +787,7 @@ impl<'h> Agent<'h> {
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+            } else if self.recover_stalled_turn(response.message.content)? {
                 return Ok(TurnOutcome::Continue);
             }
 
@@ -1097,12 +1097,12 @@ impl<'h> Agent<'h> {
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
     /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    fn recover_stalled_turn(&mut self, content: Vec<ContentBlock>) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = !self.moved_last_round
             && nudges < MAX_NUDGES
             && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
+        self.history.push(Message::empty_marker(content));
         if !nudge {
             return Ok(false);
         }
@@ -4626,6 +4626,31 @@ mod tests {
             "history holds a message no provider will accept: {:?}",
             history.as_slice()
         );
+    }
+
+    /// Signed thinking must go back as it came, so a turn of nothing else
+    /// keeps it in front of the marker instead of losing it.
+    #[tokio::test]
+    async fn stalled_turn_keeps_its_signed_thinking() {
+        let signed = ContentBlock::Thinking {
+            thinking: THOUGHT.into(),
+            signature: Some(THOUGHT_SIGNATURE.into()),
+            reasoning_id: None,
+        };
+        let provider = MockProvider::new(vec![
+            tool_call_response("glob", "t1"),
+            assistant_response(vec![signed.clone()]),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        let requests = requests.lock().unwrap();
+        assert_append_only(&requests[1], &requests[2]);
+        assert_eq!(requests[2].thinking(), [signed]);
     }
 
     /// Pins the regression where a stale nudge counter made a follow-up
