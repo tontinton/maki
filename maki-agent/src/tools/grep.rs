@@ -8,6 +8,7 @@ use grep_searcher::Searcher;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
 use ignore::WalkState;
+use regex::bytes::Regex;
 use tracing::debug;
 
 use super::{mtime, resolve_search_path, truncate_bytes, walk_builder};
@@ -24,6 +25,8 @@ pub struct GrepParams {
     pub pattern: String,
     pub path: Option<String>,
     pub include: Option<String>,
+    /// A match is dropped when this regex matches its text.
+    pub exclude: Option<String>,
     pub context_before: usize,
     pub context_after: usize,
     pub limit: usize,
@@ -36,6 +39,7 @@ impl GrepParams {
             pattern,
             path: None,
             include: None,
+            exclude: None,
             context_before: 0,
             context_after: 0,
             limit: 100,
@@ -71,13 +75,14 @@ pub struct GrepFileCount {
 /// The hits come back newest file first, with paths relative to the base.
 fn search_files<T: Send>(
     params: &GrepParams,
-    search_file: impl Fn(&mut Searcher, &RegexMatcher, &Path) -> Option<T> + Sync,
+    search_file: impl Fn(&mut Searcher, &RegexMatcher, Option<&Regex>, &Path) -> Option<T> + Sync,
 ) -> Result<(PathBuf, Vec<(String, T)>), String> {
     let search_path = resolve_search_path(params.path.as_deref())?;
     let is_multiline = needs_multiline(&params.pattern);
     debug!(
         pattern = %params.pattern,
         include = ?params.include,
+        exclude = ?params.exclude,
         path = %search_path,
         context_before = params.context_before,
         context_after = params.context_after,
@@ -92,6 +97,13 @@ fn search_files<T: Send>(
             .or_else(|_| RegexMatcher::new(&params.pattern))
             .map_err(|e| format!("{INVALID_REGEX}: {e}"))?
     };
+
+    let exclude = params
+        .exclude
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(|e| format!("{INVALID_REGEX}: {e}"))?;
 
     let patterns: Vec<&str> = params.include.as_deref().into_iter().collect();
     let walker = walk_builder(&search_path, &patterns)?;
@@ -118,6 +130,7 @@ fn search_files<T: Send>(
 
     walker.build_parallel().run({
         let (hits, matcher, search_file) = (&hits, &matcher, &search_file);
+        let exclude = exclude.as_ref();
         move || {
             let mut searcher = builder.build();
             Box::new(move |entry| {
@@ -129,7 +142,7 @@ fn search_files<T: Send>(
                     return WalkState::Continue;
                 }
                 let path = entry.into_path();
-                if let Some(hit) = search_file(&mut searcher, matcher, &path) {
+                if let Some(hit) = search_file(&mut searcher, matcher, exclude, &path) {
                     let rel = path
                         .strip_prefix(base)
                         .unwrap_or(&path)
@@ -152,10 +165,10 @@ fn search_files<T: Send>(
 /// Counts the matching lines of each file instead of collecting them.
 /// Blocking — caller must run on a thread pool.
 pub fn grep_count(params: &GrepParams) -> Result<Vec<GrepFileCount>, String> {
-    let (base, hits) = search_files(params, |searcher, matcher, path| {
-        let mut sink = CountSink(0);
+    let (base, hits) = search_files(params, |searcher, matcher, exclude, path| {
+        let mut sink = CountSink { count: 0, exclude };
         let _ = searcher.search_path(matcher, path, &mut sink);
-        (sink.0 > 0).then_some(sink.0)
+        (sink.count > 0).then_some(sink.count)
     })?;
     Ok(hits
         .into_iter()
@@ -168,15 +181,17 @@ pub fn grep_count(params: &GrepParams) -> Result<Vec<GrepFileCount>, String> {
 
 /// Core grep logic. Blocking — caller must run on a thread pool.
 pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
-    let has_context = params.context_before > 0 || params.context_after > 0;
+    let (context_before, context_after) = (params.context_before, params.context_after);
     let max_line_bytes = params.max_line_bytes;
-    let (base, hits) = search_files(&params, |searcher, matcher, path| {
+    let (base, hits) = search_files(&params, |searcher, matcher, exclude, path| {
         let mut groups = Vec::new();
         let mut sink = GrepSink {
             groups: &mut groups,
             current_group: Vec::new(),
             max_line_bytes,
-            has_context,
+            context_before,
+            context_after,
+            exclude,
         };
         let _ = searcher.search_path(matcher, path, &mut sink);
         (!groups.is_empty()).then_some(groups)
@@ -209,13 +224,24 @@ pub fn grep_search(params: GrepParams) -> Result<GrepResults, String> {
     })
 }
 
-struct CountSink(usize);
+fn is_excluded(exclude: Option<&Regex>, bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    exclude.is_some_and(|regex| regex.is_match(bytes))
+}
 
-impl Sink for CountSink {
+struct CountSink<'a> {
+    count: usize,
+    exclude: Option<&'a Regex>,
+}
+
+impl Sink for CountSink<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
-        self.0 += mat.lines().count();
+        if !is_excluded(self.exclude, mat.bytes()) {
+            self.count += mat.lines().count();
+        }
         Ok(true)
     }
 }
@@ -224,15 +250,53 @@ struct GrepSink<'a> {
     groups: &'a mut Vec<GrepMatchGroup>,
     current_group: Vec<GrepLine>,
     max_line_bytes: usize,
-    has_context: bool,
+    context_before: usize,
+    context_after: usize,
+    exclude: Option<&'a Regex>,
 }
 
 impl GrepSink<'_> {
+    fn has_context(&self) -> bool {
+        self.context_before > 0 || self.context_after > 0
+    }
+
+    /// The searcher gives an excluded match its context too, so only the
+    /// lines within reach of a match that stays are kept.
     fn flush(&mut self) {
-        if !self.current_group.is_empty() {
-            self.groups.push(GrepMatchGroup {
-                lines: std::mem::take(&mut self.current_group),
-            });
+        let lines = std::mem::take(&mut self.current_group);
+        if self.exclude.is_none() {
+            if !lines.is_empty() {
+                self.groups.push(GrepMatchGroup { lines });
+            }
+            return;
+        }
+        let matches: Vec<usize> = lines
+            .iter()
+            .filter(|line| line.is_match)
+            .map(|line| line.line_nr)
+            .collect();
+        let mut upcoming = 0;
+        let mut group = Vec::new();
+        for line in lines {
+            while matches
+                .get(upcoming)
+                .is_some_and(|&nr| nr + self.context_after < line.line_nr)
+            {
+                upcoming += 1;
+            }
+            let in_reach = matches
+                .get(upcoming)
+                .is_some_and(|&nr| line.line_nr + self.context_before >= nr);
+            if in_reach {
+                group.push(line);
+            } else if !group.is_empty() {
+                self.groups.push(GrepMatchGroup {
+                    lines: std::mem::take(&mut group),
+                });
+            }
+        }
+        if !group.is_empty() {
+            self.groups.push(GrepMatchGroup { lines: group });
         }
     }
 
@@ -256,12 +320,16 @@ impl Sink for GrepSink<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
-        if !self.has_context {
+        let is_match = !is_excluded(self.exclude, mat.bytes());
+        if !self.has_context() {
             self.flush();
+            if !is_match {
+                return Ok(true);
+            }
         }
         let start_line = mat.line_number().unwrap_or(1);
         for (i, line) in mat.lines().enumerate() {
-            self.push_line(line, start_line + i as u64, true);
+            self.push_line(line, start_line + i as u64, is_match);
         }
         Ok(true)
     }
@@ -312,7 +380,9 @@ mod tests {
             groups: &mut groups,
             current_group: Vec::new(),
             max_line_bytes,
-            has_context: true,
+            context_before: 1,
+            context_after: 1,
+            exclude: None,
         };
         sink.push_line(TEST_LINE, 2, true);
         sink.push_line(TEST_LINE, 3, false);
@@ -323,9 +393,16 @@ mod tests {
         assert_eq!(lines[1].text, expected);
     }
 
-    #[test_case(None, &[("one.rs", 1), ("two.txt", 2)] ; "every_file_with_a_match")]
-    #[test_case(Some("*.txt"), &[("two.txt", 2)] ; "only_included_files")]
-    fn count_lists_matching_lines_per_file(include: Option<&str>, expected: &[(&str, usize)]) {
+    #[test_case(None, None, &[("one.rs", 1), ("two.txt", 2)] ; "every_file_with_a_match")]
+    #[test_case(Some("*.txt"), None, &[("two.txt", 2)] ; "only_included_files")]
+    #[test_case(Some("!*.txt"), None, &[("one.rs", 1)] ; "negated_include")]
+    #[test_case(None, Some("txt"), &[("one.rs", 1), ("two.txt", 2)] ; "exclude_ignores_paths")]
+    #[test_case(None, Some("needle needle"), &[("one.rs", 1), ("two.txt", 1)] ; "excluded_line")]
+    fn count_lists_matching_lines_per_file(
+        include: Option<&str>,
+        exclude: Option<&str>,
+        expected: &[(&str, usize)],
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("one.rs"), "needle\nhay\n").unwrap();
         std::fs::write(dir.path().join("two.txt"), "needle needle\nhay\nneedle\n").unwrap();
@@ -333,6 +410,7 @@ mod tests {
         let params = GrepParams {
             path: Some(dir.path().to_string_lossy().into_owned()),
             include: include.map(str::to_owned),
+            exclude: exclude.map(str::to_owned),
             ..GrepParams::new(NEEDLE.into())
         };
 
@@ -348,5 +426,49 @@ mod tests {
             .map(|&(name, matches)| (name.into(), matches))
             .collect();
         assert_eq!(counts, expected);
+    }
+
+    #[test_case(0, &[&[(1, true)], &[(5, true)]] ; "without_context")]
+    #[test_case(1, &[&[(1, true), (2, false)], &[(4, false), (5, true), (6, false)]] ; "excluded_line_stays_as_context")]
+    fn search_drops_excluded_matches(context: usize, expected: &[&[(usize, bool)]]) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "needle\n// needle\nhay\n// needle\nneedle end\n\n\n// needle\n",
+        )
+        .unwrap();
+        let params = GrepParams {
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            exclude: Some(r"^\s*//".into()),
+            context_before: context,
+            context_after: context,
+            ..GrepParams::new(NEEDLE.into())
+        };
+
+        let results = grep_search(params).unwrap();
+        let [entry] = &results.entries[..] else {
+            panic!("expected one file, got {:?}", results.entries);
+        };
+        let groups: Vec<Vec<_>> = entry
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .lines
+                    .iter()
+                    .map(|l| (l.line_nr, l.is_match))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(groups, expected);
+    }
+
+    #[test]
+    fn invalid_exclude_is_reported() {
+        let params = GrepParams {
+            exclude: Some("(".into()),
+            ..GrepParams::new(NEEDLE.into())
+        };
+        assert!(grep_search(params).unwrap_err().starts_with(INVALID_REGEX));
     }
 }
