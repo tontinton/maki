@@ -2483,6 +2483,69 @@ fn agent_error() -> AgentEvent {
 
 /// A plugin task is a chat like a tool task, but routed by id: `chat_index`
 /// is the running turn's map, and the main chat is idle here.
+/// A plugin fan-out: the first session a call opens inherits the call id, so
+/// its row is the call's own; a later sibling arrives under a fresh id with
+/// the call as its parent. Closing the sibling settles only its row, and the
+/// call's row keeps running until its own end.
+#[test]
+fn a_fanout_sibling_closes_without_settling_the_call_row() {
+    let mut app = test_app();
+    let call_id = "toolu_call";
+    let mut first = subagent_info(call_id, "specialist:review");
+    first.prompt = Some("go".into());
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: Some(first),
+            run_id: 0,
+        },
+        None,
+    );
+    let mut sibling = subagent_info("session-second", "other:review");
+    sibling.prompt = Some("go too".into());
+    sibling.parent_call = Some(call_id.into());
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "y".into() },
+            subagent: Some(sibling.clone()),
+            run_id: 0,
+        },
+        None,
+    );
+    assert_eq!(app.chats.len(), 3);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+
+    // The sibling's run ends and its session reports its transcript: only
+    // its row settles, the call's stays working.
+    app.deliver(
+        Envelope {
+            event: monitor_turn(),
+            subagent: Some(sibling),
+            run_id: 0,
+        },
+        None,
+    );
+    app.deliver(
+        Envelope {
+            event: AgentEvent::SubagentHistory {
+                tool_use_id: "session-second".into(),
+                messages: Vec::new(),
+            },
+            subagent: None,
+            run_id: 0,
+        },
+        None,
+    );
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Done);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+
+    // The call's row stays working: only its own end may settle it, which
+    // the run-end sweep owns.
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats.len(), 3);
+}
+
 #[test]
 fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
     let app = app_with_plugin_task();

@@ -1048,6 +1048,7 @@ async fn session(
     ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
+    let is_handler = matches!(&ctx, LuaEither::Left(ctx) if ctx.is_handler());
     let (agent_ctx, opts, owner) = match ctx {
         LuaEither::Left(ctx) => (
             try_pair!(dispatch_ctx(&ctx, "session")).clone(),
@@ -1189,13 +1190,34 @@ async fn session(
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (done_tx, done_rx) = unbounded_channel();
-    // Doubles as the task id tools see. The fallback gets its own id: it keys
-    // `subagent_cancels`, where two subagents sharing the session id would
-    // collide.
-    let ui_id = agent_ctx
-        .tool_use_id
-        .clone()
-        .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    // Doubles as the task id tools see. The call's own handler session, the
+    // first one it opens, inherits the call id: the task tool and every
+    // single-session plugin keep the 1:1 row the call already shows. Every
+    // later session under the same call, and any nested one, gets a fresh id
+    // instead, so a fan-out cannot collapse into that one row. A permission
+    // prompt runs before the handler, so its sessions never inherit; without
+    // a call the fallback keeps today's ids. It also keys `subagent_cancels`,
+    // where two subagents sharing the id would collide.
+    let ui_id = match (
+        &owner,
+        agent_ctx.call.as_ref(),
+        agent_ctx.tool_use_id.as_deref(),
+    ) {
+        (None, Some(call), Some(tool_use_id)) if is_handler && tool_use_id == call.id() => {
+            if call.claim_session_id() {
+                call.id().to_owned()
+            } else {
+                format!("session-{}", MakiId::generate())
+            }
+        }
+        // A prompt layer shares the call but is not its handler: its sessions
+        // are never the call's task, or the handler's own would be demoted.
+        (None, Some(_), Some(_)) if !is_handler => format!("session-{}", MakiId::generate()),
+        _ => agent_ctx
+            .tool_use_id
+            .clone()
+            .unwrap_or_else(|| format!("session-{}", MakiId::generate())),
+    };
     let name = name.unwrap_or_default();
     let registry = BackgroundTasks::of(&lua);
     let ui = host_ui(&lua);
@@ -2373,6 +2395,75 @@ mod tests {
         .unwrap();
         assert!(error.is_none(), "{error:?}");
         session.unwrap()
+    }
+
+    /// The first session a call's handler opens inherits the call's id, like
+    /// the built-in task tool; every later one gets a fresh id, so a fan-out
+    /// cannot collapse into the call's one `/tasks` row. Cancelling one
+    /// leaves the other alone.
+    #[tokio::test]
+    async fn the_first_session_of_a_call_inherits_its_id() {
+        let lua = Lua::new();
+        let (run_trigger, run) = CancelToken::new();
+        let (ctx, call) = call_ctx(&run, Some(CALL_ID));
+        let first = native_session(&lua, &ctx).await;
+        let second = native_session(&lua, &ctx).await;
+        assert_eq!(session_ui_id(&first), CALL_ID);
+        assert_ne!(session_ui_id(&second), CALL_ID);
+
+        ctx.subagent_cancels.cancel(CALL_ID.to_owned());
+        assert!(session_cancelled(&first));
+        assert!(!session_cancelled(&second));
+        drop(call);
+        run_trigger.cancel();
+    }
+
+    /// A nested session (no tool id of its own, sharing the outer call) never
+    /// inherits the call id and never burns the claim: the outer handler's
+    /// own session still takes it afterwards, under the same call.
+    #[tokio::test]
+    async fn a_nested_session_keeps_the_call_id_for_the_handler() {
+        let lua = Lua::new();
+        let (run_trigger, run) = CancelToken::new();
+        let (mut ctx, call) = call_ctx(&run, Some(CALL_ID));
+        ctx.tool_use_id = None;
+        let nested = native_session(&lua, &ctx).await;
+        assert_ne!(session_ui_id(&nested), CALL_ID);
+
+        ctx.tool_use_id = Some(CALL_ID.into());
+        let direct = native_session(&lua, &ctx).await;
+        assert_eq!(session_ui_id(&direct), CALL_ID);
+        drop(call);
+        run_trigger.cancel();
+    }
+
+    /// A permission prompt layer runs before the handler under the same call:
+    /// its session must not take the call id, or the handler's own session
+    /// would be demoted to a fresh id.
+    #[tokio::test]
+    async fn a_permission_prompt_session_never_inherits_the_call_id() {
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let (run_trigger, run) = CancelToken::new();
+        let (ctx, call) = call_ctx(&run, Some(CALL_ID));
+        let prompt_ctx = lua.create_userdata(LuaCtx::prompt(&ctx)).unwrap();
+        let (prompt_sess, error) = session(
+            lua.clone(),
+            Arc::from(PLUGIN),
+            PluginPermissions::trusted(),
+            LuaEither::Left(prompt_ctx.borrow().unwrap()),
+            Some(lua.create_table().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let prompt_sess = prompt_sess.unwrap();
+        assert_ne!(session_ui_id(&prompt_sess), CALL_ID);
+
+        let handler_sess = native_session(&lua, &ctx).await;
+        assert_eq!(session_ui_id(&handler_sess), CALL_ID);
+        drop(call);
+        run_trigger.cancel();
     }
 
     #[test_case(false ; "close")]

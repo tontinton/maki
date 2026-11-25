@@ -151,7 +151,7 @@ impl ToolHook for SlotHook {
                     "input": input,
                     "scopes": scopes,
                 }),
-                ctx: Box::new(LuaCtx::handler(ctx)),
+                ctx: Box::new(LuaCtx::prompt(ctx)),
             };
             self.tx.send(Request::RunPrompt { run, reply }).ok()?;
             answer.await.ok().flatten()
