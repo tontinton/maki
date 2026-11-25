@@ -55,7 +55,7 @@ maki.setup({
 ```
 
 ```
-Use dedicated tools for files, not bash: the grep tool instead of grep.
+[Use dedicated tools for files, not bash: the grep tool instead of grep.]
 ```
 
 The command still runs. The same line shows dimmed under its output, so you see what the model was told. Only a plain command that a tool fully replaces gets the note. A pipe such as `cargo test | tail`, a redirect into a file, a here-document or a flag the tool has no match for gets none. The option is off by default.

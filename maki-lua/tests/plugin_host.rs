@@ -9530,7 +9530,7 @@ maki.api.register_tool({
     );
 }
 
-const FILE_TOOL_NOTE_HEAD: &str = "Use dedicated tools for files, not bash: ";
+const FILE_TOOL_NOTE_HEAD: &str = "[Use dedicated tools for files, not bash: ";
 const FILE_TOOL_NOTE_OPTION: &str = "file_tool_note";
 
 fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig)) -> String {
@@ -9552,7 +9552,7 @@ fn bash_reply(command: &str, config: impl FnOnce(&mut maki_config::AgentConfig))
 fn file_tool_note(reply: &str) -> Option<&str> {
     reply
         .strip_prefix(FILE_TOOL_NOTE_HEAD)
-        .and_then(|rest| rest.split_once(".\n"))
+        .and_then(|rest| rest.split_once(".]"))
         .map(|(items, _)| items)
 }
 
