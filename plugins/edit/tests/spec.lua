@@ -22,6 +22,11 @@ case("trimmed_boundary", function()
   has(result, R)
 end)
 
+case("boundary_trimmed_edits_keep_their_indentation", function()
+  local result = fr.replace("foo:\n  bar\nbaz", "\nfoo:\n  bar\n", "\nfoo:\n  qux\n", false)
+  eq(result, "\nfoo:\n  qux\n\nbaz")
+end)
+
 case("different_indentation", function()
   local result = fr.replace("    fn f() {\n        bar();\n    }", "fn f() {\n    bar();\n}", R, false)
   has(result, R)
@@ -158,20 +163,20 @@ case("escaped_tab", function()
   has(result, R)
 end)
 
-case("block_anchor_fuzzy_middle", function()
-  local result = fr.replace(
+case("a_middle_that_is_half_stale_is_no_match", function()
+  local _, err = fr.replace(
     "fn test() {\n    let x = 1;\n    let y = 2;\n}",
     "fn test() {\n    let x = 99;\n    let y = 2;\n}",
     R,
     false
   )
-  has(result, R)
+  eq(err, NO_MATCH)
 end)
 
 case("context_aware_partial_middle", function()
   local result = fr.replace(
-    "fn h() {\n    validate();\n    process();\n    save();\n    respond();\n}",
-    "fn h() {\n    validate();\n    WRONG();\n    save();\n    respond();\n}",
+    "fn h() {\n    validate();\n    process();\n    save();\n    log();\n    respond();\n}",
+    "fn h() {\n    validate();\n    WRONG();\n    save();\n    log();\n    respond();\n}",
     R,
     false
   )
@@ -190,7 +195,7 @@ case("ambiguous_multiple_matches", function()
   eq(err, MULTIPLE_MATCHES)
 end)
 
-case("block_anchor_picks_best_among_multiple", function()
+case("context_aware_skips_the_span_with_a_stale_middle", function()
   local content = "fn a() {\n    unrelated();\n}\nfn a() {\n    target();\n}"
   local result = fr.replace(content, "fn a() {\n    target();\n}", R, false)
   has(result, R)
@@ -208,16 +213,51 @@ case("strip_common_indent_skips_blank_lines", function()
   has(result, R)
 end)
 
-case("block_anchor_no_panic_short_content", function()
+case("content_shorter_than_the_old_string_is_no_match", function()
   local search = "fn test() {\n    body();\n}"
   for _, content in ipairs({
     "aaa\nbbb\nccc\nfn test() {",
     "fn test() {",
     "fn test() {\n}",
   }) do
-    local result = fr.replace(content, search, "x", false)
+    local result, err = fr.replace(content, search, "x", false)
     eq(result, nil)
+    eq(err, NO_MATCH)
   end
+end)
+
+-- A stale old_string whose last line is a lone `}` used to anchor onto the
+-- first `}` after its first line, splicing the whole new_string into that
+-- short span and leaving the block's tail duplicated behind.
+case("a_stale_block_end_does_not_anchor_a_shorter_span", function()
+  local content = table.concat({
+    "impl Widget {",
+    "    fn tick(&mut self) {",
+    "        let counter = self.ticks;",
+    "        if counter > 0 {",
+    "            return;",
+    "        }",
+    "        self.turn(counter);",
+    "    }",
+    "}",
+    "",
+  }, "\n")
+  local search = table.concat({
+    "    fn tick(&mut self) {",
+    "        let counter = self.ticks;",
+    "        if counter > 0 {",
+    "            return;",
+    "        }",
+    "        self.turn(counter + self.spool());",
+    "    }",
+    "",
+    "    fn stop(&mut self) {",
+    "        self.motor.halt();",
+    "    }",
+  }, "\n")
+  local result, err = fr.replace(content, search, R, false)
+  eq(result, nil)
+  eq(err, NO_MATCH)
 end)
 
 case("escape_normalized_also_fixes_new_string", function()

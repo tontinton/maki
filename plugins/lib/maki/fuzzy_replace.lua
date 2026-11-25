@@ -4,10 +4,9 @@ M.NO_MATCH = "old_string not found in file"
 M.MULTIPLE_MATCHES = "old_string matches multiple locations; add surrounding context to make it unique"
 M.EMPTY_OLD_STRING = "old_string must not be empty"
 
-local SINGLE_CANDIDATE_THRESHOLD = 0.0
-local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
-local CONTEXT_AWARE_MATCH_RATIO = 0.5
+-- Half a stale middle was license to overwrite the other half of the block.
+local CONTEXT_AWARE_MATCH_RATIO = 0.8
 local INDENT_PATTERN = "^[ \t]*"
 local DEDENT_PATTERN = "^%s*(.*)"
 local UNICODE_SPACE_LEAD_BYTES = "[\194\225\226\227]"
@@ -74,8 +73,8 @@ end
 
 -- Only `old_string` was ever checked against the file, so the drift between the
 -- two is the sole evidence of what the matcher forgave. Positions correspond
--- when the line counts agree, which every matcher but `block_anchor` guarantees;
--- otherwise only lines whose content agrees are the same line.
+-- when the line counts agree. A boundary-trimmed match is offset by the blank
+-- lines it dropped, so there only lines whose content agrees are the same line.
 local function indent_drift(matched, find)
   local file_lines, model_lines = split_lines(matched), split_lines(find)
   local paired_by_position = #file_lines == #model_lines
@@ -278,51 +277,6 @@ local function strip_common_indent(lines)
   return table.concat(result, "\n")
 end
 
-local function codepoints(s)
-  local cps = {}
-  for _, cp in utf8.codes(s) do
-    cps[#cps + 1] = cp
-  end
-  return cps
-end
-
-local function levenshtein(a, b)
-  local a_cps = codepoints(a)
-  local b_cps = codepoints(b)
-  local a_len = #a_cps
-  local b_len = #b_cps
-  if a_len == 0 then
-    return b_len
-  end
-  if b_len == 0 then
-    return a_len
-  end
-
-  local prev = {}
-  for j = 0, b_len do
-    prev[j] = j
-  end
-  local curr = {}
-
-  for i = 1, a_len do
-    curr[0] = i
-    local ca = a_cps[i]
-    for j = 1, b_len do
-      local cost = (ca == b_cps[j]) and 0 or 1
-      local ins = prev[j] + 1
-      local del = curr[j - 1] + 1
-      local sub = prev[j - 1] + cost
-      if ins < del then
-        curr[j] = ins < sub and ins or sub
-      else
-        curr[j] = del < sub and del or sub
-      end
-    end
-    prev, curr = curr, prev
-  end
-  return prev[b_len]
-end
-
 local function substring_whitespace_match(line, normalized_line, normalized_find)
   if not normalized_line:find(normalized_find, 1, true) or normalized_line == normalized_find then
     return nil
@@ -343,28 +297,6 @@ local function substring_whitespace_match(line, normalized_line, normalized_find
     return line:sub(s, e)
   end
   return nil
-end
-
-local function middle_similarity(block, search)
-  local block_mid = math.max(0, #block - 2)
-  local search_mid = math.max(0, #search - 2)
-  local lines_to_check = math.min(block_mid, search_mid)
-  if lines_to_check == 0 then
-    return 1.0
-  end
-
-  local total = 0
-  for j = 1, lines_to_check do
-    local a = trim(block[j + 1])
-    local b = trim(search[j + 1])
-    local max_len = math.max(utf8.len(a) or #a, utf8.len(b) or #b)
-    if max_len == 0 then
-      total = total + 1.0
-    else
-      total = total + (1.0 - levenshtein(a, b) / max_len)
-    end
-  end
-  return total / lines_to_check
 end
 
 local function exact(_content, find)
@@ -443,67 +375,6 @@ local function trimmed_boundary(content, find)
     end
   end
   return results
-end
-
-local function block_anchor(content, find)
-  local content_lines = split_lines(content)
-  local search_lines = split_lines(find)
-  if #search_lines > 0 and search_lines[#search_lines] == "" then
-    search_lines[#search_lines] = nil
-  end
-  if #search_lines < CONTEXT_AWARE_LINE_MIN then
-    return {}
-  end
-
-  local first_trimmed = trim(search_lines[1])
-  local last_trimmed = trim(search_lines[#search_lines])
-
-  local trimmed = {}
-  for i, line in ipairs(content_lines) do
-    trimmed[i] = trim(line)
-  end
-  local next_last = {}
-  for i = #content_lines, 1, -1 do
-    next_last[i] = trimmed[i] == last_trimmed and i or next_last[i + 1]
-  end
-
-  local candidates = {}
-  for i = 1, #content_lines do
-    local j = trimmed[i] == first_trimmed and next_last[i + 2]
-    if j then
-      candidates[#candidates + 1] = { i, j }
-    end
-  end
-
-  if #candidates == 0 then
-    return {}
-  end
-
-  if #candidates == 1 then
-    local c = candidates[1]
-    local count = c[2] - c[1] + 1
-    local block = table_slice(content_lines, c[1], count)
-    local sim = middle_similarity(block, search_lines)
-    if sim >= SINGLE_CANDIDATE_THRESHOLD then
-      return { table.concat(block, "\n") }
-    end
-    return {}
-  end
-
-  local best_block, best_sim = nil, -1.0
-  for _, c in ipairs(candidates) do
-    local count = c[2] - c[1] + 1
-    local block = table_slice(content_lines, c[1], count)
-    local sim = middle_similarity(block, search_lines)
-    if sim > best_sim then
-      best_block, best_sim = block, sim
-    end
-  end
-
-  if best_sim >= MULTI_CANDIDATE_THRESHOLD then
-    return { table.concat(best_block, "\n") }
-  end
-  return {}
 end
 
 local function whitespace_normalized(content, find)
@@ -599,7 +470,7 @@ local function context_aware(content, find)
   return results
 end
 
-local REPLACERS = { exact, line_trimmed, block_anchor, whitespace_normalized, indentation_flexible }
+local REPLACERS = { exact, line_trimmed, whitespace_normalized, indentation_flexible }
 local LATE_REPLACERS = { trimmed_boundary, context_aware }
 
 -- An empty candidate matches at every offset and would splice forever, so it
