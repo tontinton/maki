@@ -87,6 +87,10 @@ local FILE_TOOLS = {
   },
   ls = { tool = "list", flags = { ["-a"] = true, ["-A"] = true, ["-1"] = true } },
 }
+-- `rg x | head -20` is a search with a limit, which these tools take
+-- themselves.
+local TOOLS_WITH_LIMIT = { read = true, grep = true }
+local HEAD_SINK_PATTERNS = { "^head$", "^head%s+%-n%s*%d+$", "^head%s+%-%d+$" }
 local FLAG_PATTERN = "%s(%-%-?%w[%w%-]*)"
 local SHORT_FLAGS_PATTERN = "^%-(%w+)$"
 local WRITES_FILE_PATTERN = ">>?%s*[^&%s]"
@@ -380,24 +384,54 @@ local function file_tool_for(name, text)
   return spec.tool
 end
 
+local function file_tool_use(command, source)
+  local name_node = command:field("name")[1]
+  local name = name_node and node_text(name_node, source)
+  local tool = name and file_tool_for(name, node_text(command, source))
+  return tool and { tool = tool, command = name }
+end
+
+local function head_limited_command(pipeline, source)
+  local commands = {}
+  for child in pipeline:iter_children() do
+    if child:named() then
+      commands[#commands + 1] = child
+    end
+  end
+  if #commands ~= 2 or commands[1]:type() ~= "command" or commands[2]:type() ~= "command" then
+    return nil
+  end
+  local sink = node_text(commands[2], source)
+  for _, pattern in ipairs(HEAD_SINK_PATTERNS) do
+    if sink:match(pattern) then
+      return commands[1]
+    end
+  end
+  return nil
+end
+
 -- Only a plain command that reads files counts. In a pipe the other side
--- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), and
--- block forms and substitutions are scripting.
+-- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), bar a
+-- `head` that only cuts the output. Block forms and substitutions are
+-- scripting.
 local function collect_file_tool_uses(node, source, uses)
   if redirect_rules_out_file_tool(node, source) then
     return
   end
   local kind = node:type()
   if kind == "command" then
-    local name_node = node:field("name")[1]
-    local name = name_node and node_text(name_node, source)
-    local tool = name and file_tool_for(name, node_text(node, source))
-    if tool then
-      uses[#uses + 1] = { tool = tool, command = name }
+    uses[#uses + 1] = file_tool_use(node, source)
+    return
+  end
+  if kind == "pipeline" then
+    local limited = head_limited_command(node, source)
+    local use = limited and file_tool_use(limited, source)
+    if use and TOOLS_WITH_LIMIT[use.tool] then
+      uses[#uses + 1] = use
     end
     return
   end
-  if kind == "pipeline" or not WALK_THROUGH_TYPES[kind] then
+  if not WALK_THROUGH_TYPES[kind] then
     return
   end
   for child in node:iter_children() do
