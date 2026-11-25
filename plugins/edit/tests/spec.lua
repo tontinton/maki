@@ -428,6 +428,15 @@ case("shift_note_says_how_far_the_lines_below_moved", function()
   eq(shift_note("a\r\nb\r\nc\r\n", "a\r\nc\r\n"), "lines after 2 shifted by -1")
 end)
 
+local last_line_note = require("edit_helpers").last_line_note
+
+case("last_line_note_names_the_last_line_a_range_took", function()
+  local content = "fn a() {\r\n    body();\r\n}\r\nfn b() {}\r\n"
+  eq(last_line_note(content, 1, 3), 'line 3 was "}"')
+  eq(last_line_note(content, 1, 2), 'line 2 was "body();"')
+  eq(last_line_note(content, 2, 2), nil)
+end)
+
 case("shift_note_is_silent_when_no_line_below_moved", function()
   local content = "aaa\nbbb\nccc\n"
   eq(shift_note(content, "aaa\nXXX\nccc\n"), nil)
