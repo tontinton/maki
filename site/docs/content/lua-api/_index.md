@@ -9480,7 +9480,10 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
+-- one of the error constants above. The third result is true when the
+-- replaced span was matched by `context_aware`, the only fallback that
+-- forgives differing lines, so callers can warn about an edit made
+-- against a file the model no longer saw correctly.
 function M.replace(content, old_string, new_string, replace_all)
 ```
 
