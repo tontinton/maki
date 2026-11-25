@@ -8,6 +8,14 @@ local snippet = require("edit_helpers").snippet
 local shift_note = require("edit_helpers").shift_note
 
 local FALLBACK_VIEW_LINES = 5
+local APPROX_NOTE = "matched approximately. Re-read the file before editing it again"
+
+local function drift_suffix(labels)
+  if #labels == 0 then
+    return ""
+  end
+  return "; " .. table.concat(labels, ", ") .. " " .. APPROX_NOTE
+end
 
 local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
@@ -286,14 +294,21 @@ maki.api.register_tool({
   end),
 
   handler = function(input)
+    local approximate = false
     local result, err = apply_edit(input.path, function(content)
-      return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
+      local replaced, replace_err, inexact =
+        fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
+      approximate = inexact and true or false
+      return replaced, replace_err
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
 
-    return diff_result(result, "edited " .. shorten_path(result.path))
+    return diff_result(
+      result,
+      "edited " .. shorten_path(result.path) .. drift_suffix(approximate and { "old_string" } or {})
+    )
   end,
 })
 
@@ -358,12 +373,16 @@ register_tool_if(opts.multiedit, {
       return { llm_output = "provide at least one edit", is_error = true }
     end
 
+    local drifted = {}
     local result, err = apply_edit(input.path, function(content)
       for i, edit in ipairs(edits) do
-        local replaced, replace_err =
+        local replaced, replace_err, inexact =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
         if replace_err then
           return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet(edit.old_string), replace_err)
+        end
+        if inexact then
+          drifted[#drifted + 1] = string.format("edits[%d]", i - 1)
         end
         content = replaced
       end
@@ -375,7 +394,10 @@ register_tool_if(opts.multiedit, {
 
     local n = #edits
     local s = n == 1 and "" or "s"
-    return diff_result(result, string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)))
+    return diff_result(
+      result,
+      string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)) .. drift_suffix(drifted)
+    )
   end,
 })
 

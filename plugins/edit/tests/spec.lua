@@ -17,6 +17,24 @@ case("exact_match", function()
   has(result, R)
 end)
 
+case("only_span_fuzzy_matches_are_reported_as_approximate", function()
+  local _, _, exact = fr.replace("fn foo() {}", "fn foo() {}", R, false)
+  eq(exact, false)
+  local _, _, collapsed = fr.replace("let   x  =   1;", "let x = 1;", R, false)
+  eq(collapsed, false)
+  local _, _, indented = fr.replace("    fn f() {}", "fn f() {}", R, false)
+  eq(indented, false)
+  local _, _, escaped = fr.replace('let s = "hello\nworld";', 'let s = "hello\\nworld";', R, false)
+  eq(escaped, false)
+  local _, _, anchored = fr.replace(
+    "fn h() {\n    validate();\n    process();\n    save();\n    log();\n    respond();\n}",
+    "fn h() {\n    validate();\n    WRONG();\n    save();\n    log();\n    respond();\n}",
+    R,
+    false
+  )
+  eq(anchored, true)
+end)
+
 case("trimmed_boundary", function()
   local result = fr.replace("fn foo() {}", "\nfn foo() {}\n", R, false)
   has(result, R)

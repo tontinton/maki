@@ -515,7 +515,10 @@ end
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
+-- one of the error constants above. The third result is true when the
+-- replaced span was matched by `context_aware`, the only fallback that
+-- forgives differing lines, so callers can warn about an edit made
+-- against a file the model no longer saw correctly.
 function M.replace(content, old_string, new_string, replace_all)
   if old_string == "" then
     return nil, M.EMPTY_OLD_STRING
@@ -543,7 +546,7 @@ function M.replace(content, old_string, new_string, replace_all)
   for _, r in ipairs(REPLACERS) do
     local res = try_match(r(content, old_string), old_string, new_string)
     if res then
-      return res, nil
+      return res, nil, false
     end
   end
 
@@ -551,14 +554,14 @@ function M.replace(content, old_string, new_string, replace_all)
   if unescaped ~= old_string then
     local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string))
     if res then
-      return res, nil
+      return res, nil, false
     end
   end
 
   for _, r in ipairs(LATE_REPLACERS) do
     local res = try_match(r(content, old_string), old_string, new_string)
     if res then
-      return res, nil
+      return res, nil, r == context_aware
     end
   end
 
