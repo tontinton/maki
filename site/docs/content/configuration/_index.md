@@ -353,6 +353,12 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `responses_api` | boolean | `false` | - | Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Off by default while the path is still being tested. |
 
+### `plugins.navigation`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `wrap` | boolean | `false` | - | Wrap message navigation at transcript boundaries |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |
