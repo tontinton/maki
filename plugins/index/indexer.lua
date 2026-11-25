@@ -1,7 +1,7 @@
 local FIELD_TRUNCATE_THRESHOLD = 8
 local LINE_WRAP_THRESHOLD = 120
 local MAX_INT = math.maxinteger or (2 ^ 53)
-local PARSE_ERROR_NOTE = "(no entries: file has syntax errors - use the read tool instead)"
+local PARSE_ERROR_NOTE = "[no entries: file has syntax errors - use the read tool instead]"
 
 local EXT_TO_LANG = {
   rs = "rust",
