@@ -229,8 +229,12 @@ maki.api.register_tool({
       path = { type = "string", description = "Directory to search in (default: cwd)" },
       include = {
         type = "string",
-        description = "File glob filter (e.g. *.c)",
+        description = "File glob filter (e.g. *.c, or !**/tests/** to leave files out)",
         alias = "glob",
+      },
+      exclude = {
+        type = "string",
+        description = "Regex; skip matching lines that also match it (e.g. ^\\s*//)",
       },
       context_before = { type = "integer", description = "Context lines before match" },
       context_after = { type = "integer", description = "Context lines after match" },
@@ -271,7 +275,8 @@ maki.api.register_tool({
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     if input.count then
-      local counts, count_err = maki.fs.grep_count(pattern, { path = input.path, include = input.include })
+      local counts, count_err =
+        maki.fs.grep_count(pattern, { path = input.path, include = input.include, exclude = input.exclude })
       if not counts then
         return { llm_output = "error: " .. tostring(count_err), is_error = true }
       end
@@ -289,6 +294,7 @@ maki.api.register_tool({
     local entries, err, omitted = maki.fs.grep(pattern, {
       path = input.path,
       include = input.include,
+      exclude = input.exclude,
       context_before = input.context_before or 0,
       context_after = input.context_after or 0,
       limit = limit,

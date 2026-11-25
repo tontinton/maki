@@ -1156,7 +1156,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// returning the lines.
 ///
 /// @param pattern string Regular expression to search for.
-/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches.
 /// @return (table?, string?) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
 /// @example
 /// local counts, err = maki.fs.grep_count("TODO", { path = "src" })
@@ -1171,6 +1171,7 @@ async fn grep_counts(
     let mut params = GrepParams::new(pattern);
     params.path = opts.as_ref().opt("path")?;
     params.include = opts.as_ref().opt("include")?;
+    params.exclude = opts.as_ref().opt("exclude")?;
     let counts = match spawn_blocking(move || grep_count(&params))
         .await
         .map_err(mlua::Error::external)?
@@ -1195,7 +1196,7 @@ async fn grep_counts(
 /// `lines`, where every line has `line_nr`, `text`, and `is_match`.
 ///
 /// @param pattern string Regular expression to search for.
-/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches. `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 /// @return (table?, string?, table?) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 /// @example
 /// local hits, err, omitted = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
@@ -1221,6 +1222,9 @@ async fn grep(
         }
         if let Ok(v) = opts.get::<String>("include") {
             params.include = Some(v);
+        }
+        if let Ok(v) = opts.get::<String>("exclude") {
+            params.exclude = Some(v);
         }
         if let Ok(v) = opts.get::<usize>("context_before") {
             params.context_before = v;
