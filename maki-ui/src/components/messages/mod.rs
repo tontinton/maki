@@ -114,6 +114,11 @@ pub struct MessagesPanel {
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
+    /// Calls whose restore waits until their segment nears the viewport, so
+    /// loading a long transcript costs what is on screen, not every call in
+    /// it. Ids only: the item is built when it goes out, so the output of a
+    /// call nobody scrolls to is never copied.
+    pending_restores: HashSet<String>,
     thinking_lines: ThinkingLines,
     /// The reader's click on the live thinking, handed to its message by
     /// [`Self::flush_thinking`].
@@ -172,6 +177,7 @@ impl MessagesPanel {
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
             restore_event_tx: None,
+            pending_restores: HashSet::new(),
             thinking_lines: ui_config.thinking_lines,
             live_thinking_expanded: false,
             clock_format: ui_config.clock_format,
@@ -205,16 +211,42 @@ impl MessagesPanel {
         self.task_id.as_ref()
     }
 
-    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
-        let Some(tx) = &self.restore_event_tx else {
+    /// The tail goes out now, because a loaded chat opens pinned to the bottom
+    /// and the restore spinner waits for what is sent before it. A call takes
+    /// at least a row, so a viewport's worth fills the screen. If the panel
+    /// guessed its height short, the first frame sends the rest.
+    pub(crate) fn request_restores(&mut self) {
+        self.defer_restores();
+        let tail: Vec<String> = self
+            .tool_ids()
+            .rev()
+            .take(usize::from(self.viewport_height))
+            .map(str::to_owned)
+            .collect();
+        for id in tail {
+            self.pending_restores.remove(&id);
+            self.send_restore(&id);
+        }
+    }
+
+    pub(crate) fn defer_restores(&mut self) {
+        self.pending_restores = self.tool_ids().map(str::to_owned).collect();
+    }
+
+    fn tool_ids(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.messages.iter().filter_map(|msg| match &msg.role {
+            DisplayRole::Tool(role) => Some(role.id.as_str()),
+            _ => None,
+        })
+    }
+
+    fn send_restore(&self, tool_id: &str) {
+        let (Some(tx), Some(mut item)) = (&self.restore_event_tx, self.lua_restore_item(tool_id))
+        else {
             return;
         };
-        let theme_gen = crate::theme::generation();
-        for mut item in items {
-            item.theme_gen = Some(theme_gen);
-            self.stamp_chat(&mut item);
-            self.lua_event_handle.request_restore(item, tx.clone());
-        }
+        item.reason = maki_lua::RestoreReason::Load;
+        self.lua_event_handle.request_restore(item, tx.clone());
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -244,6 +276,7 @@ impl MessagesPanel {
         self.live_bufs.clear();
         self.watched_bufs.clear();
         self.rebake_requested.clear();
+        self.pending_restores.clear();
         self.highlight_segment = None;
         self.live_thinking_expanded = false;
     }
@@ -1766,6 +1799,7 @@ impl MessagesPanel {
                 return;
             }
             rows += self.reflowed_height(i, width);
+            self.send_pending_restore(i);
         }
     }
 
@@ -1780,6 +1814,19 @@ impl MessagesPanel {
         self.cache
             .get(seg_idx)
             .map_or(0, |s| s.height(width) as u32)
+    }
+
+    /// The reflow window is what the reader is about to see, which makes it
+    /// the moment a held back restore becomes worth its cost.
+    fn send_pending_restore(&mut self, seg_idx: usize) {
+        if let Some(id) = self
+            .cache
+            .get(seg_idx)
+            .and_then(|s| s.tool_id.as_deref())
+            .and_then(|id| self.pending_restores.take(id))
+        {
+            self.send_restore(&id);
+        }
     }
 
     fn reflow_segment(&mut self, seg_idx: usize, width: u16) {
