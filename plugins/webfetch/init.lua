@@ -35,7 +35,7 @@ local opts = maki.api.register_options(output_limits.extend({
     desc = "Stop reading a response after this many bytes, at most 64 MiB.",
   },
   max_inline_bytes = {
-    default = 16 * 1024,
+    default = 32 * 1024,
     min = 1024,
     desc = "A page longer than this is saved to a file, and the model gets its outline to read from.",
   },
