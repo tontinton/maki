@@ -25,6 +25,7 @@ use maki_config::{
 };
 use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -61,6 +62,11 @@ const ACCEPT_MARKDOWN_FIRST: &str = "accept: text/markdown,";
 const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
 const LANDMARK_PAGE: &[u8] =
     br#"<nav><a href="/">Home</a></nav><main><p>body</p></main><footer>legal</footer>"#;
+const PLAIN_TYPE: &str = "text/plain; charset=utf-8";
+const ONE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const SAVED_PREFIX: &str = "Page saved to ";
+const LAST_HEADING: &str = "## End";
+const READ_LINE_BYTES: usize = 500;
 const LATIN1_E_ACUTE: u8 = 0xe9;
 const BINARY_TYPE: &str = "application/pdf";
 const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
@@ -588,6 +594,47 @@ fn webfetch_keeps_only_the_main_element(format: &str) {
     let output = run(&ctx, "webfetch", json!({ "url": url, "format": format })).unwrap();
     server.join().unwrap();
     assert_eq!(output.trim(), PAGE_BODY);
+}
+
+#[test_case::test_case("word ", " " ; "wrapped_at_spaces")]
+#[test_case::test_case("\u{8a9e}", "" ; "cut_between_characters_without_spaces")]
+fn webfetch_saves_a_long_page_and_replies_with_its_outline(word: &str, joiner: &str) {
+    let (_registry, _host, mut ctx) = setup();
+    ctx.session_id = Some(SessionRef::generate());
+    let paragraph = word.repeat(MODEL_BYTES);
+    let page = format!("<h1>Title</h1><p>{paragraph}</p><h2>End</h2><p>{LAST_ITEM}</p>");
+    let (url, server) = serve_once(HTML_TYPE, page.as_bytes());
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+
+    assert!(output.len() < MODEL_BYTES, "{output}");
+    let (path, _) = output
+        .strip_prefix(SAVED_PREFIX)
+        .and_then(|rest| rest.split_once(" ("))
+        .expect(&output);
+    let saved = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = saved.lines().collect();
+    assert!(lines.iter().all(|line| line.len() <= READ_LINE_BYTES));
+    assert!(saved.replace('\n', joiner).contains(paragraph.trim()));
+    assert_eq!(lines.last(), Some(&LAST_ITEM));
+    let heading_line: usize = output
+        .lines()
+        .find_map(|line| line.strip_suffix(&format!(": {LAST_HEADING}")))
+        .expect(&output)
+        .parse()
+        .unwrap();
+    assert_eq!(lines[heading_line - 1], LAST_HEADING);
+}
+
+/// Copying the rest of the line after every cut took minutes at this size.
+#[test]
+fn webfetch_wraps_a_one_line_file_of_megabytes() {
+    let (_registry, _host, mut ctx) = setup();
+    ctx.session_id = Some(SessionRef::generate());
+    let (url, server) = serve_once(PLAIN_TYPE, &vec![b'x'; ONE_LINE_BYTES]);
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert!(output.starts_with(SAVED_PREFIX), "{output}");
 }
 
 #[test]

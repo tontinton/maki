@@ -37,6 +37,9 @@ const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
 /// The bash plugin's directory under a session's plugin data dir.
 const BASH_PLUGIN_DIR: &str = "bash";
+const WEBFETCH_PLUGIN_DIR: &str = "webfetch";
+/// Plugins whose replies point the model at a file in their session data dir.
+const OUTPUT_PLUGIN_DIRS: [&str; 2] = [BASH_PLUGIN_DIR, WEBFETCH_PLUGIN_DIR];
 const READ_TOOL: &str = "read";
 
 /// Splits the ask id from the encoded answer on the answer channel. A control
@@ -385,7 +388,7 @@ pub struct PermissionManager {
     plugin_rules: Arc<PluginRuleStore>,
     /// Canonical root of the per-session plugin data dirs. It usually does
     /// not exist yet, so a plain canonicalize would keep a symlinked state
-    /// dir as spelled. See [`Self::bash_logs_rule`].
+    /// dir as spelled. See [`Self::plugin_output_rules`].
     plugin_data: Option<PathBuf>,
 }
 
@@ -460,29 +463,32 @@ impl PermissionManager {
         }
     }
 
-    /// Lets `read` into the calling session's own bash logs, which its
-    /// receipts point the model at. A subagent shares its parent's session,
-    /// so either side reads what the other started. Other sessions' logs,
-    /// from this project or any other, get the usual outside-project
-    /// handling.
-    fn bash_logs_rule(
+    /// Lets `read` into the calling session's own bash logs and fetched
+    /// pages, which those tools' replies point the model at. A subagent
+    /// shares its parent's session, so either side reads what the other
+    /// started. Other sessions' files, from this project or any other, get
+    /// the usual outside-project handling.
+    fn plugin_output_rules(
         &self,
         tool: &ToolKey,
         session: Option<&SessionRef>,
-    ) -> Option<PermissionRule> {
-        if !matches!(tool, ToolKey::Native(name) if name.as_ref() == READ_TOOL) {
-            return None;
+    ) -> Vec<PermissionRule> {
+        let (ToolKey::Native(name), Some(data), Some(session)) = (tool, &self.plugin_data, session)
+        else {
+            return Vec::new();
+        };
+        if name.as_ref() != READ_TOOL {
+            return Vec::new();
         }
-        let dir = self
-            .plugin_data
-            .as_ref()?
-            .join(session?.id().to_string())
-            .join(BASH_PLUGIN_DIR);
-        Some(PermissionRule {
-            tool: tool.clone(),
-            scope: Some(format!("{}/**", dir.display())),
-            effect: Effect::Allow,
-        })
+        let session_dir = data.join(session.id().to_string());
+        OUTPUT_PLUGIN_DIRS
+            .iter()
+            .map(|plugin| PermissionRule {
+                tool: tool.clone(),
+                scope: Some(format!("{}/**", session_dir.join(plugin).display())),
+                effect: Effect::Allow,
+            })
+            .collect()
     }
 
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
@@ -507,7 +513,7 @@ impl PermissionManager {
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
-        let bash_logs = self.bash_logs_rule(tool, session_id);
+        let plugin_outputs = self.plugin_output_rules(tool, session_id);
 
         let gate = ApprovalGate::new(tool, plan_path);
 
@@ -529,7 +535,7 @@ impl PermissionManager {
                 .chain(
                     self.builtin_rules
                         .iter()
-                        .chain(&bash_logs)
+                        .chain(&plugin_outputs)
                         .map(|r| (ORIGIN_BUILTIN, r)),
                 )
                 .chain(plugin.iter().map(|r| (ORIGIN_PLUGIN, r)))
@@ -1614,6 +1620,8 @@ mod tests {
 
     #[test_case("{own}/bash/call.log" => true ; "own_log")]
     #[test_case("{own}/bash/call.log.1" => true ; "own_rotated_log")]
+    #[test_case("{own}/webfetch/page.md" => true ; "own_fetched_page")]
+    #[test_case("{other}/webfetch/page.md" => false ; "another_sessions_page")]
     #[test_case("{own}/notes/scratch.md" => false ; "another_plugin_dir")]
     #[test_case("{other}/bash/call.log" => false ; "another_sessions_log")]
     #[test_case("{own}/../{other}/bash/call.log" => false ; "dotdot_into_another_session")]
@@ -1647,7 +1655,7 @@ mod tests {
     #[test_case(false ; "read_through_the_target")]
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_logs_rule_resolves_a_symlinked_state_dir(through_link: bool) {
+    async fn plugin_output_rules_resolve_a_symlinked_state_dir(through_link: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("state");
         let link = tmp.path().join("state_link");
