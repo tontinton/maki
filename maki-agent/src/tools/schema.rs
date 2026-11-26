@@ -437,6 +437,9 @@ pub struct ToolInputError {
 pub enum ToolInputErrorKind {
     Missing {
         expected: &'static str,
+        /// The properties of the object the parameter belongs to, so one
+        /// error tells the model everything that object requires.
+        siblings: &'static [Property],
     },
     TypeMismatch {
         expected: ParamKind,
@@ -463,8 +466,12 @@ impl ToolInputError {
         }
     }
 
-    pub(crate) fn missing(path: &JsonPath, expected: &'static str) -> Self {
-        Self::at(path, ToolInputErrorKind::Missing { expected })
+    pub(crate) fn missing(
+        path: &JsonPath,
+        expected: &'static str,
+        siblings: &'static [Property],
+    ) -> Self {
+        Self::at(path, ToolInputErrorKind::Missing { expected, siblings })
     }
 }
 
@@ -476,8 +483,18 @@ impl Display for ToolInputError {
             write!(f, "invalid parameter '{}': ", self.path)?;
         }
         match &self.kind {
-            ToolInputErrorKind::Missing { expected } => {
-                write!(f, "required, expected {expected}")
+            ToolInputErrorKind::Missing { expected, siblings } => {
+                write!(f, "required, expected {expected}")?;
+                let mut required = siblings
+                    .iter()
+                    .filter(|(_, _, required, _, _)| *required)
+                    .map(|(name, ..)| *name);
+                if let (Some(first), Some(second)) = (required.next(), required.next()) {
+                    write!(f, ". Required: {first}, {second}")?;
+                    required.try_for_each(|name| write!(f, ", {name}"))?;
+                    f.write_str(".")?;
+                }
+                Ok(())
             }
             ToolInputErrorKind::TypeMismatch {
                 expected,
@@ -725,7 +742,8 @@ fn validate_object(
                     continue;
                 }
                 let expected = schema_type_name(sub_schema);
-                let mut err = path.with_field(name, |p| ToolInputError::missing(p, expected));
+                let mut err =
+                    path.with_field(name, |p| ToolInputError::missing(p, expected, properties));
                 err.unknown = unknown_keys(&map, properties);
                 err.hint = *hint;
                 return Err(err);
@@ -1061,6 +1079,8 @@ mod tests {
     use super::*;
 
     const MSG_MISSING: &str = "required, expected";
+    const MSG_REQUIRED_PREFIX: &str = ". Required: ";
+    const MSG_REQUIRED_LIST: &str = "end, range, start.";
     const MSG_EXPECTED_ARRAY: &str = "expected array";
     const MSG_JSON_ENCODED_HINT: &str = "Pass a JSON array";
     const MSG_ENUM_ERROR: &str =
@@ -1197,6 +1217,34 @@ mod tests {
         );
         assert!(
             rendered.ends_with("Use multiedit for several edits."),
+            "render: {rendered}"
+        );
+    }
+
+    #[test_case(json!({"end": 2}), Some(MSG_REQUIRED_LIST) ; "every_required_parameter")]
+    #[test_case(json!({"start": 1, "end": 2, "range": {}}), None ; "nothing_for_a_lone_required_parameter")]
+    fn missing_required_lists_what_the_object_requires(input: Value, listed: Option<&str>) {
+        let integer = json!({ "type": "integer", "required": true });
+        let schema_json = json!({
+            "type": "object",
+            "properties": {
+                "end": integer,
+                "note": { "type": "string" },
+                "range": {
+                    "type": "object",
+                    "required": true,
+                    "properties": { "path": { "type": "string", "required": true } },
+                },
+                "start": integer,
+            },
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        let rendered = validate(schema, input).unwrap_err().to_string();
+        assert_eq!(
+            rendered
+                .split_once(MSG_REQUIRED_PREFIX)
+                .map(|(_, list)| list),
+            listed,
             "render: {rendered}"
         );
     }
