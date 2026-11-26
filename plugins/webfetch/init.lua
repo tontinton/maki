@@ -3,6 +3,21 @@ local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { "script", "style", "noscript" }
 local MARKDOWN_SKIP_TAGS = { "script", "style", "noscript", "iframe", "object", "svg", "template" }
 local CONTENT_ROOT_TAGS = { "main" }
+local PROSE_TYPES = { "text/html", "text/markdown", "text/plain" }
+-- `read` cuts a line at 500 bytes by default, and a paragraph is one line.
+local WRAP_BYTES = 400
+local FENCE = "^%s*[`~][`~][`~]"
+local HEADING = "^#+ "
+local UNWRAPPED = "^[|#]"
+local NO_SESSION_ERR = "the call has no session"
+local PAGE_EXT = ".md"
+local PAGE_NAME_BYTES = 100
+local PREVIEW_LINES = 20
+local PREVIEW_BYTES = 2048
+local SAVED_OUTLINE =
+  "Page saved to %s (%d bytes, %d lines). Read the part you need with offset and limit. Headings by line:\n%s"
+local SAVED_PREVIEW =
+  "Page saved to %s (%d bytes, %d lines). Read the part you need with offset and limit. It starts with:\n%s"
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
@@ -19,11 +34,85 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 1024,
     desc = "Stop reading a response after this many bytes, at most 64 MiB.",
   },
+  max_inline_bytes = {
+    default = 16 * 1024,
+    min = 1024,
+    desc = "A page longer than this is saved to a file, and the model gets its outline to read from.",
+  },
 }))
 
 local function web_view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.web) or 3, keep = "head" }
+end
+
+local function is_prose(content_type: string): boolean
+  for _, prose_type in ipairs(PROSE_TYPES) do
+    if content_type:find(prose_type, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Breaks long lines at spaces so `read` shows all of them, and notes where
+-- each heading lands. Code blocks, table rows and headings stay as they are.
+local function lay_out(text: string): ({ string }, { string })
+  local lines: { string }, headings: { string } = {}, {}
+  local fenced = false
+  for line in text:gmatch("([^\n]*)\n?") do
+    if line:find(FENCE) then
+      fenced = not fenced
+    elseif not fenced and line:find(HEADING) then
+      headings[#headings + 1] = ("%d: %s"):format(#lines + 1, line)
+    end
+    if not fenced and not line:find(UNWRAPPED) then
+      while #line > WRAP_BYTES do
+        local space = line:sub(1, WRAP_BYTES):match("^.*() ")
+        if not space or space == 1 then
+          break
+        end
+        lines[#lines + 1] = line:sub(1, space - 1)
+        line = line:sub(space + 1)
+      end
+    end
+    lines[#lines + 1] = line
+  end
+  return lines, headings
+end
+
+-- Returns the reply that stands in for a saved page, or nil plus an error.
+local function save_page(
+  session: string?,
+  url: string,
+  text: string,
+  max_lines: number?,
+  max_bytes: number
+): (string?, string?)
+  if not session then
+    return nil, NO_SESSION_ERR
+  end
+  local dir, dir_err = maki.session.data_dir({ session = session })
+  if not dir then
+    return nil, dir_err
+  end
+  local made, mkdir_err = maki.fs.mkdir(dir, { parents = true })
+  if not made then
+    return nil, mkdir_err
+  end
+  local name = url:gsub("^%a+://", ""):gsub("[^%w_%-%.]", "_"):sub(1, PAGE_NAME_BYTES)
+  local path = maki.fs.joinpath(dir, name .. PAGE_EXT)
+  local lines, headings = lay_out(text)
+  local page = table.concat(lines, "\n")
+  local written, write_err = maki.fs.write(path, page)
+  if not written then
+    return nil, write_err
+  end
+  if #headings > 0 then
+    local outline = truncate(table.concat(headings, "\n"), max_lines, max_bytes)
+    return SAVED_OUTLINE:format(path, #page, #lines, outline)
+  end
+  return SAVED_PREVIEW:format(path, #page, #lines, truncate(page, PREVIEW_LINES, PREVIEW_BYTES))
 end
 
 maki.api.register_tool({
@@ -111,7 +200,16 @@ maki.api.register_tool({
       body = stripped or body
     end
 
-    local llm_output = truncate(body, max_lines, max_bytes)
+    local llm_output
+    local inline_bytes = max_bytes and math.min(max_bytes, opts.max_inline_bytes)
+    if inline_bytes and #body > inline_bytes and fmt ~= "html" and is_prose(ct) then
+      local save_err
+      llm_output, save_err = save_page(ctx:session_id(), url, body, max_lines, inline_bytes)
+      if not llm_output then
+        maki.log.warn("webfetch: page not saved, cutting it instead: " .. tostring(save_err))
+      end
+    end
+    llm_output = llm_output or truncate(body, max_lines, max_bytes)
 
     return {
       llm_output = llm_output,
