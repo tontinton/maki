@@ -59,6 +59,8 @@ const MARKDOWN_TYPE: &str = "text/markdown; charset=utf-8";
 const MARKDOWN_PAGE: &str = "# Title\n\n<b>kept as sent</b>";
 const ACCEPT_MARKDOWN_FIRST: &str = "accept: text/markdown,";
 const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
+const LANDMARK_PAGE: &[u8] =
+    br#"<nav><a href="/">Home</a></nav><main><p>body</p></main><footer>legal</footer>"#;
 const LATIN1_E_ACUTE: u8 = 0xe9;
 const BINARY_TYPE: &str = "application/pdf";
 const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
@@ -574,6 +576,16 @@ fn webfetch_markdown_drops_scripts_and_styles() {
     let (_registry, _host, ctx) = setup();
     let (url, server) = serve_once(HTML_TYPE, SCRIPTED_PAGE);
     let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.trim(), PAGE_BODY);
+}
+
+#[test_case::test_case("markdown" ; "markdown")]
+#[test_case::test_case("text" ; "text")]
+fn webfetch_keeps_only_the_main_element(format: &str) {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(HTML_TYPE, LANDMARK_PAGE);
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format })).unwrap();
     server.join().unwrap();
     assert_eq!(output.trim(), PAGE_BODY);
 }

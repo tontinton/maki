@@ -6330,6 +6330,7 @@ Invalid UTF-8 becomes U+FFFD.
 
 - `{html}` (`string`) HTML source text.
 - `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+  - `root_tags` (`string[]`) convert only the first element with one of these tags, like `main`, and the whole page when it has none.
 
 **Returns:** (`string?`, `string?`) Markdown text on success, or nil plus an error message.
 
@@ -6360,6 +6361,7 @@ Invalid UTF-8 becomes U+FFFD.
 
 - `{html}` (`string`) HTML source text.
 - `{opts?}` (`table?`) `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+  - `root_tags` (`string[]`) convert only the first element with one of these tags, like `main`, and the whole page when it has none.
 
 **Returns:** (`string?`, `string?`) Plain text on success, or nil plus an error message.
 
