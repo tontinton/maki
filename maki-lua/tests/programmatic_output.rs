@@ -62,6 +62,8 @@ const ACCEPT_MARKDOWN_FIRST: &str = "accept: text/markdown,";
 const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
 const LANDMARK_PAGE: &[u8] =
     br#"<nav><a href="/">Home</a></nav><main><p>body</p></main><footer>legal</footer>"#;
+const PLAIN_TYPE: &str = "text/plain; charset=utf-8";
+const ONE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const SAVED_PREFIX: &str = "Page saved to ";
 const LAST_HEADING: &str = "## End";
 const READ_LINE_BYTES: usize = 500;
@@ -622,6 +624,17 @@ fn webfetch_saves_a_long_page_and_replies_with_its_outline(word: &str, joiner: &
         .parse()
         .unwrap();
     assert_eq!(lines[heading_line - 1], LAST_HEADING);
+}
+
+/// Copying the rest of the line after every cut took minutes at this size.
+#[test]
+fn webfetch_wraps_a_one_line_file_of_megabytes() {
+    let (_registry, _host, mut ctx) = setup();
+    ctx.session_id = Some(SessionRef::generate());
+    let (url, server) = serve_once(PLAIN_TYPE, &vec![b'x'; ONE_LINE_BYTES]);
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert!(output.starts_with(SAVED_PREFIX), "{output}");
 }
 
 #[test]

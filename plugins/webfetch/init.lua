@@ -67,20 +67,24 @@ local function lay_out(text: string): ({ string }, { string })
       headings[#headings + 1] = ("%d: %s"):format(#lines + 1, line)
     end
     if not fenced and not line:find(UNWRAPPED) then
-      while #line > WRAP_BYTES do
-        local space = line:sub(1, WRAP_BYTES):match("^.*() ")
+      -- Walks the line by index: copying the rest after every cut is quadratic,
+      -- and a minified file is one line of megabytes.
+      local pos = 1
+      while #line - pos >= WRAP_BYTES do
+        local space = line:sub(pos, pos + WRAP_BYTES - 1):match("^.*() ")
         local cut, skipped = WRAP_BYTES, 0
         if space and space > 1 then
           cut, skipped = space - 1, 1
         else
           -- Text written without spaces, like Chinese, is cut between characters.
-          while cut > 1 and line:find(UTF8_CONTINUATION, cut + 1) do
+          while cut > 1 and line:find(UTF8_CONTINUATION, pos + cut) do
             cut = cut - 1
           end
         end
-        lines[#lines + 1] = line:sub(1, cut)
-        line = line:sub(cut + skipped + 1)
+        lines[#lines + 1] = line:sub(pos, pos + cut - 1)
+        pos = pos + cut + skipped
       end
+      line = line:sub(pos)
     end
     lines[#lines + 1] = line
   end
