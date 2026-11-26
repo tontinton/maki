@@ -463,8 +463,10 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
 
 const SKILL_TOOL: &str = "skill";
 const SKILL_NAME: &str = "release";
-/// Outside any home or cwd, so `shorten_path` leaves it alone.
-const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.md";
+/// Outside any home or cwd, so `shorten_path` leaves it alone. Not `.md`:
+/// compiling the markdown syntax costs ~5s of CPU in a debug build, and the
+/// assertions only read plain text.
+const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.txt";
 const SKILL_BODY: &str = "1 # Release\n2 Tag it.";
 
 /// Restore (session reload, batch child) must draw the skill like the live
