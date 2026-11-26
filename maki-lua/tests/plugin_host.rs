@@ -9705,6 +9705,24 @@ fn bash_names_the_file_tool_a_command_stands_in_for(command: &str, expected: Opt
     assert_eq!(file_tool_note(&reply), expected, "got: {reply}");
 }
 
+/// A redirect, glob, or other shell syntax glued to a leading `cd` is not
+/// part of the directory. The hint steps aside and bash runs the command,
+/// instead of the job starting in a directory named e.g. `/tmp/x 2>/dev/null`.
+#[test_case::test_case("cd {} 2>/dev/null && pwd" ; "trailing_redirect")]
+#[test_case::test_case("cd {}* && pwd" ; "glob")]
+#[test_case::test_case(r#"cd "{}" && pwd"# ; "quoted")]
+#[test_case::test_case("cd {} && pwd" ; "plain_hint_still_applies")]
+fn bash_cd_hint_steps_aside_for_arguments_that_are_not_plain_paths(template: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let reply = bash_reply(&template.replace("{}", path), |_| {});
+    assert_eq!(
+        reply.lines().next().unwrap_or_default(),
+        path,
+        "got: {reply}"
+    );
+}
+
 #[test]
 fn bash_adds_no_file_tool_note_unless_the_option_is_on() {
     let (reg, _host) = builtins_host();
