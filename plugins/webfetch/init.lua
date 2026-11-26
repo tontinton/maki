@@ -11,7 +11,6 @@ local HEADING = "^#+ "
 local UNWRAPPED = "^[|#]"
 local NO_SESSION_ERR = "the call has no session"
 local PAGE_EXT = ".md"
-local PAGE_NAME_BYTES = 100
 local PREVIEW_LINES = 20
 local PREVIEW_BYTES = 2048
 local SAVED_OUTLINE =
@@ -81,14 +80,21 @@ local function lay_out(text: string): ({ string }, { string })
   return lines, headings
 end
 
+local fallback_page_seq = 0
+
+local function page_name(ctx): string
+  local call_id = ctx:tool_use_id()
+  -- A call nested in a batch has no id of its own.
+  if not call_id then
+    fallback_page_seq = fallback_page_seq + 1
+    call_id = ("webfetch-%d-%d"):format(os.time(), fallback_page_seq)
+  end
+  return (call_id:gsub("[^%w_%-]", "_")) .. PAGE_EXT
+end
+
 -- Returns the reply that stands in for a saved page, or nil plus an error.
-local function save_page(
-  session: string?,
-  url: string,
-  text: string,
-  max_lines: number?,
-  max_bytes: number
-): (string?, string?)
+local function save_page(ctx, text: string, max_lines: number?, max_bytes: number): (string?, string?)
+  local session = ctx:session_id()
   if not session then
     return nil, NO_SESSION_ERR
   end
@@ -100,8 +106,7 @@ local function save_page(
   if not made then
     return nil, mkdir_err
   end
-  local name = url:gsub("^%a+://", ""):gsub("[^%w_%-%.]", "_"):sub(1, PAGE_NAME_BYTES)
-  local path = maki.fs.joinpath(dir, name .. PAGE_EXT)
+  local path = maki.fs.joinpath(dir, page_name(ctx))
   local lines, headings = lay_out(text)
   local page = table.concat(lines, "\n")
   local written, write_err = maki.fs.write(path, page)
@@ -204,7 +209,7 @@ maki.api.register_tool({
     local inline_bytes = max_bytes and math.min(max_bytes, opts.max_inline_bytes)
     if inline_bytes and #body > inline_bytes and fmt ~= "html" and is_prose(ct) then
       local save_err
-      llm_output, save_err = save_page(ctx:session_id(), url, body, max_lines, inline_bytes)
+      llm_output, save_err = save_page(ctx, body, max_lines, inline_bytes)
       if not llm_output then
         maki.log.warn("webfetch: page not saved, cutting it instead: " .. tostring(save_err))
       end
