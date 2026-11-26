@@ -1799,7 +1799,7 @@ mod tests {
     /// Shared by the mock and the assertion, so the test cannot pass against
     /// some other error.
     fn missing_command() -> ParseError {
-        ParseError::missing(&JsonPath::default(), HOOK_FIELD_TYPE)
+        ParseError::missing(&JsonPath::default(), HOOK_FIELD_TYPE, &[])
     }
 
     impl Tool for HookMock {
