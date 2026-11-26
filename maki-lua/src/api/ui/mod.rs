@@ -32,7 +32,7 @@ pub(crate) mod marks;
 pub(crate) mod syntax;
 pub(crate) mod win;
 
-use crate::runtime::{Lineage, plugin_loaded, with_task_bufs};
+use crate::runtime::{Lineage, highlight_job, plugin_loaded, with_task_bufs};
 use marks::{InputRule, InputRuleStore, PatternRule, parse_mark, parse_pushed_mark};
 use syntax::parse_syntax;
 
@@ -411,7 +411,7 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
         .unwrap_or_default();
-    let segments = maki_highlight::pool::run_async(move || {
+    let segments = highlight_job(&lua, move || {
         if independent {
             maki_highlight::highlight_lines_independent(&lang, &code)
         } else {
@@ -438,8 +438,7 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
 /// end
 #[lua_fn]
 async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
-    let lines =
-        maki_highlight::pool::run_async(move || maki_markdown::render::render(&text, width)).await;
+    let lines = highlight_job(&lua, move || maki_markdown::render::render(&text, width)).await;
     markdown_lines_to_lua(&lua, &lines)
 }
 

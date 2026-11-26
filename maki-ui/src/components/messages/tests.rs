@@ -2161,6 +2161,57 @@ fn test_event_sender() -> maki_agent::EventSender {
     maki_agent::EventSender::new(tx, 0)
 }
 
+fn drain_restore_ids(probe: &maki_lua::test_support::RequestProbe) -> Vec<String> {
+    std::iter::from_fn(|| probe.try_recv_restore_item())
+        .map(|item| item.tool_use_id)
+        .collect()
+}
+
+/// A loaded transcript restores the screen it opens on, and every other call
+/// once it nears the viewport, so how long a load takes never depends on how
+/// many calls the session made.
+#[test]
+fn loaded_restores_wait_until_their_call_nears_the_viewport() {
+    const CALLS: usize = VIEW_HEIGHT as usize * 8;
+
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
+    panel.set_restore_channel(Some(test_event_sender()));
+    let ids: Vec<String> = (0..CALLS).map(|i| format!("t{i}")).collect();
+    for id in &ids {
+        let mut ev = start(id, BASH_TOOL_NAME);
+        ev.raw_input = Some(serde_json::json!({ "command": "true" }));
+        panel.tool_start(ev);
+        panel.tool_done(done(id));
+    }
+    panel.load_messages(panel.messages.clone());
+    let (first, last) = (&ids[0], &ids[CALLS - 1]);
+
+    panel.request_restores();
+    let mut sent = drain_restore_ids(&probe);
+    assert!(
+        sent.contains(last),
+        "the screen a chat opens on goes at once"
+    );
+
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    sent.extend(drain_restore_ids(&probe));
+    assert!(!sent.contains(first), "the top is far off screen");
+
+    panel.scroll_to_top();
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    sent.extend(drain_restore_ids(&probe));
+    assert!(
+        sent.contains(first),
+        "scrolling up restores what comes into view"
+    );
+    assert_eq!(
+        sent.iter().collect::<HashSet<_>>().len(),
+        sent.len(),
+        "a call is restored once"
+    );
+}
+
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";
 const HEADER_GEN_MSG: &str = "header snapshot must stamp the provided generation";
 const LIVE_PANEL_GEN_MSG: &str = "live snapshot (None gen) must stamp with panel theme_generation";

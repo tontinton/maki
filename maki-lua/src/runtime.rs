@@ -44,6 +44,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use maki_config::RawConfig;
+use maki_highlight::pool::{self, Lane};
 use maki_providers::Message;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
@@ -154,15 +155,13 @@ pub(crate) const FALLBACK_SPENT_ERR: &str = "fallback already ran, or the key ha
 const EV_INPUT: &str = "input";
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
-/// Keeps a buggy plugin's restore task from freezing the lua loop.
-const RESTORE_ASYNC_DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
-/// Hard cap on one whole restore item. The watchdog interrupt only lands
-/// while Lua runs, so a restore parked on a never-resolving await would otherwise
-/// hold its gate slot forever and deadlock `gate.drain()` in the dispatcher.
-/// Generous on purpose: legit restores of heavy items take double-digit
-/// seconds on a loaded debug build, and a wrongly killed restore loses the
-/// tool's rendered output.
+/// Cap on one restore item, not counting its waits on the highlight thread.
+/// The watchdog interrupt only lands while Lua runs, so a restore parked on a
+/// never-resolving await would otherwise hold its gate slot forever and
+/// deadlock `gate.drain()` in the dispatcher. Generous on purpose: legit
+/// restores of heavy items take double-digit seconds on a loaded debug build,
+/// and a wrongly killed restore loses the tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
 const ASK_FIELD: &str = "ask";
@@ -835,6 +834,11 @@ pub(crate) struct TaskCell {
     /// Set under a `maki.async.spawn` task and passed down to the runs it
     /// queues. [`TaskLifetime::Detached`] says why.
     detached: bool,
+    /// Session restores run in the background lane, so the screen they are
+    /// rebuilding never waits behind them.
+    lane: Lane,
+    /// Highlight waits in flight, see [`HighlightWait`].
+    highlight_waits: usize,
 }
 
 /// What a task passes down to the `maki.async.run` tasks it queues. It travels
@@ -896,6 +900,8 @@ impl TaskCell {
             lineage: Lineage::default(),
             user_action: false,
             detached: false,
+            lane: Lane::Foreground,
+            highlight_waits: 0,
         }
     }
 
@@ -909,9 +915,12 @@ impl TaskCell {
 
     /// The deadline that can still end the task. A moved call's subtree has
     /// none, and an `expire = "background"` one is held back until its move
-    /// attempt either moves the call or hands it back as a plain deadline.
+    /// attempt either moves the call or hands it back as a plain deadline. A
+    /// [`HighlightWait`] holds it back too.
     fn live_deadline(&self) -> Option<Instant> {
-        let held = self.moved() || self.deadline_expire == DeadlineExpire::Background;
+        let held = self.moved()
+            || self.deadline_expire == DeadlineExpire::Background
+            || self.highlight_waits > 0;
         self.deadline.filter(|_| !held)
     }
 
@@ -1451,6 +1460,59 @@ struct WarmTool {
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `f` on the highlight thread, in the lane of the task asking.
+pub(crate) async fn highlight_job<T: Send + 'static>(
+    lua: &Lua,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let wait = lua
+        .app_data_ref::<TaskHandle>()
+        .and_then(|handle| HighlightWait::start(&handle));
+    let lane = if wait.is_some() {
+        Lane::Background
+    } else {
+        Lane::Foreground
+    };
+    let value = pool::run_async(lane, f).await;
+    drop(wait);
+    value
+}
+
+/// Holds a background task's deadline while it waits on the highlight
+/// thread, then pushes it back by the wait. That wait always ends, it only
+/// runs long when a big restore queued ahead, and timing the task out for it
+/// would just throw its view away. Overlapping waits each push it, which only
+/// errs on the generous side.
+struct HighlightWait {
+    handle: TaskHandle,
+    started: Instant,
+}
+
+impl HighlightWait {
+    fn start(handle: &TaskHandle) -> Option<Self> {
+        let mut cell = lock_cell(handle);
+        if cell.lane != Lane::Background {
+            return None;
+        }
+        cell.highlight_waits += 1;
+        Some(Self {
+            handle: Arc::clone(handle),
+            started: Instant::now(),
+        })
+    }
+}
+
+impl Drop for HighlightWait {
+    fn drop(&mut self) {
+        let mut cell = lock_cell(&self.handle);
+        cell.highlight_waits -= 1;
+        if let Some(deadline) = cell.deadline.as_mut() {
+            *deadline += self.started.elapsed();
+        }
+        cell.deadline_changed.send_replace(());
+    }
 }
 
 /// Backs `maki.async.on_cancel`. An already cancelled task has no
@@ -4759,7 +4821,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let input_lua = json_to_lua(lua, &item.input).ok()?;
 
     let (dummy_tx, _) = unbounded_channel();
-    let cell = TaskCell::new(
+    let mut cell = TaskCell::new(
         CancelToken::none(),
         Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
         Some(LiveCtx {
@@ -4767,6 +4829,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
             tool_use_id: item.tool_use_id.clone(),
         }),
     );
+    cell.lane = Lane::Background;
 
     let ctx = lua
         .create_userdata(LuaCtx::restore(RestoreCtx {
@@ -4780,45 +4843,56 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let inner = func.call_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx));
     let scope = TaskScope::new(lua, cell);
     lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
-    let ret = scope
-        .scope_future(inner)
-        .await
-        .inspect_err(|e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"))
-        .ok()?;
-    run_inline_tasks(lua, &scope).await;
+    let handle = Arc::clone(scope.handle());
+    let tool = Arc::clone(&item.tool);
+    let render = async {
+        let ret = scope
+            .scope_future(inner)
+            .await
+            .inspect_err(
+                |e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"),
+            )
+            .ok()?;
+        run_inline_tasks(lua, &scope).await;
 
-    if let Some(buf) = crate::api::ui::buf::buf_from_reply(&ret) {
-        lock_cell(scope.handle()).root_buf = Some(buf);
-    }
-
-    if !item.clicks.is_empty()
-        && let Some(root) = resolve_root_buf(scope.handle())
-        && let Some(func) = crate::api::ui::buf::click_fn(&root)
-    {
-        for &row in &item.clicks {
-            let Ok(data) = lua.create_table() else {
-                break;
-            };
-            let _ = data.set("row", row);
-            if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
-                tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
-                break;
-            }
-            run_inline_tasks(lua, &scope).await;
+        if let Some(buf) = crate::api::ui::buf::buf_from_reply(&ret) {
+            lock_cell(scope.handle()).root_buf = Some(buf);
         }
-    }
 
-    drop(scope);
+        if !item.clicks.is_empty()
+            && let Some(root) = resolve_root_buf(scope.handle())
+            && let Some(func) = crate::api::ui::buf::click_fn(&root)
+        {
+            for &row in &item.clicks {
+                let Ok(data) = lua.create_table() else {
+                    break;
+                };
+                let _ = data.set("row", row);
+                if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
+                    tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
+                    break;
+                }
+                run_inline_tasks(lua, &scope).await;
+            }
+        }
 
-    let mut reply = extract_restore_reply(&ret)?;
-    if reply.header.is_none() {
-        reply.header = Some(
-            compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
-                .await
-                .into_snapshot(),
-        );
-    }
-    Some(reply)
+        drop(scope);
+
+        let mut reply = extract_restore_reply(&ret)?;
+        if reply.header.is_none() {
+            reply.header = Some(
+                compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+                    .await
+                    .into_snapshot(),
+            );
+        }
+        Some(reply)
+    };
+    until_abandoned(render, &handle)
+        .await
+        .inspect_err(|reason| tracing::warn!(tool = &*tool, reason, "restore item abandoned"))
+        .ok()
+        .flatten()
 }
 
 /// Runs `maki.async.run` tasks queued during restore inline, so their
@@ -4835,13 +4909,12 @@ async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
         };
         for task in tasks {
             if !task.cancel.is_cancelled() {
-                // Its own cell: the window is per task, not the restore
-                // scope's, and only `until_abandoned` reads it.
-                let mut cell = TaskCell::new(
-                    task.cancel.clone(),
-                    Some(Instant::now() + RESTORE_ASYNC_DEADLINE),
-                    None,
-                );
+                // Its own cell carries the task's cancel and lineage, but no
+                // deadline. The task runs under the restore's cell, so a
+                // highlight wait only holds that cell's deadline, and a window
+                // of its own would kill the task mid-wait. The restore item's
+                // deadline still bounds it.
+                let mut cell = TaskCell::new(task.cancel.clone(), None, None);
                 cell.lineage = task.lineage.clone();
                 let handle = cell.into_handle();
                 let run = run_work_fn(lua, &task.work_fn, &handle);
@@ -4872,22 +4945,12 @@ fn spawn_restore(
     let plugins = Rc::clone(&rt.plugins);
     let g = Rc::clone(gate);
     restores.spawn_local(async move {
-        // Acquired before the timeout race starts, so the per-item deadline
-        // measures the item's own run, not time queued behind the whole batch.
+        // Acquired before the item starts, so its deadline measures the item's
+        // own run, not time queued behind the whole batch.
         let slot = Some(g.acquire().await);
         let id = item.tool_use_id.clone();
         let theme_gen = item.theme_gen;
-        let tool = Arc::clone(&item.tool);
-        let res = covered(
-            slot,
-            timeout(RESTORE_ITEM_TIMEOUT, restore_item(&lua, &plugins, item)),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::warn!(tool = &*tool, "restore item timed out");
-            None
-        });
-        if let Some(reply) = res {
+        if let Some(reply) = covered(slot, restore_item(&lua, &plugins, item)).await {
             reply.emit(&id, theme_gen, &event_tx);
         }
     });
@@ -6470,6 +6533,7 @@ mod tests {
         TaskScope,
         PendingLoad,
         Waiting,
+        HighlightWait,
     }
 
     const TEST_MODULE: &str = "slow";
@@ -6494,6 +6558,7 @@ mod tests {
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
     #[test_case(LuaOwned::PendingLoad ; "pending_load")]
     #[test_case(LuaOwned::Waiting ; "waiting")]
+    #[test_case(LuaOwned::HighlightWait ; "highlight_wait")]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
         let _runtime = HOST_RUNTIME.enter();
         let lua = Lua::new();
@@ -6574,7 +6639,42 @@ mod tests {
                     "the wait must be taken back"
                 );
             }
+            LuaOwned::HighlightWait => {
+                let mut cell = TaskCell::new(CancelToken::none(), Some(Instant::now()), None);
+                cell.lane = Lane::Background;
+                let handle = cell.into_handle();
+                let wait = HighlightWait::start(&handle).expect("a background task waits");
+                assert_eq!(
+                    lock_cell(&handle).live_deadline(),
+                    None,
+                    "the wait holds it"
+                );
+
+                drop_in_collector(&lua, wait);
+
+                assert!(
+                    lock_cell(&handle).live_deadline().is_some(),
+                    "the deadline must run again"
+                );
+            }
         }
+    }
+
+    /// A restore queued behind a big batch can wait on the highlight thread
+    /// long past its deadline. That wait must not count, or it loses its view.
+    #[tokio::test(start_paused = true)]
+    async fn a_highlight_wait_holds_off_the_deadline() {
+        const ANSWER: u32 = 7;
+        let mut cell = TaskCell::new(CancelToken::none(), Some(Instant::now()), None);
+        cell.lane = Lane::Background;
+        let handle = cell.into_handle();
+        let highlighting = async {
+            let wait = HighlightWait::start(&handle);
+            sleep(Duration::from_secs(3600)).await;
+            drop(wait);
+            ANSWER
+        };
+        assert_eq!(until_abandoned(highlighting, &handle).await, Ok(ANSWER));
     }
 
     #[test]

@@ -15,11 +15,16 @@
 //!
 //! Compiling a syntax's regexes the first time costs a further ~10 MB, but that
 //! one is global and paid once, so no amount of single-threading wins it back.
+//!
+//! One thread also means one line for everyone. Resuming a big session once
+//! queued thousands of restore jobs there, and the live transcript waited
+//! behind all of them. That is why the thread serves two [`Lane`]s.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::LazyLock;
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use tokio::sync::oneshot;
@@ -31,24 +36,81 @@ const THREAD_GONE: &str = "the highlight thread is gone";
 
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| job_thread(HIGHLIGHT_THREAD));
+static LANES: LazyLock<Arc<Lanes>> = LazyLock::new(lanes_thread);
+
+/// Which queue a highlight job waits in, declared in the order the thread
+/// serves them. Background work only gets the thread when nothing else waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    Foreground,
+    Background,
+}
+
+#[derive(Default)]
+struct Lanes {
+    queues: Mutex<[VecDeque<Job>; 2]>,
+    ready: Condvar,
+}
+
+impl Lanes {
+    fn lock(&self) -> MutexGuard<'_, [VecDeque<Job>; 2]> {
+        self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, lane: Lane, job: Job) {
+        self.lock()[lane as usize].push_back(job);
+        self.ready.notify_one();
+    }
+
+    fn next(&self) -> Job {
+        let mut queues = self.lock();
+        loop {
+            if let Some(job) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                return job;
+            }
+            queues = self
+                .ready
+                .wait(queues)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+fn lanes_thread() -> Arc<Lanes> {
+    let lanes = Arc::new(Lanes::default());
+    let worker = Arc::clone(&lanes);
+    spawn_named(HIGHLIGHT_THREAD, move || {
+        loop {
+            run_job(HIGHLIGHT_THREAD, worker.next());
+        }
+    });
+    lanes
+}
 
 /// Spawns a thread named {name} that runs the jobs sent to it one at a time,
 /// in order. A job that panics is logged and the thread goes on with the next.
 pub fn job_thread(name: &str) -> Sender<Job> {
     let (jobs, queued) = channel::<Job>();
     let thread_name = name.to_owned();
-    thread::Builder::new()
-        .name(thread_name.clone())
-        .spawn(move || {
-            while let Ok(job) = queued.recv() {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
-                    error!(thread = %thread_name, panic = panic_message(&*payload), "job panicked");
-                }
-            }
-        })
-        .unwrap_or_else(|e| panic!("failed to spawn the {name} thread: {e}"));
+    spawn_named(name, move || {
+        while let Ok(job) = queued.recv() {
+            run_job(&thread_name, job);
+        }
+    });
     jobs
+}
+
+fn spawn_named(name: &str, body: impl FnOnce() + Send + 'static) {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(body)
+        .unwrap_or_else(|e| panic!("failed to spawn the {name} thread: {e}"));
+}
+
+fn run_job(thread_name: &str, job: Job) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
+        error!(thread = %thread_name, panic = panic_message(&*payload), "job panicked");
+    }
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
@@ -62,13 +124,16 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 /// Runs `f` on the highlight thread and waits without occupying a blocking
 /// worker. Dropping the future discards queued work; a job already running
 /// cannot be interrupted.
-pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub async fn run_async<T: Send + 'static>(lane: Lane, f: impl FnOnce() -> T + Send + 'static) -> T {
     let (done_tx, done_rx) = oneshot::channel();
-    spawn(move || {
-        if !done_tx.is_closed() {
-            let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
-        }
-    });
+    LANES.push(
+        lane,
+        Box::new(move || {
+            if !done_tx.is_closed() {
+                let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
+            }
+        }),
+    );
     match done_rx.await {
         Ok(Ok(value)) => value,
         Ok(Err(payload)) => resume_unwind(payload),
@@ -77,7 +142,7 @@ pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
 }
 
 pub fn spawn(f: impl FnOnce() + Send + 'static) {
-    let _ = JOBS.send(Box::new(f));
+    LANES.push(Lane::Foreground, Box::new(f));
 }
 
 #[cfg(test)]
@@ -92,7 +157,7 @@ mod tests {
     use test_case::test_case;
     use tokio::task::JoinSet;
 
-    use super::{panic_message, run_async, spawn};
+    use super::{Lane, Lanes, panic_message, run_async, spawn};
 
     const PAYLOAD: usize = 41;
     const WAITERS: usize = 8;
@@ -108,7 +173,7 @@ mod tests {
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
-        let mut pending = Box::pin(run_async(move || {
+        let mut pending = Box::pin(run_async(Lane::Foreground, move || {
             count.fetch_add(1, Ordering::SeqCst);
             PAYLOAD
         }));
@@ -117,7 +182,7 @@ mod tests {
         if cancel {
             drop(pending);
             release_tx.send(()).unwrap();
-            run_async(|| ()).await;
+            run_async(Lane::Foreground, || ()).await;
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         } else {
             release_tx.send(()).unwrap();
@@ -126,9 +191,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_foreground_job_jumps_queued_background_work() {
+        let lanes = Lanes::default();
+        let (ran_tx, ran_rx) = channel();
+        for lane in [Lane::Background, Lane::Foreground] {
+            let ran_tx = ran_tx.clone();
+            lanes.push(lane, Box::new(move || ran_tx.send(lane).unwrap()));
+        }
+        lanes.next()();
+        lanes.next()();
+        assert_eq!(
+            ran_rx.try_iter().collect::<Vec<_>>(),
+            [Lane::Foreground, Lane::Background]
+        );
+    }
+
     #[tokio::test]
     async fn runs_job_and_returns_value() {
-        assert_eq!(run_async(|| PAYLOAD + 1).await, PAYLOAD + 1);
+        assert_eq!(
+            run_async(Lane::Foreground, || PAYLOAD + 1).await,
+            PAYLOAD + 1
+        );
     }
 
     #[tokio::test]
@@ -138,7 +222,7 @@ mod tests {
             let ran_tx = ran_tx.clone();
             spawn(move || ran_tx.send(job).unwrap());
         }
-        run_async(|| ()).await;
+        run_async(Lane::Foreground, || ()).await;
         assert_eq!(
             ran_rx.try_iter().collect::<Vec<_>>(),
             (0..WAITERS).collect::<Vec<_>>()
@@ -149,7 +233,7 @@ mod tests {
     async fn every_job_runs_on_one_thread() {
         let mut waiters = JoinSet::new();
         for _ in 0..WAITERS {
-            waiters.spawn(run_async(|| thread::current().id()));
+            waiters.spawn(run_async(Lane::Foreground, || thread::current().id()));
         }
         let ids = waiters.join_all().await;
         assert!(
@@ -161,12 +245,12 @@ mod tests {
     #[tokio::test]
     async fn survives_a_panicking_job() {
         spawn(|| panic!("{BOOM}"));
-        assert_eq!(run_async(|| PAYLOAD).await, PAYLOAD);
+        assert_eq!(run_async(Lane::Foreground, || PAYLOAD).await, PAYLOAD);
     }
 
     #[tokio::test]
     async fn run_async_resumes_the_job_panic() {
-        let payload = tokio::spawn(run_async::<()>(|| panic!("{BOOM}")))
+        let payload = tokio::spawn(run_async::<()>(Lane::Foreground, || panic!("{BOOM}")))
             .await
             .expect_err("job must panic")
             .into_panic();

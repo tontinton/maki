@@ -627,7 +627,7 @@ fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedSte
             },
         })
         .collect();
-    let (restored, _) = crate::chat::history_to_display(
+    let restored = crate::chat::history_to_display(
         &history,
         &HashMap::new(),
         &app.ui_config.tool_output_lines,
@@ -11676,7 +11676,7 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     let previous = app.state.session.id;
     let probe = probe_events(&mut app);
     app.restore_event_tx = Some(maki_agent::EventSender::new(unbounded_channel().0, 0));
-    let (_, items) = crate::chat::history_to_display(
+    let display = crate::chat::history_to_display(
         &[
             tool_use_msg(SUB_TOOL_ID),
             tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)),
@@ -11686,7 +11686,8 @@ fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
     );
 
     app.reset_session();
-    app.chats[0].request_restores(items);
+    app.chats[0].load_messages(display);
+    app.chats[0].request_restores();
 
     let item = probe.try_recv_restore_item().expect("the call is restored");
     assert_ne!(app.state.session.id, previous);
@@ -12587,7 +12588,7 @@ fn a_notice_keeps_its_detail_live_and_on_restore(markdown: bool) {
         .message_at(chat.message_count() - 1)
         .and_then(|row| row.detail.clone());
 
-    let (restored, _) = crate::chat::history_to_display(
+    let restored = crate::chat::history_to_display(
         &[notice],
         &HashMap::new(),
         &app.ui_config.tool_output_lines,

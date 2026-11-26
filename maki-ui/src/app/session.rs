@@ -332,7 +332,7 @@ impl App {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
-        let (display_msgs, restore_items) = history_to_display(
+        let display_msgs = history_to_display(
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
@@ -349,7 +349,7 @@ impl App {
             self.restore_input(&draft, writers);
         }
 
-        self.chats[MAIN_CHAT].request_restores(restore_items);
+        self.chats[MAIN_CHAT].request_restores();
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -366,7 +366,7 @@ impl App {
             if self.chat_of_task(&sa.tool_use_id).is_ok() {
                 continue;
             }
-            let (display, items) = history_to_display(
+            let display = history_to_display(
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
@@ -398,7 +398,9 @@ impl App {
             // After mark_finished, which would stop a still-running clock at
             // the reload instead of the task's end.
             chat.clock = TaskClock::from_unix(sa.started_at, sa.ended_at);
-            chat.request_restores(items);
+            // A subagent chat is only seen once opened, so its restores wait
+            // for that instead of holding up the spinner.
+            chat.defer_restores();
             self.chats.push(chat);
         }
 
