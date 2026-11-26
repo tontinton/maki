@@ -225,6 +225,8 @@ fn read_restore_keeps_nearby_comment_colors_with_large_context(ending: &str) {
 #[test_case(None, "cd src && echo hi", "in src" ; "undescribed_past_a_cd")]
 #[test_case(Some("print hi"), "cd src && echo hi", "print hi in src" ; "described_past_a_cd")]
 #[test_case(Some("echo hi"), "cd src && echo hi", "in src" ; "described_by_its_command_past_a_cd")]
+#[test_case(Some("print hi"), "cd src 2>/dev/null && echo hi", "print hi" ; "no_dir_for_a_refused_cd_hint")]
+#[test_case(Some("print hi"), r"cd C:\src && echo hi", "print hi in C:\\src" ; "windows_drive_cd_keeps_its_dir")]
 fn bash_restore_titles_a_call_and_shows_its_command(
     description: Option<&str>,
     command: &str,
