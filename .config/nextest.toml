@@ -26,3 +26,8 @@ threads-required = 'num-test-threads'
 [[profile.ci.overrides]]
 filter = 'test(=bash_full_mode_fails_once_output_passes_the_ceiling)'
 threads-required = 'num-test-threads'
+
+# Compiling the markdown syntax takes ~5s of CPU in a debug build, which 63 neighbours on 4 cores stretch past the 30s restore barrier.
+[[profile.ci.overrides]]
+filter = 'test(=skill_restore_renders_content_not_llm_text)'
+threads-required = 'num-test-threads'
