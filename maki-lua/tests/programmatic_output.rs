@@ -594,11 +594,12 @@ fn webfetch_keeps_only_the_main_element(format: &str) {
     assert_eq!(output.trim(), PAGE_BODY);
 }
 
-#[test]
-fn webfetch_saves_a_long_page_and_replies_with_its_outline() {
+#[test_case::test_case("word ", " " ; "wrapped_at_spaces")]
+#[test_case::test_case("\u{8a9e}", "" ; "cut_between_characters_without_spaces")]
+fn webfetch_saves_a_long_page_and_replies_with_its_outline(word: &str, joiner: &str) {
     let (_registry, _host, mut ctx) = setup();
     ctx.session_id = Some(SessionRef::generate());
-    let paragraph = "word ".repeat(MODEL_BYTES);
+    let paragraph = word.repeat(MODEL_BYTES);
     let page = format!("<h1>Title</h1><p>{paragraph}</p><h2>End</h2><p>{LAST_ITEM}</p>");
     let (url, server) = serve_once(HTML_TYPE, page.as_bytes());
     let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
@@ -612,6 +613,7 @@ fn webfetch_saves_a_long_page_and_replies_with_its_outline() {
     let saved = fs::read_to_string(path).unwrap();
     let lines: Vec<&str> = saved.lines().collect();
     assert!(lines.iter().all(|line| line.len() <= READ_LINE_BYTES));
+    assert!(saved.replace('\n', joiner).contains(paragraph.trim()));
     assert_eq!(lines.last(), Some(&LAST_ITEM));
     let heading_line: usize = output
         .lines()

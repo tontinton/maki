@@ -6,6 +6,7 @@ local CONTENT_ROOT_TAGS = { "main" }
 local PROSE_TYPES = { "text/html", "text/markdown", "text/plain" }
 -- `read` cuts a line at 500 bytes by default, and a paragraph is one line.
 local WRAP_BYTES = 400
+local UTF8_CONTINUATION = "^[\128-\191]"
 local FENCE = "^%s*[`~][`~][`~]"
 local HEADING = "^#+ "
 local UNWRAPPED = "^[|#]"
@@ -54,7 +55,7 @@ local function is_prose(content_type: string): boolean
   return false
 end
 
--- Breaks long lines at spaces so `read` shows all of them, and notes where
+-- Breaks long lines, at a space where there is one, so `read` shows all of them, and notes where
 -- each heading lands. Code blocks, table rows and headings stay as they are.
 local function lay_out(text: string): ({ string }, { string })
   local lines: { string }, headings: { string } = {}, {}
@@ -68,11 +69,17 @@ local function lay_out(text: string): ({ string }, { string })
     if not fenced and not line:find(UNWRAPPED) then
       while #line > WRAP_BYTES do
         local space = line:sub(1, WRAP_BYTES):match("^.*() ")
-        if not space or space == 1 then
-          break
+        local cut, skipped = WRAP_BYTES, 0
+        if space and space > 1 then
+          cut, skipped = space - 1, 1
+        else
+          -- Text written without spaces, like Chinese, is cut between characters.
+          while cut > 1 and line:find(UTF8_CONTINUATION, cut + 1) do
+            cut = cut - 1
+          end
         end
-        lines[#lines + 1] = line:sub(1, space - 1)
-        line = line:sub(space + 1)
+        lines[#lines + 1] = line:sub(1, cut)
+        line = line:sub(cut + skipped + 1)
       end
     end
     lines[#lines + 1] = line
