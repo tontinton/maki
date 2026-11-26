@@ -584,14 +584,15 @@ fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str) {
+fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str, bool) {
     match &messages[m].content[b] {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
+            is_error,
             ..
-        } => (tool_use_id, content),
-        _ => ("", ""),
+        } => (tool_use_id, content, *is_error),
+        _ => ("", "", false),
     }
 }
 
@@ -655,7 +656,7 @@ fn prepare_value(
         .iter()
         .enumerate()
         .map(|(i, &pos)| {
-            let (tool_use_id, text) = tool_result(messages, pos);
+            let (tool_use_id, text, is_error) = tool_result(messages, pos);
             let (tool, input) = calls
                 .get(tool_use_id)
                 .map_or((None, None), |(name, input)| (Some(*name), Some(*input)));
@@ -665,6 +666,7 @@ fn prepare_value(
                 "input": input,
                 "bytes": text.len(),
                 "text": truncate_bytes(text, PREPARE_TEXT_MAX),
+                "is_error": is_error,
             })
         })
         .collect();
@@ -1903,7 +1905,7 @@ mod tests {
                 role: Role::User,
                 content: vec![
                     ContentBlock::tool_result("t1", OLD_RESULT, false),
-                    ContentBlock::tool_result("t2", NEW_RESULT, false),
+                    ContentBlock::tool_result("t2", NEW_RESULT, true),
                 ],
                 ..Default::default()
             },
@@ -1926,6 +1928,8 @@ mod tests {
         assert_eq!(slot, AgentSlot::CompactPrepare);
         assert_eq!(value[FIELD_COLLAPSE], json!([1]));
         assert_eq!(value["results"][0]["tool"], TOOL);
+        assert_eq!(value["results"][0]["is_error"], false);
+        assert_eq!(value["results"][1]["is_error"], true);
         let contents: Vec<&str> = messages[1]
             .content
             .iter()

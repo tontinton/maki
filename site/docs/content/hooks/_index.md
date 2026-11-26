@@ -387,8 +387,9 @@ Before summarizing, maki replaces older tool results with a placeholder so the
 summarizer reads the recent ones in full. This slot picks which ones.
 
 `results` lists every tool result, oldest first, as
-`{ index, tool, input, bytes, text }`, with `text` cut to 4 KB. `index` is the
-position in `results`. `budget` is how many bytes of results maki keeps in full,
+`{ index, tool, input, bytes, text, is_error }`, with `text` cut to 4 KB. `index`
+is the position in `results`, and `is_error` is true when the tool call failed.
+`budget` is how many bytes of results maki keeps in full,
 and `collapse` holds the indexes it picked. Set `collapse` to replace that pick.
 This layer keeps every `todo_write` result:
 
