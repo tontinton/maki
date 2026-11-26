@@ -197,6 +197,8 @@ tree-sitter-starlark = "1"
 tree-sitter-swift = "0.7"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
+tree-sitter-systemverilog = "0.4"
+tree-sitter-vhdl = "1"
 tree-sitter-vlang = "0.1"
 tree-sitter-zig = "1"
 tree-sitter-dart = "0.3"
@@ -228,7 +230,7 @@ debug = true
 debug = false
 
 # `cc` reads DEBUG from here and passes -g when it is on, which covers the C
-# and C++ we build from source: aws-lc, Luau and 30 tree-sitter
+# and C++ we build from source: aws-lc, Luau and 32 tree-sitter
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false

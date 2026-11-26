@@ -1,70 +1,86 @@
 local FIELD_TRUNCATE_THRESHOLD = 8
 local LINE_WRAP_THRESHOLD = 120
 local MAX_INT = math.maxinteger or (2 ^ 53)
+-- The parser speaks for itself: an error means it could not build a complete
+-- tree, which covers a broken file, a macro it cannot expand, and input cut
+-- short, without claiming which.
 local PARSE_ERROR_NOTE = "[no entries: file has syntax errors - use the read tool instead]"
+-- A partial index is otherwise indistinguishable from a clean one, so it says so
+-- in-band, the way a truncated list marks itself.
+local PARTIAL_INDEX_NOTE = "[partial index: parser reported errors]"
 
+-- Every extension maps to the grammars to try, in order. The first that parses
+-- the file without errors wins. When none does, the first one that produced a
+-- partial skeleton is used, so a refusal cannot shadow a partial index. Most
+-- extensions name a single grammar. `.v` stays V first, as it always was, and
+-- only reaches systemverilog when V's grammar rejects the file.
 local EXT_TO_LANG = {
-  rs = "rust",
-  py = "python",
-  pyi = "python",
-  ts = "typescript",
-  tsx = "tsx",
-  js = "javascript",
-  jsx = "tsx",
-  mjs = "javascript",
-  cjs = "javascript",
-  gleam = "gleam",
-  go = "go",
-  htm = "html",
-  html = "html",
-  java = "java",
-  c = "c",
-  h = "c",
-  cpp = "cpp",
-  cc = "cpp",
-  cxx = "cpp",
-  hpp = "cpp",
-  hxx = "cpp",
-  hh = "cpp",
-  ixx = "cpp",
-  cs = "c_sharp",
-  rb = "ruby",
-  rake = "ruby",
-  gemspec = "ruby",
-  php = "php",
-  swift = "swift",
-  kt = "kotlin",
-  kts = "kotlin",
-  scala = "scala",
-  sc = "scala",
-  sh = "bash",
-  bash = "bash",
-  zsh = "bash",
-  lua = "lua_lang",
-  ex = "elixir",
-  exs = "elixir",
-  md = "markdown",
-  markdown = "markdown",
-  clj = "clojure",
-  cljs = "clojure",
-  cljc = "clojure",
-  bb = "clojure",
-  bzl = "bazel_bzl",
-  v = "v",
-  zig = "zig",
-  nix = "nix",
-  dart = "dart",
-  toml = "toml",
-  yaml = "yaml",
-  yml = "yaml",
-  sql = "sql",
-  css = "css",
-  json = "json",
-  hcl = "hcl",
-  tf = "hcl",
-  tfvars = "hcl",
-  dockerfile = "containerfile",
-  mk = "make",
+  rs = { "rust" },
+  py = { "python" },
+  pyi = { "python" },
+  ts = { "typescript" },
+  tsx = { "tsx" },
+  js = { "javascript" },
+  jsx = { "tsx" },
+  mjs = { "javascript" },
+  cjs = { "javascript" },
+  gleam = { "gleam" },
+  go = { "go" },
+  htm = { "html" },
+  html = { "html" },
+  java = { "java" },
+  c = { "c" },
+  h = { "c" },
+  cpp = { "cpp" },
+  cc = { "cpp" },
+  cxx = { "cpp" },
+  hpp = { "cpp" },
+  hxx = { "cpp" },
+  hh = { "cpp" },
+  ixx = { "cpp" },
+  cs = { "c_sharp" },
+  rb = { "ruby" },
+  rake = { "ruby" },
+  gemspec = { "ruby" },
+  php = { "php" },
+  swift = { "swift" },
+  kt = { "kotlin" },
+  kts = { "kotlin" },
+  scala = { "scala" },
+  sc = { "scala" },
+  sh = { "bash" },
+  bash = { "bash" },
+  zsh = { "bash" },
+  lua = { "lua_lang" },
+  ex = { "elixir" },
+  exs = { "elixir" },
+  md = { "markdown" },
+  markdown = { "markdown" },
+  clj = { "clojure" },
+  cljs = { "clojure" },
+  cljc = { "clojure" },
+  bb = { "clojure" },
+  bzl = { "bazel_bzl" },
+  v = { "v", "systemverilog" },
+  zig = { "zig" },
+  nix = { "nix" },
+  dart = { "dart" },
+  toml = { "toml" },
+  yaml = { "yaml" },
+  yml = { "yaml" },
+  sql = { "sql" },
+  css = { "css" },
+  json = { "json" },
+  hcl = { "hcl" },
+  tf = { "hcl" },
+  tfvars = { "hcl" },
+  dockerfile = { "containerfile" },
+  mk = { "make" },
+  vhd = { "vhdl" },
+  vhdl = { "vhdl" },
+  vh = { "systemverilog" },
+  sv = { "systemverilog" },
+  svh = { "systemverilog" },
 }
 
 local FILENAME_TO_LANG = {
@@ -130,6 +146,36 @@ local function compact_ws(s)
   return (s:gsub("%s+", " "))
 end
 
+-- Source spacing is not information: a file may pad inside brackets or
+-- parentheses, and those spaces cost tokens without adding meaning. The
+-- languages that pad this way call this from their own helpers, so the rule
+-- reaches them without touching the 100+ other callers of `compact_ws`.
+local function one_line(node, source)
+  return (
+    compact_ws(get_text(node, source))
+      :gsub("%s+$", "")
+      :gsub("([%[%(])%s+", "%1")
+      :gsub("%s+([%]%)])", "%1")
+      :gsub("(%d)%s+:%s+(%d)", "%1:%2")
+  )
+end
+
+local function statement_line(node, source)
+  return (one_line(node, source):gsub("%s*;$", ""))
+end
+
+local function field_text(node, field, source)
+  local value = node:field(field)[1]
+  return value and get_text(value, source) or nil
+end
+
+local function add_all(dst, src)
+  for _, item in ipairs(src) do
+    dst[#dst + 1] = item
+  end
+  return dst
+end
+
 local function truncate(s, max)
   if #s <= max then
     return s
@@ -145,8 +191,38 @@ local function truncate(s, max)
   return cut .. "[truncated]"
 end
 
-local function truncated_msg(total)
-  return "[" .. (total - FIELD_TRUNCATE_THRESHOLD) .. " more truncated]"
+local function truncated_msg(total, limit)
+  return "[" .. (total - (limit or FIELD_TRUNCATE_THRESHOLD)) .. " more truncated]"
+end
+
+-- Buckets that keep their first FIELD_TRUNCATE_THRESHOLD members, so a
+-- per-category budget holds however many sources fill it. `get` takes an
+-- optional marker builder for lists whose marker must be a rich item, such as
+-- an entry carrying a line range.
+--
+-- Members on one line share a line number, so reuniting the categories cannot
+-- recover their order among themselves. That order does not matter: the line is
+-- the address a reader acts on.
+local function capped_buckets(limit)
+  limit = limit or FIELD_TRUNCATE_THRESHOLD
+  local buckets, counts = {}, {}
+  local api = {}
+  function api.push(key, item)
+    counts[key] = (counts[key] or 0) + 1
+    if counts[key] > limit then
+      return
+    end
+    buckets[key] = buckets[key] or {}
+    buckets[key][#buckets[key] + 1] = item
+  end
+  function api.get(key, marker)
+    local kept = buckets[key] or {}
+    if (counts[key] or 0) > limit then
+      kept[#kept + 1] = marker and marker(key, counts[key]) or truncated_msg(counts[key], limit)
+    end
+    return kept
+  end
+  return api
 end
 
 local function wrap_csv(items, indent)
@@ -348,6 +424,7 @@ local SECTIONS = {
   { key = "Instruction", header = "instructions:" },
   { key = "Target", header = "targets:" },
   { key = "Block", header = "blocks:" },
+  { key = "DesignUnit", header = "units:" },
   { key = "Type", header = "types:" },
   { key = "Trait", header = "traits:" },
   { key = "Impl", header = "impls:" },
@@ -562,7 +639,7 @@ end
 local render_item_lines
 
 local TRUNCATED_SUFFIX = "[truncated]"
-local TRUNCATED_INFIX = " more truncated]"
+local TRUNCATED_INFIX = " truncated]"
 
 local function ends_with_truncation(s)
   if s:sub(-#TRUNCATED_SUFFIX) == TRUNCATED_SUFFIX then
@@ -790,9 +867,14 @@ local U = {
   line_end = line_end,
   find_child = find_child,
   compact_ws = compact_ws,
+  one_line = one_line,
+  statement_line = statement_line,
+  field_text = field_text,
+  add_all = add_all,
   TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
   truncate = truncate,
   truncated_msg = truncated_msg,
+  capped_buckets = capped_buckets,
   new_entry = new_entry,
   new_import_entry = new_import_entry,
   simple_import = simple_import,
@@ -864,10 +946,16 @@ local LANG_ALIASES = {
 }
 
 local KNOWN_LANGS = {}
-for _, map in ipairs({ EXT_TO_LANG, FILENAME_TO_LANG }) do
-  for _, lang in pairs(map) do
-    KNOWN_LANGS[LANG_ALIASES[lang] or lang] = true
+local function known(lang)
+  KNOWN_LANGS[LANG_ALIASES[lang] or lang] = true
+end
+for _, langs in pairs(EXT_TO_LANG) do
+  for _, lang in ipairs(langs) do
+    known(lang)
   end
+end
+for _, lang in pairs(FILENAME_TO_LANG) do
+  known(lang)
 end
 
 -- One index call needs one language, and requiring all ~34 extractors up front
@@ -898,24 +986,68 @@ local function extractor_for(name)
   return extract
 end
 
-local function index_source(source, lang_name)
+local function run(source, lang_name)
   local extractor = extractor_for(LANG_ALIASES[lang_name] or lang_name)
   if not extractor then
     return nil, "unsupported language: " .. tostring(lang_name)
   end
-  local parser = maki.treesitter.get_parser(source, parser_name(lang_name))
+  local parser, parse_err = maki.treesitter.get_parser(source, parser_name(lang_name))
+  if not parser then
+    return nil, tostring(parse_err)
+  end
   local root = parser:parse()[1]:root()
   local skeleton, meta = extractor(source, root)
-  -- An empty skeleton reads as "this file declares nothing", and that is the
-  -- wrong story to tell when the parser choked on the file instead.
-  if skeleton == "" and root:has_error() then
-    skeleton = PARSE_ERROR_NOTE .. "\n"
+  return skeleton, meta, root
+end
+
+-- Callers pass an extension's candidate list, or a bare language name (the
+-- specs do), which is treated as a single candidate.
+local function index_source(source, lang)
+  local candidates = type(lang) == "table" and lang or { lang }
+  local partial
+  local refusal
+  for _, candidate in ipairs(candidates) do
+    local skeleton, meta, root = run(source, candidate)
+    if skeleton then
+      local errored = root:has_error()
+      -- A clean parse has said all it has to say about the file, even when it
+      -- found nothing, so the next grammar is not tried.
+      if not errored then
+        return skeleton, meta
+      end
+      partial = partial or { skeleton, meta, root }
+    else
+      -- An extractor may refuse the file outright (V does when its grammar
+      -- rejects it). That is no better than a partial skeleton, so keep looking.
+      refusal = refusal or meta
+    end
   end
-  return skeleton, meta
+  if not partial then
+    return nil, refusal
+  end
+  local skeleton, meta, root = partial[1], partial[2], partial[3]
+  -- An empty skeleton reads as "this file declares nothing", which is the wrong
+  -- story for a file the parser could not read.
+  if skeleton == "" and root:has_error() then
+    return PARSE_ERROR_NOTE .. "\n", meta
+  end
+  -- The note is for a file one grammar could not read and another only partly
+  -- could: a single grammar that parsed most of the file has just reported its
+  -- own error the usual way, so it says nothing extra.
+  if not refusal then
+    return skeleton, meta
+  end
+  -- The note takes line 1, so every line's meta moves down one.
+  local shifted = {}
+  for line, value in pairs(meta or {}) do
+    shifted[type(line) == "number" and line + 1 or line] = value
+  end
+  return PARTIAL_INDEX_NOTE .. "\n" .. skeleton, shifted
 end
 
 local LANG_TO_EXT = {}
-for ext, lang in pairs(EXT_TO_LANG) do
+for ext, langs in pairs(EXT_TO_LANG) do
+  local lang = langs[1]
   if not LANG_TO_EXT[lang] then
     LANG_TO_EXT[lang] = ext
   end
@@ -928,4 +1060,5 @@ return {
   FILENAME_TO_LANG = FILENAME_TO_LANG,
   TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
   PARSE_ERROR_NOTE = PARSE_ERROR_NOTE,
+  PARTIAL_INDEX_NOTE = PARTIAL_INDEX_NOTE,
 }

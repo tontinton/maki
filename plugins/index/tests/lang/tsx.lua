@@ -22,11 +22,6 @@ case("tsx_jsx_in_javascript_sources", function()
   has(idx("export const x = <T a={<B c={d} />} />;", JS_LANG), { "export x = <T />" })
 end)
 
-case("tsx_and_jsx_extensions_route_to_the_tsx_grammar", function()
-  eq(indexer.EXT_TO_LANG.tsx, TSX_LANG)
-  eq(indexer.EXT_TO_LANG.jsx, TSX_LANG)
-end)
-
 case("tsx_keeps_typescript_constructs", function()
   local src = [==[import { useState } from 'react';
 

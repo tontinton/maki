@@ -5,6 +5,7 @@
 -- existing file as a template) and adding a require line below — keep them
 -- alphabetized.
 
+local indexer = require("indexer")
 local th = require("maki.test_helpers")
 local case = th.case
 local eq = th.eq
@@ -53,6 +54,7 @@ case("dir_listing_sort_and_filter", function()
   rmtree(tmpdir)
 end)
 require("tests.indexer_core")
+require("tests.routing")
 require("tests.lang.bash")
 require("tests.lang.bazel")
 require("tests.lang.c")
@@ -81,11 +83,35 @@ require("tests.lang.rust")
 require("tests.lang.scala")
 require("tests.lang.sql")
 require("tests.lang.swift")
+require("tests.lang.systemverilog")
 require("tests.lang.toml")
 require("tests.lang.tsx")
 require("tests.lang.typescript")
 require("tests.lang.v")
+require("tests.lang.vhdl")
 require("tests.lang.yaml")
 require("tests.lang.zig")
+
+-- Every language the indexer routes an extension to must have a parser on the
+-- Rust side. `.sv` shipped registered in language.rs but absent from the tables
+-- here, so the tool refused those files; this pins the two layers together.
+case("every_routed_language_has_a_parser", function()
+  local names = {}
+  local function add(name)
+    names[name] = true
+  end
+  for _, langs in pairs(indexer.EXT_TO_LANG) do
+    for _, lang in ipairs(langs) do
+      add(lang)
+    end
+  end
+  for _, lang in pairs(indexer.FILENAME_TO_LANG) do
+    add(lang)
+  end
+  for name in pairs(names) do
+    local skeleton, err = indexer.index_source("", name)
+    assert(skeleton ~= nil, name .. ": " .. tostring(err))
+  end
+end)
 
 th.report()
