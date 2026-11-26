@@ -2481,71 +2481,119 @@ fn agent_error() -> AgentEvent {
     }
 }
 
-/// A plugin task is a chat like a tool task, but routed by id: `chat_index`
-/// is the running turn's map, and the main chat is idle here.
-/// A plugin fan-out: the first session a call opens inherits the call id, so
-/// its row is the call's own; a later sibling arrives under a fresh id with
-/// the call as its parent. Closing the sibling settles only its row, and the
-/// call's row keeps running until its own end.
-#[test]
-fn a_fanout_sibling_closes_without_settling_the_call_row() {
-    let mut app = test_app();
-    let call_id = "toolu_call";
-    let mut first = subagent_info(call_id, "specialist:review");
-    first.prompt = Some("go".into());
-    app.deliver(
-        Envelope {
-            event: AgentEvent::TextDelta { text: "x".into() },
-            subagent: Some(first),
-            run_id: 0,
-        },
-        None,
-    );
-    let mut sibling = subagent_info("session-second", "other:review");
-    sibling.prompt = Some("go too".into());
-    sibling.parent_call = Some(call_id.into());
+fn app_with_fanout(moved: bool, receipt_first: bool) -> (App, SubagentInfo) {
+    let mut app = if receipt_first {
+        let mut app = streaming_app();
+        app.update(agent_msg(tool_start(TASK_ID, SLOW_TOOL)));
+        receive_receipt(&mut app);
+        moved_subagent_event(
+            &mut app,
+            TASK_ID,
+            AgentEvent::TextDelta { text: "x".into() },
+        );
+        app
+    } else {
+        app_with_subagent_call(TASK_ID)
+    };
+    if moved && !receipt_first {
+        receive_receipt(&mut app);
+    }
+    let plugin = moved.then(|| Arc::from(SLOW_TOOL));
+    let mut sibling = subagent_info(FANOUT_SIBLING_ID, "second specialist");
+    sibling.parent_call = Some(TASK_ID.into());
     app.deliver(
         Envelope {
             event: AgentEvent::TextDelta { text: "y".into() },
             subagent: Some(sibling.clone()),
             run_id: 0,
         },
-        None,
+        plugin,
     );
-    assert_eq!(app.chats.len(), 3);
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
-    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
-
-    // The sibling's run ends and its session reports its transcript: only
-    // its row settles, the call's stays working.
-    app.deliver(
-        Envelope {
-            event: monitor_turn(),
-            subagent: Some(sibling),
-            run_id: 0,
-        },
-        None,
-    );
-    app.deliver(
-        Envelope {
-            event: AgentEvent::SubagentHistory {
-                tool_use_id: "session-second".into(),
-                messages: Vec::new(),
-            },
-            subagent: None,
-            run_id: 0,
-        },
-        None,
-    );
-    assert_eq!(app.chats[2].task_status(), TaskStatus::Done);
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
-
-    // The call's row stays working: only its own end may settle it, which
-    // the run-end sweep owns.
-    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
-    assert_eq!(app.chats.len(), 3);
+    (app, sibling)
 }
 
+const FANOUT_SIBLING_ID: &str = "session-second";
+
+#[test_case(false, false ; "foreground")]
+#[test_case(true, false ; "moved_after_first_session_speaks")]
+#[test_case(true, true ; "moved_before_first_session_speaks")]
+fn a_fanout_lists_both_sessions_until_and_after_they_close(moved: bool, receipt_first: bool) {
+    let (mut app, sibling) = app_with_fanout(moved, receipt_first);
+    assert_eq!(app.chats[1].name, RESEARCH_NAME);
+    let visible = |app: &App| {
+        serde_json::to_value(app.tasks())
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["status"].is_string() && row["wrapper"] != true)
+            .map(|row| (row["id"].clone(), row["status"].clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        visible(&app),
+        [
+            (TASK_ID.into(), "working".into()),
+            (FANOUT_SIBLING_ID.into(), "working".into())
+        ],
+    );
+    if moved {
+        app.deliver(
+            Envelope {
+                event: AgentEvent::StreamClosed,
+                subagent: Some(sibling),
+                run_id: 0,
+            },
+            Some(Arc::from(SLOW_TOOL)),
+        );
+    } else {
+        close_subagent_transcript(&mut app, FANOUT_SIBLING_ID);
+    }
+    assert_eq!(
+        visible(&app),
+        [
+            (TASK_ID.into(), "working".into()),
+            (FANOUT_SIBLING_ID.into(), "done".into())
+        ],
+    );
+    if moved {
+        moved_subagent_event(&mut app, TASK_ID, AgentEvent::StreamClosed);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+        app.deliver(
+            Envelope {
+                event: slow_tool_done(TASK_ID, false),
+                subagent: None,
+                run_id: 0,
+            },
+            Some(Arc::from(SLOW_TOOL)),
+        );
+    } else {
+        close_subagent_transcript(&mut app, TASK_ID);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+        app.update(agent_msg(slow_tool_done(TASK_ID, false)));
+    }
+    assert_eq!(
+        visible(&app),
+        [
+            (TASK_ID.into(), "done".into()),
+            (FANOUT_SIBLING_ID.into(), "done".into())
+        ],
+    );
+}
+
+#[test]
+fn stopping_the_first_foreground_session_leaves_its_sibling_running() {
+    let (mut app, _) = app_with_fanout(false, false);
+    assert!(matches!(
+        app.stop_task(TASK_ID),
+        Ok(Action::CancelSubagent { tool_use_id }) if tool_use_id == TASK_ID
+    ));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Cancelled);
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+}
+
+/// A plugin task is a chat like a tool task, but routed by id: `chat_index`
+/// is the running turn's map, and the main chat is idle here.
 #[test]
 fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
     let app = app_with_plugin_task();

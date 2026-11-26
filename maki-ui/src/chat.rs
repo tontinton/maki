@@ -78,6 +78,7 @@ pub struct Chat {
     /// Shows a call moved off its turn. The call is out until its final
     /// result, whatever its runs do in between, so it never reads idle.
     pub(crate) backs_moved_call: bool,
+    pub(crate) has_subagent: bool,
     /// The moved call `/tasks` lists this task under.
     pub(crate) parent: Option<TaskParent>,
     pub(crate) clock: Option<TaskClock>,
@@ -129,6 +130,7 @@ impl Chat {
             idle: false,
             auth_parked: false,
             backs_moved_call: false,
+            has_subagent: false,
             parent: None,
             clock: None,
             cost: None,

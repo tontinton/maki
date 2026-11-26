@@ -85,7 +85,17 @@ end
 -- stops alone and returns nil.
 function M.stopped_parent(task, tasks)
   local parent = task.part and index_by_id(tasks)[task.parent]
-  return parent and alive(parent.status) and parent or nil
+  if parent and alive(parent.status) then
+    return parent
+  end
+  if task.plugin and alive(task.status) then
+    for _, child in ipairs(tasks) do
+      if child.parent == task.id and not child.part and alive(child.status) then
+        return task
+      end
+    end
+  end
+  return nil
 end
 
 local function dispw(s)

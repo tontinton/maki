@@ -162,6 +162,14 @@ case("only_a_part_of_a_running_call_stops_its_parent", function()
   eq(Rows.stopped_parent(part, { MAIN, finished_batch, part }), nil, "a finished call stops nothing")
 end)
 
+case("stopping_a_moved_fanout_call_asks_before_stopping_its_sessions", function()
+  local moved = { id = BATCH.id, name = RESEARCH.name, status = "working", plugin = "delegate" }
+  local foreground = { id = moved.id, name = moved.name, status = moved.status }
+  eq(Rows.stopped_parent(moved, { moved, CHILD_RUNNING }), moved)
+  eq(Rows.stopped_parent(moved, { moved, CHILD_DONE }), nil)
+  eq(Rows.stopped_parent(foreground, { foreground, CHILD_RUNNING }), nil)
+end)
+
 case("a_cancelled_task_is_finished", function()
   local stopped = { id = "toolu_09", name = "serve", status = "cancelled", focused = false }
   eq(Rows.deletable(stopped), true)

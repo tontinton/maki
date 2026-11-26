@@ -12,9 +12,7 @@ use super::{
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent};
 use crate::chat::{Chat, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::components::permission_prompt::ProjectAnswers;
-use crate::components::{
-    BackgroundOutcome, DisplayMessage, DisplayRole, ExitRequest, RetryInfo, Status,
-};
+use crate::components::{DisplayMessage, DisplayRole, ExitRequest, RetryInfo, Status};
 use crate::markdown::TRUNCATION_PREFIX;
 
 fn cap_error_text(message: &str) -> String {
@@ -47,6 +45,12 @@ fn started_by(info: &SubagentInfo) -> Option<TaskParent> {
 /// call's tab, a subagent a plugin adopted), so each field fills in from
 /// the first info that names it.
 fn fill_missing_subagent_info(chat: &mut Chat, info: &SubagentInfo) {
+    if !chat.has_subagent {
+        if !info.name.is_empty() {
+            chat.name.clone_from(&info.name);
+        }
+        chat.has_subagent = true;
+    }
     if chat.parent.is_none() {
         chat.parent = started_by(info);
     }
@@ -254,13 +258,10 @@ impl App {
             messages,
         } = envelope.event
         {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere. A plugin task is never in
-            // `chat_index`, and rightly stays open here: it writes its
-            // transcript after every prompt, and its close is `StreamClosed`.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+            if !from_plugin
+                && let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str())
+                && !self.chats.iter().any(|chat| chat.has_tool(&tool_use_id))
+            {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
             self.state
@@ -307,19 +308,20 @@ impl App {
         Some(envelope)
     }
 
-    /// The session is gone. If Esc already ended the task, its `Error`
-    /// stays. A close mid-prompt leaves tools without a result, and nothing
-    /// after this would settle them. The close knows no verdict, so the final
-    /// result of an adopted subagent's call can still refine it, and its
-    /// badge.
     fn close_plugin_task(&mut self, chat_idx: usize, subagent_id: Option<&str>) {
+        let awaits_call_result = self.chats[chat_idx].backs_moved_call
+            || subagent_id.is_some_and(|id| self.chats.iter().any(|chat| chat.has_tool(id)));
         let chat = &mut self.chats[chat_idx];
         chat.cancel_in_progress();
-        if !chat.is_finished() {
+        if let Some(id) = subagent_id {
+            self.permission_prompt.drop_subagent(id);
+        }
+        if awaits_call_result {
+            chat.auth_parked = false;
+            chat.answer_tx = None;
+            chat.control = None;
+        } else {
             chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            if let Some(id) = subagent_id {
-                self.set_badge_outcome(id, BackgroundOutcome::Done);
-            }
         }
     }
 
