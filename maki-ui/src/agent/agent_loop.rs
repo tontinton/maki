@@ -237,7 +237,14 @@ impl AgentLoop {
             Box::pin(async move {
                 let (vars, instructions, slots, config, host_prompt) = &*spec;
                 let tools = base_tools(vars, &model, config, has_mcp, workflow).await;
-                host_prompt.context(vars, instructions, slots, &model, tools)
+                host_prompt.context(
+                    vars,
+                    instructions,
+                    slots,
+                    &model,
+                    tools,
+                    config.model_in_prompt,
+                )
             })
         });
         (context, prompt_slots)

@@ -152,6 +152,7 @@ With 0 you see only the header. The read, index and list tools default to 0, bec
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable |
+| `model_in_prompt` | bool | `true` | - | Include the model identifier in the default system prompt environment and in switch updates. A custom system template that uses `{model}` always states it |
 
 ### `provider`
 
