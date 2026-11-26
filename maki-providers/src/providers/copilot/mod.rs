@@ -32,7 +32,7 @@ pub(crate) const SLUG: &str = "copilot";
 const DISPLAY_NAME: &str = "Copilot";
 const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
-const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
+const DEFAULT_MODEL: &str = "copilot/claude-sonnet-5.5";
 const LOGIN_URL: &str = "https://github.com/settings/copilot";
 /// Prose, not a value: the real endpoint is discovered over GraphQL.
 const DOC_API_URL: &str =
@@ -1145,16 +1145,9 @@ mod tests {
     }
 
     #[test_case(ModelTier::Weak, "gpt-5.6-luna"; "weak defaults to luna")]
-    #[test_case(ModelTier::Medium, "gpt-5.6-terra"; "medium defaults to terra")]
-    #[test_case(ModelTier::Strong, "claude-opus-5"; "strong defaults to opus")]
-    fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
-        let defaults: Vec<_> = SPEC
-            .models()
-            .iter()
-            .filter(|entry| entry.default && entry.tier == tier)
-            .collect();
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].prefixes[0], expected_prefix);
+    #[test_case(ModelTier::Medium, "claude-sonnet-5.5"; "medium defaults to sonnet")]
+    #[test_case(ModelTier::Strong, "claude-opus-5.5"; "strong defaults to opus")]
+    fn manifest_tier_default(tier: ModelTier, expected_prefix: &str) {
         assert_eq!(
             ProviderRegistry::find_default_for_tier("copilot", tier)
                 .unwrap()
@@ -1164,7 +1157,7 @@ mod tests {
     }
 
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
-    #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
+    #[test_case("copilot/claude-opus-5.5", 100_000, 100_000, 0.40 + 2.00; "opus 5.5 beats opus 5 prefix")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
     fn manifest_models_report_cost(spec: &str, input: u64, output: u64, expected: f64) {
         let usage = TokenUsage {

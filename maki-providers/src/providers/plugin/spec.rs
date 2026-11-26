@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex};
 
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
-use crate::manifest::check_rows;
+use crate::manifest::{check_one_default_per_tier, check_rows};
 use crate::model::ModelEntry;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs,
@@ -143,6 +143,7 @@ fn declared_models(decl: &ProviderDecl, target: Target) -> Result<&'static [Mode
     // Only what the author wrote is checked. A borrowed output cap larger than
     // a stated window is the agent's to clamp, not the author's mistake.
     check_rows(&decl.models)?;
+    check_one_default_per_tier(&decl.models)?;
     let mut rows = decl.models.clone();
     for row in &mut rows {
         if let Some(stated) = decl.max_output_tokens {

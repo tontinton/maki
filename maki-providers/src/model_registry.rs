@@ -469,8 +469,8 @@ mod tests {
         );
     }
 
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
-    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
+    #[test_case(&[("alpha", ModelTier::Strong), ("claude-opus-5.5", ModelTier::Strong)], "copilot/claude-opus-5.5"; "curated default beats discovered tier")]
+    #[test_case(&[("claude-opus-4.8", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.8"; "later curated default when first is unavailable")]
     #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
     fn spec_for_tier_prefers_entitled_curated_default(
         models: &[(&str, ModelTier)],

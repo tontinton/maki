@@ -106,9 +106,22 @@ fn parse(slug: &str, src: &str) -> Result<Box<[ModelEntry]>, String> {
     Ok(rows)
 }
 
+/// Only for rows an author declares at runtime. A built-in table may mark
+/// several rows of a tier, as fallbacks for an account its first one is not
+/// enabled for.
+pub(crate) fn check_one_default_per_tier(rows: &[ModelEntry]) -> Result<(), String> {
+    let mut defaults_seen: Vec<ModelTier> = Vec::new();
+    for row in rows.iter().filter(|row| row.default) {
+        if defaults_seen.contains(&row.tier) {
+            return Err(format!("{DUPLICATE_DEFAULT} {:?}", row.tier));
+        }
+        defaults_seen.push(row.tier);
+    }
+    Ok(())
+}
+
 pub(crate) fn check_rows(rows: &[ModelEntry]) -> Result<(), String> {
     let mut prefixes_seen: HashSet<&str> = HashSet::new();
-    let mut defaults_seen: Vec<ModelTier> = Vec::new();
 
     for (index, row) in rows.iter().enumerate() {
         let Some(name) = row.prefixes.first() else {
@@ -129,22 +142,13 @@ pub(crate) fn check_rows(rows: &[ModelEntry]) -> Result<(), String> {
                 "{at}: max_output_tokens {max_output} {OUTPUT_EXCEEDS_WINDOW} {context_window}"
             ));
         }
-        if row.default {
-            if defaults_seen.contains(&row.tier) {
-                return Err(format!("{at}: {DUPLICATE_DEFAULT} {:?}", row.tier));
-            }
-            defaults_seen.push(row.tier);
-        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DUPLICATE_DEFAULT, DUPLICATE_PREFIX, NO_PREFIXES, OUTPUT_EXCEEDS_WINDOW, SLUG_MISMATCH,
-        parse,
-    };
+    use super::{DUPLICATE_PREFIX, NO_PREFIXES, OUTPUT_EXCEEDS_WINDOW, SLUG_MISMATCH, parse};
     use test_case::test_case;
 
     const SLUG: &str = "synthetic";
@@ -170,7 +174,6 @@ mod tests {
     #[test_case(&table("regolo", ROW), SLUG_MISMATCH ; "slug_header_names_another_provider")]
     #[test_case(&table(SLUG, &ROW.replace(r#"["a"]"#, "[]")), NO_PREFIXES ; "row_without_prefixes")]
     #[test_case(&format!("{}{}", table(SLUG, ROW), ROW.replace("default = true", "default = false")), DUPLICATE_PREFIX ; "prefix_repeated_in_table")]
-    #[test_case(&format!("{}{}", table(SLUG, ROW), ROW.replace(r#"["a"]"#, r#"["b"]"#)), DUPLICATE_DEFAULT ; "two_defaults_for_one_tier")]
     #[test_case(&table(SLUG, &format!("{ROW}max_output_tokens = 200001\n")), OUTPUT_EXCEEDS_WINDOW ; "output_exceeds_window")]
     #[test_case(&table(SLUG, &ROW.replace("vision", "visoin")), UNKNOWN_KEY ; "unknown_key")]
     #[test_case(&table(SLUG, &ROW.replace("vision = false", "")), MISSING_KEY ; "missing_key")]
