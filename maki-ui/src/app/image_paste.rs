@@ -95,6 +95,15 @@ impl App {
         self.status_bar.flash(READING_CLIPBOARD_MSG.into());
     }
 
+    pub(super) fn spawn_terminal_image(&mut self, source: ImageSource) {
+        let (tx, rx) = oneshot::channel();
+        spawn_blocking(move || {
+            let _ = tx.send(Ok(PastedContent::Image(source)));
+        });
+        self.paste_rx.push(rx);
+        self.status_bar.flash("Reading image...".into());
+    }
+
     pub fn poll_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         while let Some(result) = take_ready(&mut self.paste_rx) {

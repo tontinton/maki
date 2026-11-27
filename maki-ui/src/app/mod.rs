@@ -10,6 +10,7 @@ mod commands;
 mod image_paste;
 pub(crate) mod mode;
 mod mouse;
+mod osc1337;
 mod plan_form;
 mod queue;
 mod session;
@@ -1322,7 +1323,13 @@ impl App {
                         self.start_clipboard_paste();
                     }
                 } else {
-                    self.route_text_paste(&text, turn);
+                    let (images, rest) = osc1337::parse(&text);
+                    for source in images {
+                        self.spawn_terminal_image(source);
+                    }
+                    if !rest.is_empty() {
+                        self.route_text_paste(&rest, turn);
+                    }
                 }
                 vec![]
             }
