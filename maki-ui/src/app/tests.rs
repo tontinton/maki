@@ -10195,6 +10195,8 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "fast": false,
             "supports_thinking": false,
             "supports_fast": false,
+            "context_window": 128_000,
+            "context_window_override": serde_json::Value::Null,
         })
     );
 
@@ -10212,6 +10214,8 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "fast": true,
             "supports_thinking": true,
             "supports_fast": true,
+            "context_window": 200_000,
+            "context_window_override": serde_json::Value::Null,
         })
     );
 }

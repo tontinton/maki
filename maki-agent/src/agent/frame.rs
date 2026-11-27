@@ -35,6 +35,8 @@ const UPDATE_OPEN: &str = "<context-update>\nThis changed since the conversation
 const UPDATE_CLOSE: &str = "\n</context-update>";
 pub(crate) const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
 const INSTRUCTIONS_GONE: &str = "No project instructions apply anymore.";
+const CONTEXT_WINDOW_GONE: &str =
+    "The context window cap is gone; the model's own window applies again.";
 const FINGERPRINT_BYTES: usize = 16;
 pub(crate) const FRAME_REBUILT: &str =
     "The tools or the system prompt changed, so the prompt was rebuilt and its cache starts over.";
@@ -68,6 +70,7 @@ impl RunContext {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
                 model: model.spec(),
+                context_window: model.session_context_window(),
                 instructions: if slots.renders_instructions(PromptId::System) {
                     instructions.to_owned()
                 } else {
@@ -384,6 +387,12 @@ pub(crate) fn context_update(
     if let Some(cwd) = &update.cwd {
         parts.push(format!("Working directory is now {cwd}."));
     }
+    if let Some(window) = &update.context_window {
+        parts.push(match window {
+            Some(window) => format!("Context window is now {window} tokens."),
+            None => CONTEXT_WINDOW_GONE.to_owned(),
+        });
+    }
     if let Some(instructions) = &update.instructions {
         parts.push(if instructions.trim().is_empty() {
             INSTRUCTIONS_GONE.to_owned()
@@ -438,6 +447,7 @@ mod tests {
                 date: DATE.into(),
                 cwd: "/repo".into(),
                 model: "anthropic/claude-opus-5-5".into(),
+                context_window: Some(1_000_000),
                 instructions: "\n\nProject instructions:\nbe nice".into(),
                 hints: BTreeMap::from([(HINT_KEY.into(), "tags: a, b".into())]),
             }),
@@ -456,6 +466,8 @@ mod tests {
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
     #[test_case(|f: &mut LiveFacts| prompt(f).model = "openai/gpt-6".into(), "openai/gpt-6" ; "model")]
     #[test_case(|f: &mut LiveFacts| prompt(f).cwd = "/other".into(), "/other" ; "cwd")]
+    #[test_case(|f: &mut LiveFacts| prompt(f).context_window = Some(500_000), "500000" ; "context_window_set")]
+    #[test_case(|f: &mut LiveFacts| prompt(f).context_window = None, "cap is gone" ; "context_window_cleared")]
     #[test_case(|f: &mut LiveFacts| f.plan = Some(PathBuf::from("/plans/p.md")), "/plans/p.md" ; "plan_on")]
     #[test_case(|f: &mut LiveFacts| { prompt(f).hints.insert(HINT_KEY.into(), "tags: c".into()); }, "tags: c" ; "hint_changed")]
     #[test_case(|f: &mut LiveFacts| prompt(f).hints.clear(), HINT_KEY ; "hint_removed")]

@@ -440,17 +440,6 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
     }
 }
 
-/// `maki.model.set`'s answer, with whatever model the session is on by now.
-fn apply_settings(app: &mut App, thinking: Option<String>, fast: Option<bool>) -> UiReply {
-    if let Some(thinking) = thinking {
-        app.set_thinking(&thinking)?;
-    }
-    if let Some(fast) = fast {
-        app.set_fast(fast)?;
-    }
-    Ok(app.model_state())
-}
-
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
@@ -463,8 +452,11 @@ struct SessionRuntime {
     /// This session's model and provider, one cell per runtime and never
     /// shared. The agent loop reads it at the start of every turn, and a
     /// background tab must not get dragged onto the model another tab just
-    /// picked. Only `apply_model` writes it, on the UI thread.
+    /// picked. Only `apply_model` writes it, on the UI thread, as [`Self::base`]
+    /// under the session's context window cap.
     slot: Arc<ArcSwap<ModelSlot>>,
+    /// The shared per-spec slot this tab runs on, before its cap.
+    base: Arc<ModelSlot>,
 }
 
 impl SessionRuntime {
@@ -527,7 +519,10 @@ impl SpawnCtx {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
-        let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
+        let cell = Arc::new(ArcSwap::from(capped_slot(
+            &slot,
+            session.meta.context_window,
+        )));
         let handles = AgentHandles::spawn(
             &cell,
             Resumed {
@@ -588,8 +583,22 @@ impl SpawnCtx {
             last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
             slot: cell,
+            base: slot,
         }
     }
+}
+
+/// A tab's own slot: the shared one under its session's context window cap.
+fn capped_slot(base: &Arc<ModelSlot>, cap: Option<u32>) -> Arc<ModelSlot> {
+    base.model.capped_context(cap).map_or_else(
+        || Arc::clone(base),
+        |model| {
+            Arc::new(ModelSlot {
+                model,
+                provider: Arc::clone(&base.provider),
+            })
+        },
+    )
 }
 
 /// A plugin polling a slug needs the live instance whatever tab it is in:
@@ -676,11 +685,12 @@ struct Pick {
 enum PickOrigin {
     /// The model picker or a login, which flash a failure.
     Picker,
-    /// `maki.model.set`, whose thinking and fast go on top of the new model
-    /// before it answers.
+    /// `maki.model.set`, whose thinking, fast and context window go on top of
+    /// the new model before it answers.
     Lua {
         thinking: Option<String>,
         fast: Option<bool>,
+        context_window: Option<Option<u32>>,
         reply_tx: oneshot::Sender<UiReply>,
     },
 }
@@ -1897,10 +1907,12 @@ impl<'t> EventLoop<'t> {
                 spec: Some(spec),
                 thinking,
                 fast,
+                context_window,
             } => {
                 let origin = PickOrigin::Lua {
                     thinking,
                     fast,
+                    context_window,
                     reply_tx,
                 };
                 return self.change_model(spec, origin);
@@ -1909,7 +1921,8 @@ impl<'t> EventLoop<'t> {
                 spec: None,
                 thinking,
                 fast,
-            } => apply_settings(self.focused_app(), thinking, fast),
+                context_window,
+            } => self.apply_settings(self.focused, thinking, fast, context_window),
         };
         let _ = reply_tx.send(reply);
     }
@@ -1986,7 +1999,7 @@ impl<'t> EventLoop<'t> {
         };
         // An inherited model's slot is already built and sitting right here.
         if inherits_model {
-            let slot = self.sessions[self.focused].slot.load_full();
+            let slot = Arc::clone(&self.sessions[self.focused].base);
             self.show_created(created, slot, None);
         } else {
             let spec = created.open.session.model.clone();
@@ -2190,7 +2203,7 @@ impl<'t> EventLoop<'t> {
             Ok(slot) => {
                 for idx in 0..self.sessions.len() {
                     let rt = &self.sessions[idx];
-                    if on_spec(rt) && !Arc::ptr_eq(&rt.slot.load(), slot) {
+                    if on_spec(rt) && !Arc::ptr_eq(&rt.base, slot) {
                         self.apply_model(idx, Arc::clone(slot));
                     }
                 }
@@ -2409,7 +2422,31 @@ impl<'t> EventLoop<'t> {
         let rt = &mut self.sessions[idx];
         rt.app.state.update_model(&slot.model);
         rt.app.usage_slot.store(None);
-        rt.slot.store(slot);
+        rt.slot
+            .store(capped_slot(&slot, rt.app.state.context_window));
+        rt.base = slot;
+    }
+
+    /// `maki.model.set`'s answer, with whatever model the session is on by now.
+    fn apply_settings(
+        &mut self,
+        idx: usize,
+        thinking: Option<String>,
+        fast: Option<bool>,
+        context_window: Option<Option<u32>>,
+    ) -> UiReply {
+        let app = &mut self.sessions[idx].app;
+        if let Some(thinking) = thinking {
+            app.set_thinking(&thinking)?;
+        }
+        if let Some(fast) = fast {
+            app.set_fast(fast)?;
+        }
+        if let Some(window) = context_window {
+            app.state.set_context_window(window);
+            self.apply_model(idx, Arc::clone(&self.sessions[idx].base));
+        }
+        Ok(self.sessions[idx].app.model_state())
     }
 
     /// Discovery landed or a provider was re-authenticated. Invalidating alone
@@ -2439,7 +2476,7 @@ impl<'t> EventLoop<'t> {
     /// The fork runs on the model of the session it came from, whose slot is
     /// already built.
     fn open_fork(&mut self, idx: usize, open: OpenSession) {
-        let slot = self.sessions[idx].slot.load_full();
+        let slot = Arc::clone(&self.sessions[idx].base);
         let fork = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         self.set_focused(fork);
         let id = self.sessions[self.focused].id();
@@ -2481,6 +2518,7 @@ impl<'t> EventLoop<'t> {
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => self.change_model(spec, PickOrigin::Picker),
+            Action::ReapplyModel => self.apply_model(idx, Arc::clone(&self.sessions[idx].base)),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 self.persist_tiers(model_registry::set(spec, tier));
@@ -2585,10 +2623,12 @@ impl<'t> EventLoop<'t> {
         if let PickOrigin::Lua {
             thinking,
             fast,
+            context_window,
             reply_tx,
         } = pick.origin
         {
-            let _ = reply_tx.send(apply_settings(&mut self.sessions[idx].app, thinking, fast));
+            let reply = self.apply_settings(idx, thinking, fast, context_window);
+            let _ = reply_tx.send(reply);
         }
     }
 
@@ -2897,6 +2937,26 @@ mod tests {
             .unwrap();
         assert_eq!(reply["plan"], json!("lite"));
         assert_eq!(reply["limits"][0]["label"], json!("rotated key"));
+    }
+
+    const CAP: u32 = 50_000;
+
+    /// Every install derives from the shared slot, so lifting a cap brings
+    /// the model's own window back instead of keeping the last cap.
+    #[test]
+    fn capped_slot_derives_from_the_shared_slot() {
+        let base = Arc::new(ModelSlot {
+            model: Model::from_spec("anthropic/claude-opus-4-6").unwrap(),
+            provider: Arc::new(QuotaProvider { usage: None }),
+        });
+        let window = base.model.context_window;
+
+        let capped = capped_slot(&base, Some(CAP));
+        assert_eq!(capped.model.context_window, CAP);
+        assert!(Arc::ptr_eq(&capped.provider, &base.provider));
+
+        assert!(Arc::ptr_eq(&capped_slot(&base, None), &base));
+        assert!(Arc::ptr_eq(&capped_slot(&base, Some(window + 1)), &base));
     }
 
     #[test]

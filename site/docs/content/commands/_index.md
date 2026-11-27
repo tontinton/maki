@@ -27,6 +27,7 @@ Type `/` in the input box to open the command palette.
 | `/btw` | Ask a quick question (no tools, no history pollution) |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) |
+| `/context` | Show or set this session's context window cap in tokens (default or auto lifts it) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config (! stops background tasks) |
@@ -125,7 +126,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 - Needs `agent`, `session_write`: `/compact`, custom commands, MCP prompts.
 - Needs `session_write`: `/new`, `/fork`.
 - Needs `session_write`, `session_settings`: `/rename`, `/sessions`.
-- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/workflow`, `/thinking`.
+- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/context`, `/workflow`, `/thinking`.
 - Needs what its owner holds: every other plugin command, as described below.
 - Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
 

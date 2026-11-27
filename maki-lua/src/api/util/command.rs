@@ -558,6 +558,8 @@ pub enum ModelRequest {
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
+        /// `Some(Some(n))` sets a per-session override, `Some(None)` clears it.
+        context_window: Option<Option<u32>>,
     },
 }
 

@@ -16,6 +16,8 @@ use crate::api::util::pair::{Pair, err_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
+const CONTEXT_WINDOW_ARG_ERR: &str =
+    "context_window_override must be a whole token count, 0 or false";
 
 /// Shared with `maki.agent.resolve_model`, so a tier assignment that no longer
 /// resolves reads the same wherever it surfaces.
@@ -201,9 +203,13 @@ async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pai
 /// Declared effort fields keep `adaptive` separate because their fragments can
 /// differ from the provider fallback.
 ///
+/// `context_window` is the window the session runs with, under any cap.
+/// `context_window_override` is the session's cap, nil when it has none.
+///
 /// @return (table|nil, string|nil) `{spec, id, provider, thinking,
 ///   thinking_shown, thinking_options, fast, supports_thinking,
-///   supports_fast}`, or nil and an error.
+///   supports_fast, context_window, context_window_override?}`, or nil and an
+///   error.
 /// @example
 /// local m = maki.model.get()
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end
@@ -230,19 +236,26 @@ async fn available(
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
-/// Switches the focused session's model, thinking level, or fast mode. Fields
-/// you leave out stay as they are, so this doubles as a thinking-only switch.
-/// Answers with the new state, in the same shape `get` returns.
+/// Switches the focused session's model, thinking level, fast mode, or context
+/// window cap. Fields you leave out stay as they are, so this doubles as a
+/// thinking-only switch. Answers with the new state, in the same shape `get`
+/// returns.
 ///
 /// @param opts string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
 ///   `thinking` (string|number) `"off"`, `"adaptive"`, an effort level
 ///   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
-///   `fast` (boolean) Anthropic fast mode.
+///   `fast` (boolean) Anthropic fast mode;
+///   `context_window_override` (integer|false) caps this session's context
+///   window in tokens, or `false` (or `0`) to lift the cap. A cap only lowers
+///   the window, so a session compacts earlier. It is not `context_window`, the
+///   effective window `get` reports, so `get` fed back into `set` never pins
+///   it. The model is told the window while a cap applies.
 /// @return (table|nil, string|nil) The new state, or nil and an error.
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
+/// maki.model.set({ context_window_override = 50000 })
 /// maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 #[lua_fn(guard = SessionSettings)]
 async fn set(
@@ -255,11 +268,13 @@ async fn set(
             spec: Some(spec.to_str()?.to_owned()),
             thinking: None,
             fast: None,
+            context_window: None,
         },
         Value::Table(opts) => ModelRequest::Set {
             spec: opts.opt("spec")?,
             thinking: opts.opt("thinking")?,
             fast: opts.opt("fast")?,
+            context_window: context_window_override(opts.opt("context_window_override")?)?,
         },
         other => {
             return Err(LuaError::runtime(format!(
@@ -283,6 +298,31 @@ lua_table! {
     DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
 }
 
+/// `nil` leaves the cap alone, `false` or `0` lifts it. Anything else that
+/// is not a whole token count throws, so a typo never lifts a cap silently.
+fn context_window_override(value: Option<Value>) -> LuaResult<Option<Option<u32>>> {
+    let tokens = match &value {
+        None => return Ok(None),
+        Some(Value::Boolean(false)) => return Ok(Some(None)),
+        Some(Value::Integer(n)) => Some(*n as f64),
+        Some(Value::Number(n)) => Some(*n),
+        Some(_) => None,
+    };
+    match tokens {
+        Some(0.0) => Ok(Some(None)),
+        Some(n) if n.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(&n) => {
+            Ok(Some(Some(n as u32)))
+        }
+        Some(n) => Err(LuaError::runtime(format!(
+            "{CONTEXT_WINDOW_ARG_ERR}, got {n}"
+        ))),
+        None => Err(LuaError::runtime(format!(
+            "{CONTEXT_WINDOW_ARG_ERR}, got {}",
+            value.map_or("nil", |v| v.type_name())
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +337,7 @@ mod tests {
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
     const THINKING: &str = "high";
+    const WINDOW: u32 = 200_000;
     const UI_FAILURE: &str = "Model is not allowed by policy: anthropic/claude-opus-4-6";
 
     /// Assignments live in a process-global registry, so a test that needs one
@@ -343,13 +384,21 @@ mod tests {
     /// acted on. Fields left out stay `nil` on the way back.
     fn echo(req: ModelRequest) -> Option<UiReply> {
         Some(Ok(match req {
-            ModelRequest::Get => json!({ "spec": SPEC, "thinking": THINKING, "fast": true }),
+            ModelRequest::Get => {
+                json!({ "spec": SPEC, "thinking": THINKING, "fast": true, "context_window": WINDOW })
+            }
             ModelRequest::Available => json!([SPEC]),
             ModelRequest::Set {
                 spec,
                 thinking,
                 fast,
-            } => json!({ "spec": spec, "thinking": thinking, "fast": fast }),
+                context_window,
+            } => json!({
+                "spec": spec,
+                "thinking": thinking,
+                "fast": fast,
+                "context_window_override": context_window.map(|cap| cap.map_or(json!(false), Json::from)),
+            }),
         }))
     }
 
@@ -363,11 +412,14 @@ mod tests {
     /// the UI leaves alone. `false` and `""` are values though, not omissions:
     /// `""` is the thinking toggle. The last case is the documented loop, `get`
     /// straight back into `set`, read-only extras and all.
-    #[test_case("return model.get()", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "get")]
+    #[test_case("return model.get()", json!({ "spec": SPEC, "thinking": THINKING, "fast": true, "context_window": WINDOW }) ; "get")]
     #[test_case("return model.available()", json!([SPEC]) ; "available")]
     #[test_case("return model.set('anthropic/claude-opus-4-6')", json!({ "spec": SPEC }) ; "set_bare_spec_string")]
     #[test_case("return model.set({ thinking = 8192, fast = true })", json!({ "thinking": "8192", "fast": true }) ; "set_table_without_spec")]
     #[test_case("return model.set({ thinking = '', fast = false })", json!({ "thinking": "", "fast": false }) ; "set_empty_thinking_and_false_fast")]
+    #[test_case("return model.set({ context_window_override = 50000 })", json!({ "context_window_override": 50000 }) ; "cap_context_window")]
+    #[test_case("return model.set({ context_window_override = false })", json!({ "context_window_override": false }) ; "false_lifts_the_cap")]
+    #[test_case("return model.set({ context_window_override = 0 })", json!({ "context_window_override": false }) ; "zero_lifts_the_cap")]
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
     #[tokio::test]
     async fn requests_cross_the_channel_and_answer_with_the_new_state(
@@ -533,5 +585,17 @@ mod tests {
         let lua = lua_with_model(None);
         let err = lua.load(script).eval_async::<Value>().await.unwrap_err();
         assert!(err.to_string().contains(SET_ARG_ERR));
+    }
+
+    #[test_case("model.set({ context_window_override = -1 })" ; "negative")]
+    #[test_case("model.set({ context_window_override = 100000.5 })" ; "fractional")]
+    #[test_case("model.set({ context_window_override = 2 ^ 40 })" ; "out_of_range")]
+    #[test_case("model.set({ context_window_override = '50000' })" ; "string")]
+    #[test_case("model.set({ context_window_override = true })" ; "true")]
+    #[tokio::test]
+    async fn set_throws_on_a_bad_context_window_override(script: &str) {
+        let lua = lua_with_model(None);
+        let err = lua.load(script).exec_async().await.unwrap_err();
+        assert!(err.to_string().contains(CONTEXT_WINDOW_ARG_ERR), "{err}");
     }
 }

@@ -170,6 +170,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
+        name: "/context",
+        description: "Show or set this session's context window cap in tokens (default or auto lifts it)",
+        max_args: 1,
+        bang: false,
+        plugin_access: CHANGES_SETTINGS,
+    },
+    BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,

@@ -1004,6 +1004,8 @@ impl App {
             "fast": self.state.fast,
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
+            "context_window": model.context_window,
+            "context_window_override": self.state.context_window,
         })
     }
 
