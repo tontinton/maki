@@ -177,11 +177,6 @@ impl Google {
         self.auth.lock().unwrap().finish(builder)
     }
 
-    fn api_key(&self) -> String {
-        let auth = self.auth.lock().unwrap();
-        auth.header(API_KEY_HEADER).unwrap_or_default().to_owned()
-    }
-
     fn stream_url(&self, model_id: &str) -> String {
         let base = self.base_url();
         let encoded = super::urlenc(model_id);
@@ -190,8 +185,7 @@ impl Google {
 
     fn models_url(&self) -> String {
         let base = self.base_url();
-        let key = self.api_key();
-        format!("{base}/models?key={key}&pageSize=1000")
+        format!("{base}/models?pageSize=1000")
     }
 
     fn build_body(
@@ -728,6 +722,12 @@ mod tests {
             .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
         let error = google.list_models().await.unwrap_err();
         assert_eq!(error.projection(), ErrorProjection::Config);
+    }
+
+    #[test]
+    fn models_url_keeps_api_key_out_of_query() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        assert!(!google.models_url().contains(GEMINI_API_KEY));
     }
 
     #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
