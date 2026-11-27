@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use image::GenericImageView;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -342,6 +343,39 @@ async fn decode(lua: Lua, data: LuaValue) -> LuaResult<Pair<AnyUserData>> {
     Ok((Some(lua.create_userdata(LuaImage(Arc::new(state)))?), None))
 }
 
+/// Put an image on the system clipboard. The clipboard is on the machine
+/// Maki runs on; this is not an OSC 52 write, which carries text only.
+///
+/// @param data string|buffer Raw image bytes.
+/// @return (boolean?, string?) true, or `(nil, err)` on failure.
+/// @example
+/// local ok, err = maki.image.copy(img:encode("png"))
+/// if err then error(err) end
+#[lua_fn]
+async fn copy(lua: Lua, data: LuaValue) -> LuaResult<Pair<bool>> {
+    let _ = lua;
+    let bytes = bytes_arg(&data, "image.copy")?;
+    let result = spawn_blocking(move || copy_bytes(&bytes))
+        .await
+        .map_err(mlua::Error::external)?;
+    try_pair!(result);
+    Ok((Some(true), None))
+}
+
+fn copy_bytes(bytes: &[u8]) -> Result<(), String> {
+    let (_, image) = decode_bytes(bytes)?;
+    let (width, height) = image.dimensions();
+    let rgba = image.to_rgba8();
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: rgba.into_raw().into(),
+        })
+        .map_err(|e| e.to_string())
+}
+
 lua_table! {
     /// Small building blocks for working with images: probe metadata, decode
     /// pixels, resize, and encode back to bytes. Plugins compose these freely.
@@ -354,13 +388,40 @@ lua_table! {
     /// local png = small:encode("png")
     /// ```
     "maki.image" => pub(crate) fn create_image_table(), DOCS [
-        probe, decode,
+        probe, decode, copy,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+
+    #[test]
+    fn copy_rejects_bytes_that_are_not_an_image() {
+        assert!(super::copy_bytes(b"not an image").is_err());
+    }
+
+    #[test]
+    fn copy_rejects_an_image_over_the_pixel_limit_before_decoding() {
+        let mut bytes = png_bytes(20, 10);
+        bytes[16..20].copy_from_slice(&50_000u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&50_000u32.to_be_bytes());
+        let mut crc = 0xffff_ffffu32;
+        for byte in &bytes[12..29] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        let err = super::copy_bytes(&bytes).unwrap_err();
+        assert!(err.contains("image too large"), "got: {err}");
+    }
+
     use image::{Rgb, RgbImage};
     use test_case::test_case;
 

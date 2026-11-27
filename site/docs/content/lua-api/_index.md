@@ -3807,6 +3807,30 @@ if err then error(err) end
 print(img:width() .. "x" .. img:height())
 ```
 
+---
+
+### `maki.image.copy()` {#maki-image-copy}
+
+```lua
+maki.image.copy({data})
+```
+
+Put an image on the system clipboard. The clipboard is on the machine
+Maki runs on; this is not an OSC 52 write, which carries text only.
+
+**Parameters:**
+
+- `{data}` (`string|buffer`) Raw image bytes.
+
+**Returns:** (`boolean?`, `string?`) true, or `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+local ok, err = maki.image.copy(img:encode("png"))
+if err then error(err) end
+```
+
 
 ## maki.image.Image {#maki-image-Image}
 

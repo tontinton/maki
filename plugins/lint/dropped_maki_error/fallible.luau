@@ -32,6 +32,7 @@ return {
   ["maki.fs.rm"] = true,
   ["maki.fs.root"] = true,
   ["maki.fs.write"] = true,
+  ["maki.image.copy"] = true,
   ["maki.image.decode"] = true,
   ["maki.image.probe"] = true,
   ["maki.interpreter.run"] = true,
