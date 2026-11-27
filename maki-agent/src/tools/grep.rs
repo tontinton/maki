@@ -304,14 +304,16 @@ impl GrepSink<'_> {
         let text = String::from_utf8_lossy(bytes);
         let text = text.strip_suffix('\n').unwrap_or(&text);
         let text = text.strip_suffix('\r').unwrap_or(text);
+        let cut = self.max_line_bytes != 0 && text.len() > self.max_line_bytes;
         self.current_group.push(GrepLine {
             line_nr: line_nr as usize,
-            text: if self.max_line_bytes == 0 {
-                text.to_owned()
-            } else {
+            text: if cut {
                 truncate_bytes(text, self.max_line_bytes)
+            } else {
+                text.to_owned()
             },
             is_match,
+            cut,
         });
     }
 }
@@ -372,9 +374,9 @@ mod tests {
         assert_eq!(needs_multiline(pattern), expected);
     }
 
-    #[test_case(0, "match é tail" ; "unlimited")]
-    #[test_case(7, "match ..." ; "bounded_utf8")]
-    fn sink_line_byte_limit(max_line_bytes: usize, expected: &str) {
+    #[test_case(0, "match é tail", false ; "unlimited")]
+    #[test_case(7, "match ...", true ; "bounded_utf8")]
+    fn sink_line_byte_limit(max_line_bytes: usize, expected: &str, cut: bool) {
         let mut groups = Vec::new();
         let mut sink = GrepSink {
             groups: &mut groups,
@@ -391,6 +393,7 @@ mod tests {
         let lines = &groups[0].lines;
         assert_eq!(lines[0].text, expected);
         assert_eq!(lines[1].text, expected);
+        assert_eq!(lines[0].cut, cut);
     }
 
     #[test_case(None, None, &[("one.rs", 1), ("two.txt", 2)] ; "every_file_with_a_match")]

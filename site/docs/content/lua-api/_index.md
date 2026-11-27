@@ -3604,7 +3604,8 @@ Search file contents for a regex {pattern}. Returns structured matches
 grouped by file, similar to ripgrep output.
 
 Each result entry has a `path` and a list of `groups`. Each group contains
-`lines`, where every line has `line_nr`, `text`, and `is_match`.
+`lines`, where every line has `line_nr`, `text`, and `is_match`. A line
+`max_line_bytes` cut also has `cut = true`, and its `text` ends in `...`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 

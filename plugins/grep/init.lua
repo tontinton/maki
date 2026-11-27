@@ -8,6 +8,8 @@ local NO_MATCHES = "No files found"
 local COUNT_TOTAL = "%d %s in %d %s"
 local COUNT_LINE = "%s: %d"
 local LIMIT_NOTE = "[limit of %d reached, %d more %s from %d %s not shown]"
+local CUT_NOTE =
+  "[%d %s cut at %d bytes, the `...` at the end is not in the file. Use read with limit=1 on a line for more of it]"
 local MIN_PER_CALL_LIMIT = 1
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
@@ -32,6 +34,20 @@ local function has_context(groups)
     end
   end
   return false
+end
+
+local function count_cut_lines(entries)
+  local cut = 0
+  for _, entry in ipairs(entries) do
+    for _, group in ipairs(entry.groups) do
+      for _, line in ipairs(group.lines) do
+        if line.cut then
+          cut = cut + 1
+        end
+      end
+    end
+  end
+  return cut
 end
 
 local function format_llm_output(entries)
@@ -315,6 +331,10 @@ maki.api.register_tool({
 
     local llm_output = format_llm_output(entries)
     llm_output = truncate(llm_output, max_lines, max_bytes)
+    local cut = count_cut_lines(entries)
+    if cut > 0 then
+      llm_output = llm_output .. "\n\n" .. CUT_NOTE:format(cut, plural(cut, "line"), max_line_bytes)
+    end
     if omitted then
       local groups, files = omitted.groups, omitted.files
       local note = string.format(LIMIT_NOTE, limit, groups, plural(groups, "match group"), files, plural(files, "file"))
