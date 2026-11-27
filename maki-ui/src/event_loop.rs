@@ -2518,11 +2518,7 @@ impl<'t> EventLoop<'t> {
                 self.open_editor(idx, &path);
             }
             Action::OpenUrl(url) => {
-                spawn_blocking(move || {
-                    if let Err(e) = open::that_detached(&url) {
-                        warn!(error = %e, url, "failed to open browser");
-                    }
-                });
+                open_external_url(&url);
             }
             Action::EditInputInEditor => {
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
@@ -2778,6 +2774,95 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+/// `$BROWSER` candidates for a URL, following the Rust `webbrowser` contract.
+/// Windows keeps using the platform opener.
+fn browser_entries(url: &str, browser: &str) -> Vec<(String, Vec<String>)> {
+    browser
+        .split(':')
+        .filter_map(|entry| {
+            let mut parts = entry.split_whitespace();
+            let program = parts.next()?;
+            let mut args = Vec::new();
+            let mut placed = false;
+            for part in parts {
+                let (expanded, has_url) = expand_field(part, url);
+                placed |= has_url;
+                args.push(expanded);
+            }
+            if !placed {
+                args.push(url.to_owned());
+            }
+            Some((program.to_owned(), args))
+        })
+        .collect()
+}
+
+fn expand_field(part: &str, url: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut placed = false;
+    let mut chars = part.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => {
+                out.push_str(url);
+                placed = true;
+            }
+            Some('c') => out.push(':'),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    (out, placed)
+}
+
+fn browser_commands(url: &str) -> Vec<std::process::Command> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let Ok(browser) = std::env::var("BROWSER") else {
+        return Vec::new();
+    };
+    if browser.trim().is_empty() {
+        return Vec::new();
+    }
+    browser_entries(url, &browser)
+        .into_iter()
+        .map(|(program, args)| {
+            let mut command = std::process::Command::new(program);
+            command
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            command
+        })
+        .collect()
+}
+
+fn open_external_url(url: &str) {
+    for mut command in browser_commands(url) {
+        if command.spawn().is_ok() {
+            return;
+        }
+    }
+    let url = url.to_owned();
+    spawn_blocking(move || {
+        if let Err(e) = open::that_detached(&url) {
+            warn!(error = %e, url, "failed to open browser");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2786,6 +2871,31 @@ mod tests {
         MOVED_ID, answer_permission, app_with_moved_call, ask_tool_permission, end_turn,
         open_question_float, streaming_app, test_app,
     };
+
+    #[test]
+    fn browser_entries_follow_the_webbrowser_contract() {
+        assert_eq!(
+            browser_entries("https://example.com/$&", "browser a%cb %% %s"),
+            vec![(
+                "browser".to_owned(),
+                vec![
+                    "a:b".to_owned(),
+                    "%".to_owned(),
+                    "https://example.com/$&".to_owned()
+                ]
+            )]
+        );
+        assert_eq!(
+            browser_entries("https://example.com", "first:second --tab"),
+            vec![
+                ("first".to_owned(), vec!["https://example.com".to_owned()]),
+                (
+                    "second".to_owned(),
+                    vec!["--tab".to_owned(), "https://example.com".to_owned()]
+                ),
+            ]
+        );
+    }
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
     use maki_providers::provider::BoxFuture;
