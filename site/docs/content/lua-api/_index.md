@@ -481,6 +481,11 @@ Invalid UTF-8 in the returned text becomes U+FFFD.
 "full" when code such as `code_execution` made the call. Apply output limits
 only in compact mode.
 
+`ctx:context_usage()` returns `{ size, window }`: the tokens the calling agent's
+context holds and that agent's own window, snapshotted when its run built
+the call's context. A subagent sees its own numbers, never the parent
+session's. `(nil, err)` outside a handler ctx, as in `start` and restore.
+
 **Parameters:**
 
 - `{spec}` (`table`) Tool specification:

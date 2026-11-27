@@ -363,6 +363,20 @@ impl UserData for LuaCtx {
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
 
+        // The calling agent's own context: tokens in use and the window,
+        // snapshotted when the run built this call's context. A subagent
+        // fills its own window, so it must never gauge its room against
+        // the parent session's.
+        methods.add_method("context_usage", |lua, this, ()| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("context_usage"));
+            };
+            let usage = lua.create_table()?;
+            usage.set("size", agent.context_size)?;
+            usage.set("window", agent.model.context_window)?;
+            Ok((Some(usage), None))
+        });
+
         methods.add_method("tool_use_id", |_, this, ()| {
             Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
         });
@@ -736,6 +750,46 @@ mod tests {
 
         assert_eq!((finished, error), (Some(true), None));
         assert!(finish_rx.try_recv().is_ok());
+    }
+
+    /// `ctx:context_usage()` is the gauge and window of the agent that called
+    /// the tool, snapshotted when its dispatch built the context.
+    #[test]
+    fn context_usage_reports_the_calling_agents_own_gauge() {
+        const USED: u32 = 42_000;
+        let mut tool_ctx = populated_ctx();
+        tool_ctx.context_size = USED;
+        let lua = Lua::new();
+        let ctx = lua.create_userdata(LuaCtx::handler(&tool_ctx)).unwrap();
+
+        let (usage, error): (Option<Table>, Option<String>) = lua
+            .load("local ctx = ... return ctx:context_usage()")
+            .call(&ctx)
+            .unwrap();
+        assert_eq!(error, None);
+        let usage = usage.expect("a handler ctx has a gauge");
+        let size: u32 = usage.get("size").unwrap();
+        let window: u32 = usage.get("window").unwrap();
+        assert_eq!(size, USED);
+        assert_eq!(window, tool_ctx.model.context_window);
+    }
+
+    #[test]
+    fn context_usage_is_a_capability_error_without_a_run() {
+        let lua = Lua::new();
+        let ctx = lua
+            .create_userdata(LuaCtx::restore(RestoreCtx::default()))
+            .unwrap();
+        let (usage, error): (Option<Table>, Option<String>) = lua
+            .load("local ctx = ... return ctx:context_usage()")
+            .call(&ctx)
+            .unwrap();
+        assert!(usage.is_none());
+        assert!(
+            error
+                .expect("a restore ctx has no gauge")
+                .contains("context_usage")
+        );
     }
 
     #[test]
