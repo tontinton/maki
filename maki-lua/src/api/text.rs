@@ -6,7 +6,7 @@ use std::io;
 use std::iter::successors;
 
 use htmd::element_handler::{HandlerResult, Handlers};
-use htmd::node::{Node, NodeType};
+use htmd::node::{Node, NodeType, Tree};
 use htmd::options::{BulletListMarker, Options};
 use htmd::{Element, HtmlToMarkdown};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -96,12 +96,25 @@ fn unpad_row(line: &str) -> Cow<'_, str> {
     Cow::Owned(row)
 }
 
+/// The first element with one of `root_tags`, or the whole document when the
+/// page has none.
+fn content_root<'a>(tree: &'a Tree, root_tags: &[String]) -> Node<'a> {
+    let document = tree.root();
+    document
+        .find(|node| {
+            node.tag_name()
+                .is_some_and(|tag| root_tags.iter().any(|root| root == tag))
+        })
+        .unwrap_or(document)
+}
+
 /// Convert an HTML string to Markdown.
 /// Useful for cleaning up web content fetched with `maki.webfetch`.
 /// Invalid UTF-8 becomes U+FFFD.
 ///
 /// @param html string HTML source text.
 /// @param opts table? `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+///   `root_tags` (string[]) convert only the first element with one of these tags, like `main`, and the whole page when it has none.
 /// @return (string?, string?) Markdown text on success, or nil plus an error message.
 /// @example
 /// local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
@@ -117,6 +130,7 @@ async fn html_to_markdown(
 ) -> LuaResult<Pair<String>> {
     let html = html.to_string_lossy();
     let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
+    let root_tags: Vec<String> = opts.as_ref().opt("root_tags")?.unwrap_or_default();
     Ok(pair(
         spawn_blocking(move || {
             let mut builder = HtmlToMarkdown::builder()
@@ -141,7 +155,9 @@ async fn html_to_markdown(
             if !skip_tags.is_empty() {
                 builder = builder.skip_tags(skip_tags.iter().map(String::as_str).collect());
             }
-            builder.build().convert(&html)
+            let converter = builder.build();
+            let tree = converter.html_to_tree(&html)?;
+            converter.convert(content_root(&tree, &root_tags))
         })
         .await
         .map_err(mlua::Error::external)?
@@ -156,6 +172,7 @@ async fn html_to_markdown(
 ///
 /// @param html string HTML source text.
 /// @param opts table? `skip_tags` (string[]) elements dropped together with their content, like `script` or `nav`.
+///   `root_tags` (string[]) convert only the first element with one of these tags, like `main`, and the whole page when it has none.
 /// @return (string?, string?) Plain text on success, or nil plus an error message.
 /// @example
 /// local text, err = maki.text.html_to_text("<h1>Fish &amp; chips</h1><p>to <b>go</b></p>")
@@ -165,8 +182,9 @@ async fn html_to_markdown(
 async fn html_to_text(_lua: Lua, html: LuaString, opts: Option<Table>) -> LuaResult<Pair<String>> {
     let html = html.to_string_lossy();
     let skip_tags: Vec<String> = opts.as_ref().opt("skip_tags")?.unwrap_or_default();
+    let root_tags: Vec<String> = opts.as_ref().opt("root_tags")?.unwrap_or_default();
     Ok(pair(
-        spawn_blocking(move || visible_text(&html, &skip_tags))
+        spawn_blocking(move || visible_text(&html, &skip_tags, &root_tags))
             .await
             .map_err(mlua::Error::external)?
             .map_err(|e| format!("html_to_text: {e}")),
@@ -187,12 +205,12 @@ enum Step<'a> {
     EndPre,
 }
 
-fn visible_text(html: &str, skip_tags: &[String]) -> io::Result<String> {
+fn visible_text(html: &str, skip_tags: &[String], root_tags: &[String]) -> io::Result<String> {
     let mut text = String::new();
     let mut gap = Gap::None;
     let mut pre_depth = 0usize;
     let tree = HtmlToMarkdown::new().html_to_tree(html)?;
-    let mut steps = vec![Step::Visit(tree.root())];
+    let mut steps = vec![Step::Visit(content_root(&tree, root_tags))];
     while let Some(step) = steps.pop() {
         let node = match step {
             Step::Visit(node) => node,
@@ -458,6 +476,10 @@ mod tests {
     const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
     const PAGE_BODY: &str = "body";
     const TEXT_SKIP_TAGS: [&str; 3] = ["script", "style", "noscript"];
+    const SKIP_TAGS_OPTION: &str = "skip_tags";
+    const ROOT_TAGS_OPTION: &str = "root_tags";
+    const ROOT_TAGS: [&str; 1] = ["main"];
+    const LANDMARK_PAGE: &str = r#"<header><a href="/">Home</a></header><main><p>body</p></main><main><p>second</p></main><footer>legal</footer>"#;
     const PADDED_TABLE: &[u8] = b"<table><tr><th>a</th><th>b</th></tr><tr><td>a much longer cell</td><td></td></tr><tr><td>x | y</td><td><code>a|b</code></td></tr><tr><td>-</td><td>-</td></tr></table>";
     const UNPADDED_TABLE: &str =
         "| a | b |\n| --- | --- |\n| a much longer cell | |\n| x \\| y | `a\\|b` |\n| \\- | \\- |";
@@ -529,14 +551,12 @@ mod tests {
         lua
     }
 
-    async fn to_markdown(html: &[u8], skip_tags: Option<&[&str]>) -> String {
+    async fn to_markdown(html: &[u8], tag_option: Option<(&str, &[&str])>) -> String {
         let lua = lua_with_text();
         let text: Table = lua.globals().get("text").unwrap();
         let convert: Function = text.get("html_to_markdown").unwrap();
-        let opts = skip_tags.map(|tags| {
-            lua.create_table_from([("skip_tags", tags.to_vec())])
-                .unwrap()
-        });
+        let opts =
+            tag_option.map(|(name, tags)| lua.create_table_from([(name, tags.to_vec())]).unwrap());
         let (markdown, error): (String, Option<String>) = convert
             .call_async((lua.create_string(html).unwrap(), opts))
             .await
@@ -568,12 +588,32 @@ mod tests {
         skip_tags: &[&str],
         expected: &str,
     ) {
-        assert_eq!(to_markdown(input, Some(skip_tags)).await, expected);
+        assert_eq!(
+            to_markdown(input, Some((SKIP_TAGS_OPTION, skip_tags))).await,
+            expected
+        );
+    }
+
+    #[test_case(LANDMARK_PAGE.as_bytes(), PAGE_BODY ; "first_match")]
+    #[test_case(PAGE_BODY.as_bytes(), PAGE_BODY ; "whole_page_without_a_match")]
+    #[tokio::test]
+    async fn root_tags_narrow_markdown_to_one_element(input: &[u8], expected: &str) {
+        assert_eq!(
+            to_markdown(input, Some((ROOT_TAGS_OPTION, &ROOT_TAGS))).await,
+            expected
+        );
+    }
+
+    #[test_case(LANDMARK_PAGE, PAGE_BODY ; "first_match")]
+    #[test_case(PAGE_BODY, PAGE_BODY ; "whole_page_without_a_match")]
+    fn root_tags_narrow_text_to_one_element(html: &str, expected: &str) {
+        let root_tags = ROOT_TAGS.map(str::to_owned);
+        assert_eq!(visible_text(html, &[], &root_tags).unwrap(), expected);
     }
 
     fn to_text(html: &str) -> String {
         let skip_tags = TEXT_SKIP_TAGS.map(str::to_owned);
-        visible_text(html, &skip_tags).unwrap()
+        visible_text(html, &skip_tags, &[]).unwrap()
     }
 
     #[test_case("<div><p>Hello <b>wor</b>ld</p></div>", "Hello world" ; "inline_tags_leave_no_gap")]

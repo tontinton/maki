@@ -2,6 +2,7 @@ local VALID_FORMATS = { markdown = true, text = true, html = true }
 local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { "script", "style", "noscript" }
 local MARKDOWN_SKIP_TAGS = { "script", "style", "noscript", "iframe", "object", "svg", "template" }
+local CONTENT_ROOT_TAGS = { "main" }
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
@@ -31,6 +32,7 @@ maki.api.register_tool({
   description = [[Fetch a URL and return its contents.
 
 - Supports markdown (default), text, or html output formats.
+- markdown and text keep only the page's <main> element when it has one, so navigation and footer links need html.
 - HTTP URLs are auto-upgraded to HTTPS.
 - Max response size is 5MB, max timeout is 120s.
 - Best used inside code_execution with some truncation / filter to avoid context bloat.]],
@@ -101,10 +103,11 @@ maki.api.register_tool({
     local is_html = ct:find("text/html") ~= nil
 
     if fmt == "markdown" and is_html then
-      local converted = maki.text.html_to_markdown(body, { skip_tags = MARKDOWN_SKIP_TAGS })
+      local converted =
+        maki.text.html_to_markdown(body, { skip_tags = MARKDOWN_SKIP_TAGS, root_tags = CONTENT_ROOT_TAGS })
       body = converted or body
     elseif fmt == "text" and is_html then
-      local stripped = maki.text.html_to_text(body, { skip_tags = SKIP_TAGS })
+      local stripped = maki.text.html_to_text(body, { skip_tags = SKIP_TAGS, root_tags = CONTENT_ROOT_TAGS })
       body = stripped or body
     end
 
