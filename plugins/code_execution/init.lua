@@ -34,8 +34,11 @@ local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning 
 local EXCEPTION_LINE = "\n(%S[^\n]*)"
 local TOOLS_MODULE_HINT = "\n\nHint: tools are globals, call them directly. There is no `tools` module."
 local ASYNCIO_HINT = "\n\nHint: asyncio here has only `gather`, `run` and `sleep`."
+local MISSING_MODULE_HINT =
+  "\n\nHint: the sandbox has only part of the stdlib, and what is there can lack arguments. For more, run Python through bash."
 local ERROR_HINTS = {
   { "^ModuleNotFoundError: No module named 'tools'", TOOLS_MODULE_HINT },
+  { "^ModuleNotFoundError: No module named", MISSING_MODULE_HINT },
   { "^NameError: name 'tools' is not defined", TOOLS_MODULE_HINT },
   { "^AttributeError: module 'asyncio' has no attribute", ASYNCIO_HINT },
   { "^ImportError: cannot import name '[^']*' from 'asyncio'", ASYNCIO_HINT },
