@@ -62,6 +62,7 @@ const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
 pub const PERMISSION_SHAPE_ERR: &str = "must give 'permission' as one permission name, e.g. permission = \"fs_read\", or {} when the tool reaches nothing past the conversation";
 pub const INERT_WITH_SCOPES_ERR: &str = "declares permission = {}, so it has nothing to prompt for. Remove 'permission_scopes', or name the capability it prompts for";
+pub const SCHEMA_FIELD_ERR: &str = "not in schema properties or not type";
 pub const INERT_WITH_MUTABLE_PATH_ERR: &str = "writes the file named in 'mutable_path', so it reaches 'fs_write'. Declare permission = \"fs_write\" instead of {}";
 
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
@@ -222,6 +223,7 @@ pub(crate) struct ToolMeta {
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) durable_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
@@ -358,6 +360,10 @@ impl Tool for LuaTool {
 
     fn examples(&self) -> Option<Value> {
         self.meta.examples.clone()
+    }
+
+    fn durable_field(&self) -> Option<&str> {
+        self.meta.durable_field.as_deref()
     }
 
     fn reach(&self) -> Option<ToolReach> {
@@ -823,6 +829,7 @@ fn register_prompt(
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the handler calls no guarded `maki` function and no other tool. Such a tool needs no grant and is free to hand to a session. It cannot have `permission_scopes` or `mutable_path`, and older maki versions refuse it, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
+///   durable         (string)   Schema field (type: string) whose value names the result. The latest successful result per tool and value survives compaction verbatim, in transcript order. Results share 64 KiB and half the room left below the compaction threshold, at most a tenth of the context window, filled newest first, and a result that does not fit is skipped. A result survives while the tool keeps this declaration and, when the field declares an `enum`, the enum still lists the value. Only a direct call counts: a call made inside another tool, like `batch`, is not kept, and neither is a background receipt.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -1584,7 +1591,7 @@ fn check_schema_field(schema: &Value, key: &str, field: &str, expected: &str) ->
         Ok(())
     } else {
         Err(mlua::Error::runtime(format!(
-            "register_tool: {key} field '{field}' not in schema properties or not type '{expected}'"
+            "register_tool: {key} field '{field}' {SCHEMA_FIELD_ERR} '{expected}'"
         )))
     }
 }
@@ -1742,6 +1749,7 @@ fn register_tool_from_lua(
         ));
     }
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+    let durable_field = require_schema_field(spec, "durable", &schema_val)?;
     let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
     if mutable_path_field.is_some() && matches!(permission, Some(DeclaredReach::Inert)) {
         return Err(mlua::Error::runtime(format!(
@@ -1803,6 +1811,7 @@ fn register_tool_from_lua(
                 audience,
                 kind,
                 mutable_path_field,
+                durable_field,
                 timeout,
                 start_annotation,
                 examples,
@@ -2327,6 +2336,7 @@ mod tests {
                 audience: ToolAudience::default(),
                 kind: None,
                 mutable_path_field: None,
+                durable_field: None,
                 timeout: Some(Duration::from_secs(60)),
                 start_annotation: None,
                 examples: None,

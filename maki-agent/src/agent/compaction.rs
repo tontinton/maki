@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant};
@@ -5,8 +6,8 @@ use std::time::{Duration, Instant};
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse,
+    CHARS_PER_TOKEN, ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions,
+    Role, StreamResponse, estimate_message_tokens, estimate_prompt_tokens,
 };
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -18,7 +19,7 @@ use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
-use crate::tools::truncate_bytes;
+use crate::tools::{ToolRegistry, truncate_bytes};
 use crate::{
     AgentError, AgentEvent, DoneReason, EventSender, RunLedger, SteerKind, TurnCompleteEvent,
 };
@@ -30,6 +31,10 @@ const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 /// cheap ones, so one giant MCP dump could sit in the protected tail and blow
 /// the window on every retry.
 const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
+const DURABLE_KEY_SEPARATOR: char = ':';
+/// Share of the context window that carried durable results may fill, so they
+/// never push a small window back over the compaction threshold.
+const DURABLE_CONTEXT_PERCENT: u32 = 10;
 /// A summary runs to a few thousand tokens. Giving compaction the full turn
 /// budget would reserve tens of thousands it cannot use, on the one request
 /// already sent under the most context pressure a session ever sees.
@@ -166,6 +171,138 @@ pub(super) async fn steer_compaction(
         instructions: join_lines([request, added]),
         continue_text: continue_with.map(str::to_owned),
     })
+}
+
+/// The input field of a durable tool, and the values its schema still accepts
+/// there. A value the schema no longer lists, like a skill whose folder lost
+/// trust, is not carried any more.
+struct DurableField {
+    name: String,
+    accepted: Option<Vec<String>>,
+}
+
+impl DurableField {
+    fn of(registry: &ToolRegistry, tool: &str) -> Option<Self> {
+        let tool = &registry.get(tool)?.tool;
+        let name = tool.durable_field()?;
+        let accepted = tool
+            .schema()
+            .get("properties")
+            .and_then(|properties| properties.get(name)?.get("enum")?.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            });
+        Some(Self {
+            name: name.to_owned(),
+            accepted,
+        })
+    }
+
+    fn accepts(&self, value: &str) -> bool {
+        self.accepted
+            .as_ref()
+            .is_none_or(|accepted| accepted.iter().any(|known| known == value))
+    }
+}
+
+/// [`DurableField`] per tool name, looked up once per compaction.
+struct DurableFields<'a> {
+    registry: &'a ToolRegistry,
+    known: HashMap<String, Option<DurableField>>,
+}
+
+impl DurableFields<'_> {
+    fn get(&mut self, tool: &str) -> Option<&DurableField> {
+        if !self.known.contains_key(tool) {
+            let field = DurableField::of(self.registry, tool);
+            self.known.insert(tool.to_owned(), field);
+        }
+        self.known.get(tool)?.as_ref()
+    }
+}
+
+/// The latest durable result per key that the summary replaces, oldest first,
+/// as long as its tool still declares it durable and accepts its value. The
+/// newest are kept within [`RECENT_TOOL_RESULT_BUDGET`] and `max_tokens`. A
+/// newer result for the key in the carried tail wins, so it is left where it
+/// is. A background receipt is not the result, so it is never kept.
+fn durable_messages(
+    history: &[Message],
+    summarized: usize,
+    registry: &ToolRegistry,
+    max_tokens: u32,
+) -> Vec<Message> {
+    let mut fields = DurableFields {
+        registry,
+        known: HashMap::new(),
+    };
+    let mut calls = HashMap::new();
+    let mut latest = HashMap::new();
+    let mut seq = 0..;
+    for (at, message) in history.iter().enumerate() {
+        if let Some(key) = &message.durable
+            && let Some((tool, value)) = key.split_once(DURABLE_KEY_SEPARATOR)
+            && fields.get(tool).is_some_and(|field| field.accepts(value))
+            && let Some(text) = message.first_text_content()
+        {
+            latest.insert(key.clone(), (seq.next(), at, text));
+        }
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    calls.remove(id.as_str());
+                    if let Some(field) = fields.get(name)
+                        && let Some(value) = input.get(&field.name).and_then(Value::as_str)
+                        && !value.trim().is_empty()
+                        && field.accepts(value)
+                    {
+                        calls.insert(id.as_str(), format!("{name}{DURABLE_KEY_SEPARATOR}{value}"));
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(key) = calls.remove(tool_use_id.as_str())
+                        && !is_error
+                        && !content.trim().is_empty()
+                        && !message.receipts.contains(tool_use_id)
+                    {
+                        latest.insert(key, (seq.next(), at, content.as_str()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut carried: Vec<_> = latest
+        .into_iter()
+        .filter(|(_, (_, at, _))| *at < summarized)
+        .collect();
+    carried.sort_by_key(|(_, (order, _, _))| Reverse(*order));
+    let mut budget = RECENT_TOOL_RESULT_BUDGET.min(max_tokens as usize * CHARS_PER_TOKEN);
+    carried.retain(|(_, (_, _, text))| {
+        let fits = text.len() <= budget;
+        if fits {
+            budget -= text.len();
+        }
+        fits
+    });
+    carried
+        .into_iter()
+        .rev()
+        .map(|(key, (_, _, text))| Message {
+            durable: Some(key),
+            ..Message::observation(text.to_owned())
+        })
+        .collect()
 }
 
 fn percent_of(tokens: u32, percent: u32) -> u32 {
@@ -392,15 +529,36 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     };
 
-    let (new_history, summary_len) = rebuild_history(
+    let (mut new_history, summary_len) = rebuild_history(
         response.message,
         history.as_slice(),
         summarized,
         config.post_compaction_instructions.as_deref(),
     );
+    // Carried results get at most half of what the prefix, summary and tail
+    // leave below the threshold, so the next turns have room before the next
+    // compaction. Without a frame yet, as on resume, the window share bounds it.
+    let kept = history.request_prefix().map_or_else(
+        || estimate_message_tokens(&new_history),
+        |(system, tools)| estimate_prompt_tokens(&new_history, system, tools),
+    );
+    let room = (usable(hooks.model, config).saturating_sub(kept) / 2).min(percent_of(
+        hooks.model.context_window,
+        DURABLE_CONTEXT_PERCENT,
+    ));
+    let summary_at = new_history[summary_len - 1].created_at;
+    let durable = durable_messages(history.as_slice(), summarized, hooks.registry, room);
+    let carried_from = summary_len + durable.len();
+    new_history.splice(
+        summary_len..summary_len,
+        durable.into_iter().map(|msg| Message {
+            created_at: summary_at,
+            ..msg
+        }),
+    );
     history.restart(new_history);
 
-    Ok((summary, history.len() - summary_len))
+    Ok((summary, history.len() - carried_from))
 }
 
 /// `context` builds what the session would start with now. The summary goes

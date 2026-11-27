@@ -29,7 +29,7 @@ pub const UNTRUSTED_PROJECT_WRITE: &str =
 static PERMISSION_WRITE: Mutex<()> = Mutex::new(());
 
 pub mod project;
-pub use project::{GatedFile, ProjectConfig, policy_grant};
+pub use project::{GatedFile, PROJECT_SKILL_DIRS, ProjectConfig, policy_grant};
 
 pub mod providers;
 

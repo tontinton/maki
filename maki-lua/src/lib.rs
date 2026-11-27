@@ -27,7 +27,9 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::provider::fetch_provider_usage;
 pub use api::session::SessionSnapshotFn;
-pub use api::tool::{INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, PERMISSION_SHAPE_ERR};
+pub use api::tool::{
+    INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, PERMISSION_SHAPE_ERR, SCHEMA_FIELD_ERR,
+};
 pub use api::ui::marks::{
     Decoration, InputRule, InputRulesReader, Mark, PatternRule, Reveal, VirtTextPos,
 };

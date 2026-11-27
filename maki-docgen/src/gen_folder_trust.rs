@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use maki_config::GatedFile;
+use maki_config::{GatedFile, PROJECT_SKILL_DIRS};
 
 const INTRO: &str = r#"+++
 title = "Folder Trust"
@@ -37,13 +37,11 @@ configuration.
 
 ## What Trust Does Not Cover
 
-Trust gates code. Text that a project puts into the prompt loads at any trust
-level:
+Trust gates code and project skills. Other text that a project puts into the
+prompt loads at any trust level:
 
 - `AGENTS.md` and the other instruction files
 - Commands under `.maki/commands` and `.claude/commands`
-- Skills under `.maki/skills`, `.claude/skills`, `.opencode/skills` and
-  `.agents/skills`
 
 A repository can still steer the agent through what the model reads, so trust
 is not a sandbox. What limits the agent on each tool call is
@@ -146,7 +144,9 @@ maki.setup({
 ## What a Yes Covers
 
 Your yes covers the kinds of gated file the folder had that day. A project that
-later adds a kind you were never asked about asks again.
+later adds a kind you were never asked about asks again. Project skills are the
+exception: a yes always covers them, so a trusted folder that gains skills stays
+trusted.
 
 Maki records the file names rather than their contents, so Lua that changes in a
 later pull runs under the answer you already gave. Run `maki trust remove` when
@@ -158,7 +158,15 @@ fn gated_table() -> String {
     let mut table =
         String::from("| Gated file | What it can do |\n|------------|----------------|");
     for file in GatedFile::ALL {
-        write!(table, "\n| `{file}` | {} |", file.describes()).unwrap();
+        let name = match file {
+            GatedFile::Skills => PROJECT_SKILL_DIRS
+                .iter()
+                .map(|dir| format!("`{dir}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => format!("`{file}`"),
+        };
+        write!(table, "\n| {name} | {} |", file.describes()).unwrap();
     }
     table
 }

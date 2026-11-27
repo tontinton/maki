@@ -32,6 +32,7 @@ async fn load_stack(
         cli.no_plugins,
         super::BuiltinFailure::Fatal,
         Interaction::None,
+        &trust.project_config,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let mut config = host

@@ -17,6 +17,7 @@ pub const TRUST_QUESTION: &str = "Trust this folder?";
 const TERMINAL_TRUST_QUESTION: &str = "Trust this folder? [y/N]";
 const SHARED_FILE_POWERS: &str =
     "which can change the environment, start processes, and run Lua code";
+const SKILL_POWERS: &str = "which add instructions for the agent";
 const NO_SHARED_FILES_YET: &str =
     "This project ships no .maki files yet, but any added later would ask again.";
 const ADDED_SINCE_TRUSTED: &str = "since you trusted it";
@@ -31,7 +32,19 @@ const HOW_TO_TRUST: &str =
 const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
-/// A file under `.maki/` that only a trusted folder may hand to Maki.
+const PROJECT_SKILLS: &str = "project skills";
+const SKILL_FILE: &str = "SKILL.md";
+/// Where a project keeps skills, relative to each trusted project directory.
+/// The trust check and the skill plugin both read this list, so a folder the
+/// question never named cannot load skills.
+pub const PROJECT_SKILL_DIRS: &[&str] = &[
+    ".maki/skills",
+    ".claude/skills",
+    ".opencode/skills",
+    ".agents/skills",
+];
+
+/// A kind of project content that requires folder trust.
 ///
 /// `config.toml` is deliberately absent. Maki stopped reading it, so it can do
 /// nothing, and asking about a file that has no powers is a question with no
@@ -42,6 +55,7 @@ pub enum GatedFile {
     Permissions,
     InitLua,
     Mcp,
+    Skills,
 }
 
 impl GatedFile {
@@ -59,6 +73,7 @@ impl GatedFile {
             GatedFile::Permissions => "permissions.toml",
             GatedFile::InitLua => "init.lua",
             GatedFile::Mcp => "mcp.toml",
+            GatedFile::Skills => "skills",
         }
     }
 
@@ -71,19 +86,25 @@ impl GatedFile {
             GatedFile::Permissions => "decides which tools run without asking",
             GatedFile::InitLua => "runs Lua inside Maki's own process at startup",
             GatedFile::Mcp => "starts MCP servers as child processes",
+            GatedFile::Skills => "adds agent instructions from project skill directories",
         }
     }
 }
 
 impl std::fmt::Display for GatedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{PROJECT_DIR}/{}", self.file_name())
+        if matches!(self, Self::Skills) {
+            f.write_str(PROJECT_SKILLS)
+        } else {
+            write!(f, "{PROJECT_DIR}/{}", self.file_name())
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
     config_root: PathBuf,
+    project_dirs: Vec<PathBuf>,
     /// The home directory is the one folder that is never a project of its own,
     /// see [`ProjectConfig::rooted`].
     at_home: bool,
@@ -108,8 +129,15 @@ impl ProjectConfig {
     pub(crate) fn rooted(cwd: &Path, home: Option<&Path>) -> Self {
         let cwd = canonicalize_clean(cwd);
         let at_home = home == Some(cwd.as_path());
+        let config_root = git_checkout_boundary(&cwd, home).unwrap_or_else(|| cwd.clone());
+        let project_dirs = cwd
+            .ancestors()
+            .take_while(|path| !at_home && path.starts_with(&config_root))
+            .map(Path::to_path_buf)
+            .collect();
         Self {
-            config_root: git_checkout_boundary(&cwd, home).unwrap_or(cwd),
+            config_root,
+            project_dirs,
             at_home,
             trusted: false,
             trust_store: None,
@@ -124,10 +152,27 @@ impl ProjectConfig {
         self.trusted
     }
 
+    /// Canonical directories covered by the trust check, nearest first.
+    fn project_dirs(&self) -> &[PathBuf] {
+        if self.trusted {
+            &self.project_dirs
+        } else {
+            &[]
+        }
+    }
+
+    /// Every directory a project skill can come from, nearest first, in
+    /// [`PROJECT_SKILL_DIRS`] order. Empty unless the folder is trusted.
+    pub fn project_skill_dirs(&self) -> Vec<PathBuf> {
+        skill_dirs(self.project_dirs()).collect()
+    }
+
     /// The only route to a gated project file. `None` unless the folder is
     /// trusted, so a consumer cannot read one by forgetting a check.
+    /// Project skills span several directories and have no single path; their
+    /// consumers read [`Self::project_skill_dirs`].
     pub fn gated_path(&self, file: GatedFile) -> Option<PathBuf> {
-        self.trusted.then(|| self.project_file(file))
+        (self.trusted && file != GatedFile::Skills).then(|| self.project_file(file))
     }
 
     /// Ungated, and private for that reason: `.maki/permissions.toml` is read
@@ -384,8 +429,16 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
     let trusted_folders = TrustedFolders::new(storage);
-    let present = gated_files(project_config.config_root());
-    let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
+    let present = gated_files_in(project_config.config_root(), &project_config.project_dirs);
+    // A recorded grant covers project skills: they are prompt text, like
+    // `AGENTS.md`, so adding them never widens it. A folder with no record
+    // is still asked about them.
+    let compared: Vec<GatedFile> = present
+        .iter()
+        .copied()
+        .filter(|file| *file != GatedFile::Skills)
+        .collect();
+    let decision = match trusted_folders.decide(&folder, &store_names(&compared), &project_root) {
         Ok(decision) => decision,
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
@@ -543,17 +596,19 @@ pub fn trust_question_lines(question: &TrustQuestion) -> Vec<String> {
         "Maki can load shared project configuration from {}.",
         question.folder.path().display()
     )];
-    lines.push(
-        match name_list(question.named().iter().map(|file| file.file_name())) {
-            Some(files) if question.added.is_empty() => {
-                format!("This project ships {files}, {SHARED_FILE_POWERS}.")
-            }
-            Some(files) => {
-                format!("This project added {files} {ADDED_SINCE_TRUSTED}, {SHARED_FILE_POWERS}.")
-            }
-            None => NO_SHARED_FILES_YET.to_owned(),
-        },
-    );
+    let named = question.named();
+    let powers = if named.iter().all(|file| *file == GatedFile::Skills) {
+        SKILL_POWERS
+    } else {
+        SHARED_FILE_POWERS
+    };
+    lines.push(match name_list(named.iter().map(|file| file.file_name())) {
+        Some(files) if question.added.is_empty() => {
+            format!("This project ships {files}, {powers}.")
+        }
+        Some(files) => format!("This project added {files} {ADDED_SINCE_TRUSTED}, {powers}."),
+        None => NO_SHARED_FILES_YET.to_owned(),
+    });
     lines.push(String::new());
     lines.push(TRUST_DOCS.to_owned());
     lines
@@ -580,16 +635,38 @@ pub fn confirm_trust(
     Ok(trusted)
 }
 
-/// Which gated files a project ships right now. This is the set a trust answer
-/// is recorded against, so `maki trust add` and `resolve` agree on what an
-/// answer covers.
+/// Root-level content for an explicit grant. Startup also inventories skill
+/// directories between its working directory and this root.
 pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
+    gated_files_in(config_root, &[config_root.to_path_buf()])
+}
+
+fn gated_files_in(config_root: &Path, project_dirs: &[PathBuf]) -> Vec<GatedFile> {
     let project_dir = config_root.join(PROJECT_DIR);
     GatedFile::ALL
         .iter()
         .copied()
-        .filter(|file| project_dir.join(file.file_name()).exists())
+        .filter(|file| match file {
+            GatedFile::Skills => skill_dirs(project_dirs).any(|dir| holds_a_skill(&dir)),
+            _ => project_dir.join(file.file_name()).exists(),
+        })
         .collect()
+}
+
+/// A skill folder counts once it holds a skill, so an empty `.claude/skills`
+/// left by another tool does not ask about anything.
+fn holds_a_skill(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().join(SKILL_FILE).is_file())
+    })
+}
+
+fn skill_dirs(project_dirs: &[PathBuf]) -> impl Iterator<Item = PathBuf> {
+    project_dirs
+        .iter()
+        .flat_map(|ancestor| PROJECT_SKILL_DIRS.iter().map(move |dir| ancestor.join(dir)))
 }
 
 /// The trust store keeps plain names on disk: it is a wire format, and a name
@@ -612,7 +689,13 @@ fn from_store_names(names: &[String]) -> Vec<GatedFile> {
 fn name_list<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let names: Vec<String> = files
         .into_iter()
-        .map(|file| format!("{PROJECT_DIR}/{file}"))
+        .map(|file| {
+            if file == GatedFile::Skills.file_name() {
+                PROJECT_SKILLS.to_owned()
+            } else {
+                format!("{PROJECT_DIR}/{file}")
+            }
+        })
         .collect();
     match names.split_last()? {
         (last, []) => Some(last.clone()),
@@ -643,6 +726,9 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
@@ -680,6 +766,10 @@ mod tests {
     const NESTED_REPO: &str = "work";
     const NESTED_CWD: &str = "work/src";
     const SOURCE_DIR: &str = "src";
+    const SKILL_DIR: &str = ".agents/skills";
+    const EXAMPLE_SKILL: &str = "release";
+    #[cfg(unix)]
+    const ALIAS_DIR: &str = "alias";
     const NO_FILES: &[&str] = &[];
     /// The documented blanket form: every folder trusted, spelled out.
     const BLANKET_GLOB: &str = "**";
@@ -696,11 +786,8 @@ mod tests {
 
         for file in GatedFile::ALL.iter().copied() {
             assert_eq!(untrusted.gated_path(file), None, "{file}");
-            assert_eq!(
-                trusted.gated_path(file),
-                Some(trusted.project_file(file)),
-                "{file}"
-            );
+            let expected = (file != GatedFile::Skills).then(|| trusted.project_file(file));
+            assert_eq!(trusted.gated_path(file), expected, "{file}");
         }
     }
 
@@ -712,6 +799,135 @@ mod tests {
     #[test_case(GatedFile::Mcp, "mcp.toml" ; "mcp")]
     fn gated_file_names_are_the_wire_format(file: GatedFile, expected: &str) {
         assert_eq!(file.file_name(), expected);
+    }
+
+    #[test_case(".maki/skills" ; "maki")]
+    #[test_case(".claude/skills" ; "claude")]
+    #[test_case(".opencode/skills" ; "opencode")]
+    #[test_case(".agents/skills" ; "agents")]
+    fn a_folder_with_only_nested_skills_and_no_record_is_asked(relative: &str) {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join(NESTED_CWD);
+        fs::create_dir(root.path().join(GIT_DIR)).unwrap();
+        add_skill(&cwd.join(relative));
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let decision = resolve(&storage, &cwd, TrustMode::Consult);
+
+        assert!(!decision.project_config.is_trusted());
+        let question = decision.state.question().expect("nested skills need trust");
+        assert_eq!(
+            question.folder,
+            CanonicalFolder::resolve(root.path()).unwrap()
+        );
+        assert_eq!(question.present, [GatedFile::Skills]);
+    }
+
+    fn add_skill(dir: &Path) {
+        let skill = dir.join(EXAMPLE_SKILL);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join(SKILL_FILE), "").unwrap();
+    }
+
+    /// Another tool can leave an empty skill folder behind. With no skill in it
+    /// there is nothing to load, so there is nothing to ask about.
+    #[test]
+    fn an_empty_skill_folder_asks_nothing() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(GIT_DIR)).unwrap();
+        fs::create_dir_all(root.path().join(SKILL_DIR)).unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let decision = resolve(&storage, root.path(), TrustMode::Consult);
+
+        assert!(decision.state.question().is_none());
+        add_skill(&root.path().join(SKILL_DIR));
+        let decision = resolve(&storage, root.path(), TrustMode::Consult);
+        assert_eq!(
+            decision
+                .state
+                .question()
+                .map(|question| question.present.as_slice()),
+            Some([GatedFile::Skills].as_slice())
+        );
+    }
+
+    #[test_case("", ".claude/skills" ; "an_upgraded_trusted_folder_gains_skills")]
+    #[test_case(NESTED_CWD, ".agents/skills" ; "a_root_grant_covers_a_nested_start")]
+    fn a_recorded_grant_covers_project_skills(cwd: &str, skills: &str) {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(GIT_DIR)).unwrap();
+        fs::create_dir(root.path().join(PROJECT_DIR)).unwrap();
+        fs::write(root.path().join(INIT_FILE), INIT_SOURCE).unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(root.path()).unwrap();
+        TrustedFolders::new(&storage)
+            .add(&folder, &store_names(&gated_files(root.path())))
+            .unwrap();
+        let cwd = root.path().join(cwd);
+        add_skill(&cwd.join(skills));
+
+        let decision = resolve(&storage, &cwd, TrustMode::Consult);
+
+        assert!(decision.project_config.is_trusted());
+        assert!(decision.state.question().is_none());
+    }
+
+    #[test]
+    fn project_directories_are_trusted_and_stop_at_the_checkout_root() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(NESTED_REPO);
+        let cwd = project.join(SOURCE_DIR);
+        fs::create_dir_all(project.join(GIT_DIR)).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(root.path().join(SKILL_DIR)).unwrap();
+        let discovered = ProjectConfig::discover(&cwd);
+        assert!(discovered.project_dirs().is_empty());
+        let trusted = discovered.with_trust(true);
+        assert_eq!(
+            trusted.project_dirs(),
+            [canonicalize_clean(&cwd), canonicalize_clean(&project)]
+        );
+        assert!(gated_files_in(trusted.config_root(), &trusted.project_dirs).is_empty());
+    }
+
+    #[test]
+    fn home_and_non_checkout_paths_do_not_scan_their_parents() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join(SOURCE_DIR);
+        fs::create_dir(&cwd).unwrap();
+        let home_path = canonicalize_clean(home.path());
+        assert!(
+            ProjectConfig::rooted(&home_path, Some(&home_path))
+                .with_trust(true)
+                .project_dirs()
+                .is_empty()
+        );
+        assert_eq!(
+            ProjectConfig::rooted(&cwd, Some(&home_path))
+                .with_trust(true)
+                .project_dirs(),
+            [canonicalize_clean(&cwd)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_project_directories_resolve_a_symlinked_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(NESTED_REPO);
+        let cwd = project.join(SOURCE_DIR);
+        let alias = root.path().join(ALIAS_DIR);
+        fs::create_dir_all(project.join(GIT_DIR)).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        symlink(&project, &alias).unwrap();
+        let via_alias = ProjectConfig::discover(&alias.join(SOURCE_DIR)).with_trust(true);
+        let direct = ProjectConfig::discover(&cwd).with_trust(true);
+        assert_eq!(via_alias.project_dirs(), direct.project_dirs());
+        assert_eq!(via_alias.config_root(), direct.config_root());
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -945,6 +1161,23 @@ mod tests {
                 .join("\n")
                 .contains(NO_SHARED_FILES_YET)
         );
+    }
+
+    /// Skills are prompt text, so a folder that ships only skills must not be
+    /// described with the powers of code. Next to code the shared clause holds.
+    #[test]
+    fn a_folder_with_only_skills_is_described_as_instructions() {
+        let (_state, project, _storage) = setup();
+        fs::remove_file(project.path().join(INIT_FILE)).unwrap();
+        add_skill(&project.path().join(SKILL_DIR));
+        let card = || trust_question_lines(&question_at(project.path())).join("\n");
+
+        let skills_only = card();
+        assert!(skills_only.contains(SKILL_POWERS), "{skills_only:?}");
+        assert!(!skills_only.contains(SHARED_FILE_POWERS), "{skills_only:?}");
+
+        fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
+        assert!(card().contains(SHARED_FILE_POWERS));
     }
 
     /// A linked worktree spells `.git` as a file pointing at the main checkout,
