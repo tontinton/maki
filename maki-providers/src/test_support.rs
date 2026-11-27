@@ -43,6 +43,9 @@ const HEADER_REPEATED: &str = "the client sent a header more than once";
 const HEADER_NOT_SENT: &str = "the client did not send the header";
 const BAD_DECLARATION: &str = "the test declaration must register";
 const TEMPDIR_FAILED: &str = "cannot create the isolated home";
+const NEXTEST_VAR: &str = "NEXTEST";
+const NOT_NEXTEST: &str = "isolated_home needs a process per test, run the suite with `cargo nextest run`: \
+under `cargo test` an earlier test can fix the base dirs to the real home first";
 const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
 // Logs sit beside the state base, so keep its parent inside the guard.
 // Windows reads `APPDATA` and `LOCALAPPDATA` instead of the XDG variables.
@@ -371,6 +374,7 @@ pub(crate) mod transport {
 /// first, since the base dirs are resolved once per process, and keep the
 /// guard for the whole test.
 pub fn isolated_home() -> TempDir {
+    assert!(std::env::var_os(NEXTEST_VAR).is_some(), "{NOT_NEXTEST}");
     let home = TempDir::new().expect(TEMPDIR_FAILED);
     // SAFETY: Nextest runs each test in its own process. Callers set up the
     // environment before starting work that can read it.
@@ -444,6 +448,14 @@ mod tests {
         unsafe { std::env::set_var(&var, GATEWAY_URL) };
         let _home = isolated_home();
         assert!(std::env::var_os(&var).is_none(), "{OVERRIDE_KEPT}: {var}");
+    }
+
+    #[test]
+    fn isolated_home_refuses_a_shared_process() {
+        // SAFETY: Nextest runs this test in its own process, before any thread.
+        unsafe { std::env::remove_var(NEXTEST_VAR) };
+        let payload = catch_unwind(isolated_home).err().unwrap();
+        assert_eq!(payload.downcast_ref::<String>().unwrap(), NOT_NEXTEST);
     }
 
     /// One raw request on its own connection, answered by the status line and
