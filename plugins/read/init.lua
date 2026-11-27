@@ -141,7 +141,7 @@ end
 
 -- The cut itself is only a `...` at the end of the line, which reads like
 -- the file's own text once it is copied somewhere else.
-local function cut_note(cut, max_line_bytes, whole_line_bytes)
+local function cut_note(cut: { { line: number, bytes: number } }, max_line_bytes, whole_line_bytes)
   if #cut == 0 then
     return ""
   end
