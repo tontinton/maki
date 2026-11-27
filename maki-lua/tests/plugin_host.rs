@@ -9709,6 +9709,10 @@ fn file_tool_note(reply: &str) -> Option<&str> {
 #[test_case::test_case("echo \"$(cat /dev/null)\"", None ; "command_substitution")]
 #[test_case::test_case("for f in /dev/null; do cat \"$f\"; done", None ; "loop_body")]
 #[test_case::test_case("git grep -c zzz-no-match -- /dev/null", None ; "subcommand_named_grep")]
+#[test_case::test_case("V=/dev\ncd \"$V\"; cat null; echo ---; cat null", Some("the read tool instead of cat") ; "reads_held_together_by_glue")]
+#[test_case::test_case("ls /dev/null; stat /dev/null", None ; "beside_a_command_no_tool_covers")]
+#[test_case::test_case("ls /dev/null; for d in /dev/null; do rg zzz-no-match \"$d\"; done", None ; "beside_a_loop")]
+#[test_case::test_case("cat /dev/null && cat /dev/null | wc -l", None ; "beside_a_pipe")]
 fn bash_names_the_file_tool_a_command_stands_in_for(command: &str, expected: Option<&str>) {
     let reply = bash_reply(command, |_| {});
     assert_eq!(file_tool_note(&reply), expected, "got: {reply}");

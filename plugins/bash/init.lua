@@ -90,6 +90,14 @@ local FILE_TOOLS = {
 -- `rg x | head -20` is a search with a limit, which these tools take
 -- themselves.
 local TOOLS_WITH_LIMIT = { read = true, grep = true }
+-- What holds a few reads together without doing work of its own:
+-- `V=dir; cd "$V"; cat a; echo ---; cat b 2>/dev/null` is still two reads.
+local GLUE_COMMANDS = { echo = true, cd = true }
+local GLUE_TYPES = {
+  comment = true,
+  variable_assignment = true,
+  file_redirect = true,
+}
 local HEAD_SINK_PATTERNS = { "^head$", "^head%s+%-n%s*%d+$", "^head%s+%-%d+$" }
 local FLAG_PATTERN = "%s(%-%-?%w[%w%-]*)"
 local SHORT_FLAGS_PATTERN = "^%-(%w+)$"
@@ -389,9 +397,13 @@ local function file_tool_for(name, text)
   return spec.tool
 end
 
-local function file_tool_use(command, source)
+local function command_name(command, source)
   local name_node = command:field("name")[1]
-  local name = name_node and node_text(name_node, source)
+  return name_node and node_text(name_node, source)
+end
+
+local function file_tool_use(command, source)
+  local name = command_name(command, source)
   local tool = name and file_tool_for(name, node_text(command, source))
   return tool and { tool = tool, command = name }
 end
@@ -418,32 +430,39 @@ end
 -- Only a plain command that reads files counts. In a pipe the other side
 -- does work no tool takes over (`cargo test | tail`, `cat f | jq .`), bar a
 -- `head` that only cuts the output. Block forms and substitutions are
--- scripting.
+-- scripting. Returns false once the line holds such work: it needs bash
+-- anyway, so a note on the reads that ride along is noise.
 local function collect_file_tool_uses(node, source, uses)
   if redirect_rules_out_file_tool(node, source) then
-    return
+    return false
   end
   local kind = node:type()
+  if GLUE_TYPES[kind] then
+    return true
+  end
   if kind == "command" then
-    uses[#uses + 1] = file_tool_use(node, source)
-    return
+    local use = file_tool_use(node, source)
+    uses[#uses + 1] = use
+    return use ~= nil or GLUE_COMMANDS[command_name(node, source)] == true
   end
   if kind == "pipeline" then
     local limited = head_limited_command(node, source)
     local use = limited and file_tool_use(limited, source)
-    if use and TOOLS_WITH_LIMIT[use.tool] then
-      uses[#uses + 1] = use
+    if not (use and TOOLS_WITH_LIMIT[use.tool]) then
+      return false
     end
-    return
+    uses[#uses + 1] = use
+    return true
   end
   if not WALK_THROUGH_TYPES[kind] then
-    return
+    return false
   end
   for child in node:iter_children() do
-    if child:named() then
-      collect_file_tool_uses(child, source, uses)
+    if child:named() and not collect_file_tool_uses(child, source, uses) then
+      return false
     end
   end
+  return true
 end
 
 local function file_tool_note(command, ctx)
@@ -452,8 +471,7 @@ local function file_tool_note(command, ctx)
     return nil
   end
   local uses = {}
-  collect_file_tool_uses(parser:parse()[1]:root(), command, uses)
-  if #uses == 0 then
+  if not collect_file_tool_uses(parser:parse()[1]:root(), command, uses) then
     return nil
   end
   local callable = {}
