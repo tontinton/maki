@@ -35,6 +35,7 @@ const GITDIR_POINTER: &str = "gitdir:";
 /// Inside a worktree's entry under the main checkout's `.git/worktrees`: the
 /// path back to the worktree's `.git` file, and the path on to the shared
 /// `.git` directory.
+const WORKTREES_DIR: &str = "worktrees";
 const WORKTREE_BACK_POINTER: &str = "gitdir";
 const WORKTREE_COMMON_DIR: &str = "commondir";
 
@@ -698,7 +699,11 @@ fn linked_worktree_main(worktree: &Path) -> Option<PathBuf> {
     }
     let common = fs::read_to_string(entry.join(WORKTREE_COMMON_DIR)).ok()?;
     let common = canonicalize_clean(&entry.join(common.trim()));
-    (common.file_name()? == GIT_DIR && common.is_dir())
+    // The entry is only proof while it sits where `git worktree add` puts it.
+    // One the folder brought along can name any `.git` as its common
+    // directory.
+    let registered = canonicalize_clean(&entry).parent()? == common.join(WORKTREES_DIR);
+    (registered && common.file_name()? == GIT_DIR && common.is_dir())
         .then(|| common.parent().map(Path::to_path_buf))
         .flatten()
 }
@@ -1058,6 +1063,9 @@ mod tests {
         /// The main checkout never registered this folder: its entry names
         /// another one.
         BackPointerElsewhere,
+        /// An entry the folder ships itself, naming the folder back and the
+        /// trusted checkout's `.git` as its common directory.
+        SelfMadeEntry,
         /// A `.git` that is a symlink to a genuine worktree's.
         #[cfg(unix)]
         SymlinkedGitFile,
@@ -1070,12 +1078,14 @@ mod tests {
     #[test_case(Link::TwoWay, true ; "a_linked_worktree_inherits_the_main_checkouts_yes")]
     #[test_case(Link::TwoWayRelative, true ; "relative_pointers_link_the_same_way")]
     #[test_case(Link::BackPointerElsewhere, false ; "a_folder_the_main_checkout_does_not_name_inherits_nothing")]
+    #[test_case(Link::SelfMadeEntry, false ; "an_entry_the_folder_ships_itself_inherits_nothing")]
     #[cfg_attr(unix, test_case(Link::SymlinkedGitFile, false ; "a_symlink_to_a_worktrees_git_file_inherits_nothing"))]
     #[test_case(Link::MainNeverTrusted, false ; "an_unanswered_main_checkout_has_nothing_to_inherit")]
     #[test_case(Link::WorktreeShipsMore, false ; "a_kind_the_main_checkouts_yes_never_named_still_asks")]
     #[test_case(Link::WorktreeRejected, false ; "a_never_on_the_worktree_stays")]
     fn linked_worktree_trust_follows_the_main_checkout(link: Link, trusted: bool) {
         const ENTRY: &str = ".git/worktrees/linked";
+        const SELF_MADE_ENTRY: &str = "entry";
         const RELATIVE_BACK_POINTER: &str = "../../../../linked/.git\n";
 
         let state = tempfile::tempdir().unwrap();
@@ -1106,6 +1116,26 @@ mod tests {
             }
             Link::BackPointerElsewhere => {
                 fs::write(impostor.join(GIT_DIR), &pointer).unwrap();
+                impostor
+            }
+            Link::SelfMadeEntry => {
+                let forged = impostor.join(SELF_MADE_ENTRY);
+                fs::create_dir(&forged).unwrap();
+                fs::write(
+                    forged.join(WORKTREE_COMMON_DIR),
+                    format!("{}\n", main.join(GIT_DIR).display()),
+                )
+                .unwrap();
+                fs::write(
+                    forged.join(WORKTREE_BACK_POINTER),
+                    format!("{}\n", impostor.join(GIT_DIR).display()),
+                )
+                .unwrap();
+                fs::write(
+                    impostor.join(GIT_DIR),
+                    format!("{GITDIR_POINTER} {}\n", forged.display()),
+                )
+                .unwrap();
                 impostor
             }
             #[cfg(unix)]
