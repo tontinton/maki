@@ -429,10 +429,18 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
         // and only for the kinds of file it named. A `Never` on the worktree
         // itself was matched above and stays.
         //
-        // Nothing is written down for the worktree. The main checkout's answer
-        // is read on every start, so taking it back takes it back here too.
-        TrustDecision::Unknown | TrustDecision::Widened { .. }
-            if main_checkout_covers(&trusted_folders, &folder, &present) =>
+        // The yes itself is never written down for the worktree. The main
+        // checkout's answer is read on every start, so taking it back takes it
+        // back here too. What the worktree does keep is the files Maki wrote
+        // into it, see [`record_written_file`], and the main checkout only has
+        // to cover the rest.
+        TrustDecision::Unknown
+            if main_checkout_covers(&trusted_folders, &folder, &store_names(&present)) =>
+        {
+            ProjectDecision::new(project_config, TrustState::Trusted, None)
+        }
+        TrustDecision::Widened { ref added }
+            if main_checkout_covers(&trusted_folders, &folder, added) =>
         {
             ProjectDecision::new(project_config, TrustState::Trusted, None)
         }
@@ -548,21 +556,23 @@ pub fn record_written_file(project_config: &ProjectConfig, file: &str) {
     }
 }
 
-/// A linked worktree usually has no answer of its own and reads the main
-/// checkout's, so that is the answer that has to learn about the file too.
-/// A folder with no answer keeps none, so covering both costs nothing.
+/// A worktree that reads its main checkout's yes has no answer of its own to
+/// add the file to, and the main checkout's must not grow by a file that
+/// checkout never shipped. So the worktree gets an answer here that names
+/// only what Maki wrote.
 fn record_written_file_in(storage: &StateDir, project_config: &ProjectConfig, file: &str) {
     let root = project_config.config_root();
     let trusted_folders = TrustedFolders::new(storage);
-    for answered in [Some(root.to_path_buf()), linked_worktree_main(root)]
-        .into_iter()
-        .flatten()
-    {
-        let recorded = CanonicalFolder::resolve(&answered)
-            .and_then(|folder| trusted_folders.cover_written_file(&folder, file));
-        if let Err(error) = recorded {
-            warn!(%error, file, folder = %answered.display(), "cannot record a file Maki wrote into a trusted project");
+    let inherits = project_config.is_trusted() && linked_worktree_main(root).is_some();
+    let recorded = CanonicalFolder::resolve(root).and_then(|folder| {
+        if inherits {
+            trusted_folders.add(&folder, &[file])
+        } else {
+            trusted_folders.cover_written_file(&folder, file)
         }
+    });
+    if let Err(error) = recorded {
+        warn!(%error, file, folder = %root.display(), "cannot record a file Maki wrote into a trusted project");
     }
 }
 
@@ -664,15 +674,12 @@ pub fn project_root(cwd: &Path) -> PathBuf {
 fn main_checkout_covers(
     trusted_folders: &TrustedFolders,
     worktree: &CanonicalFolder,
-    present: &[GatedFile],
+    files: &[impl AsRef<str>],
 ) -> bool {
+    let files: Vec<&str> = files.iter().map(AsRef::as_ref).collect();
     linked_worktree_main(worktree.path())
         .and_then(|main| CanonicalFolder::resolve(&main).ok())
-        .and_then(|main| {
-            trusted_folders
-                .decide(&main, &store_names(present), &project_root)
-                .ok()
-        })
+        .and_then(|main| trusted_folders.decide(&main, &files, &project_root).ok())
         .is_some_and(|decision| decision == TrustDecision::Trusted)
 }
 
@@ -1178,6 +1185,15 @@ mod tests {
             resolve_recorded(&storage, project_at(&worktree))
                 .project_config
                 .is_trusted()
+        );
+
+        fs::write(main.join(MCP_FILE), MCP_SOURCE).unwrap();
+        assert!(
+            matches!(
+                resolve_recorded(&storage, project_at(&main)).state,
+                TrustState::Unanswered(_)
+            ),
+            "a file Maki wrote in the worktree is not a kind the main checkout said yes to"
         );
 
         store.remove(&main).unwrap();

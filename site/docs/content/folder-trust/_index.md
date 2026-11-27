@@ -39,10 +39,13 @@ A linked worktree is a project root of its own, and it inherits the yes its main
 checkout has. Maki checks the link from both sides: the worktree names the main
 checkout, and the main checkout's `.git/worktrees` names the worktree back, which
 only `git worktree add` writes. Maki reads the main checkout's answer on every
-start and records none for the worktree, so `maki trust remove` on the main
+start and records no yes for the worktree, so `maki trust remove` on the main
 checkout covers its worktrees as well. The yes reaches the kinds of gated file
 the main checkout's yes named. A worktree that ships another kind asks, and a
 `Never` recorded for the worktree stays.
+
+A gated file Maki writes in a worktree, such as `.maki/permissions.toml`, is
+recorded for that worktree alone. The main checkout's answer does not grow.
 
 ## What Trust Does Not Cover
 
