@@ -82,6 +82,7 @@ return {
   ["maki.treesitter.get_parser"] = true,
   ["maki.treesitter.get_string_parser"] = true,
   ["maki.treesitter.language.add"] = true,
+  ["maki.treesitter.query.set"] = true,
   ["maki.ui.action"] = true,
   ["maki.ui.input"] = true,
   ["maki.ui.input_decorate"] = true,

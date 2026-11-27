@@ -91,7 +91,10 @@ pub(crate) fn create_maki_global(
         fs::create_fs_table(lua, permissions, Arc::clone(&plugin))?,
     )?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
-    maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
+    maki.set(
+        "treesitter",
+        treesitter::create_treesitter_table(lua, permissions, Arc::clone(&plugin))?,
+    )?;
     maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;

@@ -5813,6 +5813,28 @@ fn unload_clears_commands() {
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
 
+const QUERY_OWNER: &str = "query_owner";
+const QUERY_PROBE: &str = "query_probe";
+const SETS_QUERY: &str = r#"maki.treesitter.query.set("lua", "highlights", "(comment) @comment")"#;
+const QUERY_IS_SET: &str = r#"assert(maki.treesitter.query.get("lua", "highlights"))"#;
+const QUERY_IS_GONE: &str = r#"assert(not maki.treesitter.query.get("lua", "highlights"))"#;
+
+#[test_case::test_case(true ; "reload")]
+#[test_case::test_case(false ; "unload")]
+fn a_set_query_leaves_with_its_plugin(reload: bool) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(QUERY_OWNER, SETS_QUERY).unwrap();
+    host.load_source(QUERY_PROBE, QUERY_IS_SET).unwrap();
+
+    if reload {
+        host.load_source(QUERY_OWNER, "").unwrap();
+    } else {
+        host.unload(QUERY_OWNER).unwrap();
+    }
+
+    host.load_source(QUERY_PROBE, QUERY_IS_GONE).unwrap();
+}
+
 /// `/tasks` and `/sessions` used to be Rust commands. The plugins that took
 /// them over have to keep the names, or the palette quietly loses a row.
 #[test]
