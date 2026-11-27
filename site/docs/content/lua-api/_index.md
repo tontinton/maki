@@ -7651,8 +7651,9 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `input`, `input_edit`, `input_decorate`, `input_submit`, and `action`
-  on a built-in name return `nil, "no interactive UI attached"`.
+- `input`, `input_edit`, `input_decorate`, `input_submit`, `set_theme`,
+  and `action` on a built-in name return
+  `nil, "no interactive UI attached"`.
   Plugin actions still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
@@ -7839,6 +7840,28 @@ out:line("hello world")
 -- A float raised during a tool call needs its own buffer:
 local toast = maki.ui.buf({ scratch = true })
 toast:line("copied!")
+```
+
+---
+
+### `maki.ui.get_theme()` {#maki-ui-get_theme}
+
+```lua
+maki.ui.get_theme()
+```
+
+Returns the name of the current theme, the one `maki.ui.set_theme` or
+`/theme` last switched to.
+
+**Returns:** (`string|nil`) The theme name. Nil until the UI has applied a theme,
+  so while plugins load at startup and without a UI.
+
+**Example:**
+
+```lua
+if maki.ui.get_theme() == "catppuccin_latte" then
+  maki.ui.flash("light theme")
+end
 ```
 
 ---
@@ -8121,6 +8144,36 @@ maki.api.create_autocmd("ModeChanged", {
     maki.ui.set_cursor_shape(ev.data.new_mode == "n" and "block" or "bar")
   end,
 })
+```
+
+---
+
+### `maki.ui.set_theme()` {#maki-ui-set_theme}
+
+```lua
+maki.ui.set_theme({name})
+```
+
+Switches the UI to the theme named {name}, one of the names `/theme`
+lists. Unlike picking it in `/theme`, the switch is not saved, so the next
+start uses `ui.theme` or the theme last picked there.
+
+It waits for the UI to switch, so while your plugin loads it returns `nil`
+and an error.
+
+**Parameters:**
+
+- `{name}` (`string`) Theme name, e.g. `"dracula"`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true`, or nil and an error when the theme does not load or there is no UI.
+
+**Example:**
+
+```lua
+maki.keymap.set("n", "<M-t>", function()
+  local light = maki.ui.get_theme() == "catppuccin_latte"
+  maki.ui.set_theme(light and "catppuccin_mocha" or "catppuccin_latte")
+end)
 ```
 
 ---

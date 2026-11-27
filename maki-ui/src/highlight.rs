@@ -15,16 +15,18 @@ pub(crate) fn is_ready() -> bool {
     maki_highlight::is_ready()
 }
 
-/// Also publishes every named style to Lua, behind `maki.ui.theme_style`.
+/// Also publishes the theme name and every named style to Lua, behind
+/// `maki.ui.get_theme` and `maki.ui.theme_style`.
 pub(crate) fn refresh_syntax_theme() {
     let theme = theme::current();
     maki_highlight::set_theme(theme.syntax.clone());
-    maki_highlight::set_ui_styles(
-        theme::STYLE_NAMES
+    maki_highlight::set_ui_theme(maki_highlight::UiTheme {
+        name: theme.name().to_owned(),
+        styles: theme::STYLE_NAMES
             .iter()
             .map(|name| ((*name).to_owned(), ui_style(theme::style_by_name(name))))
             .collect(),
-    );
+    });
 }
 
 fn ui_style(style: Style) -> maki_highlight::UiStyle {

@@ -79,18 +79,14 @@ impl ThemePicker {
     }
 
     fn apply_preview(&self) {
-        if let Some(name) = self.picker.selected_item()
-            && let Ok(t) = theme::load_by_name(name)
-        {
-            theme::set(t);
+        if let Some(name) = self.picker.selected_item() {
+            let _ = theme::switch_to(name);
         }
     }
 
     fn restore_original(&self) {
-        if let Some(ref name) = self.original_theme_name
-            && let Ok(t) = theme::load_by_name(name)
-        {
-            theme::set(t);
+        if let Some(ref name) = self.original_theme_name {
+            let _ = theme::switch_to(name);
         }
     }
 }

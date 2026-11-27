@@ -4,7 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -36,6 +36,14 @@ pub enum SegmentColor {
     Rgb(Rgb),
     Ansi(u8),
     Default,
+}
+
+/// What Lua sees of the UI theme. One swap carries both, so a name is never
+/// read next to another theme's styles.
+#[derive(Debug, Default)]
+pub struct UiTheme {
+    pub name: String,
+    pub styles: HashMap<String, UiStyle>,
 }
 
 /// Shaped like a plugin span style, so a lookup goes straight back to Lua.
@@ -125,7 +133,7 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(ArcSwap::default);
-static UI_STYLES: LazyLock<ArcSwap<HashMap<String, UiStyle>>> = LazyLock::new(ArcSwap::default);
+static UI_THEME: ArcSwapOption<UiTheme> = ArcSwapOption::const_empty();
 static BLOCK_CACHE: LazyLock<RwLock<BlockCache>> = LazyLock::new(RwLock::default);
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -243,12 +251,17 @@ pub fn theme() -> Arc<Theme> {
     THEME.load_full()
 }
 
-pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
-    UI_STYLES.store(Arc::new(styles));
+pub fn set_ui_theme(theme: UiTheme) {
+    UI_THEME.store(Some(Arc::new(theme)));
 }
 
 pub fn ui_style(name: &str) -> Option<UiStyle> {
-    UI_STYLES.load().get(name).cloned()
+    UI_THEME.load().as_ref()?.styles.get(name).cloned()
+}
+
+/// `None` until a UI publishes its theme.
+pub fn ui_theme_name() -> Option<String> {
+    Some(UI_THEME.load().as_ref()?.name.clone())
 }
 
 /// Colors the syntax theme names itself. UI styles live in [`ui_style`].

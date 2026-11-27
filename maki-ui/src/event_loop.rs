@@ -954,9 +954,8 @@ impl<'t> EventLoop<'t> {
                 startup_warnings.push(RESTART_FOR_BACKGROUND.to_owned());
             }
             let name = pair.name(background == Some(Background::Light));
-            match crate::theme::load_by_name(name) {
-                Ok(theme) => crate::theme::set(theme),
-                Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
+            if let Err(e) = crate::theme::switch_to(name) {
+                startup_warnings.push(format!("config ui.theme: {e}"));
             }
         }
 
@@ -1425,6 +1424,9 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().scroll_to_row(scroll_top);
+            }
+            UiAction::SetTheme { name, reply_tx } => {
+                let _ = reply_tx.send(crate::theme::switch_to(&name));
             }
             // Answered before dispatching, which can hold the loop for as long
             // as `$EDITOR` is open.
