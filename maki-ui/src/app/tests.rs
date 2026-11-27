@@ -5357,6 +5357,7 @@ fn typed_lua_command_with_args_executes() {
             plugin: "sessions".into(),
             reach: trusted(),
             max_args: usize::MAX,
+            interactive: false,
         }]),
     );
     let probe = probe_events(&mut app);
@@ -5484,6 +5485,7 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: &[Permissio
             plugin: RUNNING_PLUGIN.into(),
             reach: only(Permission::Run),
             max_args: 0,
+            interactive: false,
         }]),
     );
 
@@ -5548,6 +5550,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             plugin: "sessions".into(),
             reach: trusted(),
             max_args: 0,
+            interactive: false,
         }]),
     );
     let probe = probe_events(&mut app);

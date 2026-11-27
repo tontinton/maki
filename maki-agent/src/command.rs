@@ -430,6 +430,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_keeps_argument_hint() {
+        let path = PathBuf::from("/fake/review.md");
+        let cmd = parse_command(
+            "---\nargument-hint: <file>\n---\nReview $ARGUMENTS",
+            &path,
+            CommandScope::Project,
+        )
+        .unwrap();
+        assert_eq!(cmd.argument_hint.as_deref(), Some("<file>"));
+    }
+
+    #[test]
     fn parse_command_empty_body_returns_none() {
         let path = PathBuf::from("/fake/empty.md");
         assert!(parse_command("---\nname: empty\n---\n   \n", &path, CommandScope::User).is_none());
