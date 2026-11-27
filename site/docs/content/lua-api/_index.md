@@ -1026,10 +1026,8 @@ A subagent's run fires only `"TurnComplete"`, never tool or other turn
 events. `"TurnEnd"` fires once per turn of the main session. A manual
 `/compact` fires no `"TurnEnd"`.
 
-Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
-`maki-ui` only. `maki-acp` runs the agent on its own loop and does not
-call the dispatcher yet, so plugins loaded under ACP receive no turn
-events. Everything else fires under `maki -p` and sdk mode as well.
+`"TurnStart"` and `"PlanReady"` come from `maki-ui` only. Everything the
+agent itself reports fires under `maki -p`, sdk mode and ACP as well.
 
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
@@ -5430,9 +5428,10 @@ at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
 `current`, `read`, `export`, `messages`, `windows`, `subagents`,
-`notify` and `new` without `prompt` or `focus` still work. ACP has no
-focused session, so there `current` fails and the read functions need
-`session`. Hook and event payloads carry it as `session_id`.
+`notify` and `new` without `prompt` or `focus` still work. The readers
+default to the session the running tool call or event handler serves,
+else the focused one. ACP has no focused session, so anywhere else they
+need `session` there. Hook and event payloads carry it as `session_id`.
 
 ---
 
@@ -5486,8 +5485,10 @@ local live, err = maki.session.live()
 maki.session.current()
 ```
 
-Returns the id of the focused session. Under `maki -p` and the sdk,
-that is the one session they run.
+Returns the id of the session the running tool call or event handler
+serves, so one in a background tab gets its own tab. Else the focused
+session, and under `maki -p` and the sdk the one session they run. ACP has
+no focused session, so anywhere else it fails there.
 
 **Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
 
@@ -5506,8 +5507,9 @@ maki.session.read({opts?})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
-status. Reads the focused session, or the one you name in `session`: a
-background tab, or a stored session nothing has open.
+status. Reads the session the running tool call or event handler serves,
+else the focused one, or the one you name in `session`: a background tab,
+or a stored session nothing has open.
 
 Metadata only, so it needs no permission. Not to be confused with the
 `session_read` permission, which guards transcript content
@@ -5517,7 +5519,7 @@ The returned table:
 ```text
 {
   id, cwd, model, mode = "build" | "plan",
-  thinking, fast,    -- nil under headless drivers
+  thinking, fast,
   status = "idle" | "working" | "needs_input" | "stored",
   focused, updated_at,
   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
@@ -5525,7 +5527,7 @@ The returned table:
   context_window,    -- nil for a stored session
   cost,              -- nil for a stored session
   queue = { count }, -- nil under headless drivers and for a stored session
-  title,             -- nil under headless drivers
+  title,
 }
 ```
 
@@ -5539,7 +5541,7 @@ session's own, since a subagent runs its own window. There is no
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the session the running tool call or event handler serves, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
@@ -5581,7 +5583,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the session the running tool call or event handler serves, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) The document, or nil and an error.
 
@@ -5645,7 +5647,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session the running tool call or event handler serves, else the focused one.
   - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
     Defaults to the current window.
   - `last` (`integer?`) only the newest `last` messages.
@@ -5689,7 +5691,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session the running tool call or event handler serves, else the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Array of windows, or nil and an error.
 
@@ -5732,7 +5734,7 @@ Requires the `session_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the session the running tool call or event handler serves, else the focused one.
   - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
     Defaults to the current window.
 

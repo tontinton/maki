@@ -5,6 +5,7 @@ pub mod chunks;
 pub mod docs;
 pub mod docs_render;
 mod error;
+pub mod headless;
 mod hook;
 mod jobs;
 pub mod key;
@@ -234,6 +235,7 @@ pub mod test_support {
             event: event.to_owned(),
             data,
             message: None,
+            session: None,
         });
     }
 

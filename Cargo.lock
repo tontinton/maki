@@ -3667,11 +3667,13 @@ name = "maki-acp"
 version = "0.7.3"
 dependencies = [
  "agent-client-protocol-schema",
+ "arc-swap",
  "color-eyre",
  "futures",
  "jiff 0.2.46",
  "maki-agent",
  "maki-config",
+ "maki-lua",
  "maki-otel",
  "maki-providers",
  "maki-storage",

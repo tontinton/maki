@@ -1277,12 +1277,14 @@ impl EventHandle {
 
     /// The one way host code fires an event, so every field it sends is one
     /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
-    /// classifies. {session_id} is the session the event is about.
+    /// classifies. {session_id} is the session the event is about, and its
+    /// handlers run on its behalf.
     pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
         let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
             message: event.lua_message().cloned(),
+            session: session_id.and_then(|id| id.to_string().parse().ok()),
         });
     }
 

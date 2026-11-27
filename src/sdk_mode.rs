@@ -26,7 +26,8 @@ use maki_agent::{
     PermissionsConfig, RunTotals, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
+use maki_lua::headless::{HeadlessHost, SessionObserver, SessionOpening};
+use maki_lua::session_snapshot::{MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
 use maki_storage::id::SessionRef;
@@ -582,6 +583,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     }
 
     let startup_model = model.clone();
+    let opening = SessionOpening::new(&resumed, &model);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -647,15 +649,9 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         permissions: Permissions::new(handle.answer_tx.clone()),
     }));
 
-    let snapshot = HeadlessSnapshot::default();
     let shared_for_mode = Arc::clone(&shared);
-    snapshot.install(
-        &lua_handle,
-        HeadlessMeta {
-            id: handle.session_id.to_string(),
-            cwd: working_dir.clone(),
-            model: startup_model.spec(),
-        },
+    let hosted = HeadlessHost::sole(lua_handle.clone()).open(
+        opening,
         // `set_permission_mode` can flip this mid-run, so read it per call.
         move || match shared_for_mode.lock().unwrap().permission_mode {
             PermissionMode::Plan => MODE_PLAN,
@@ -674,9 +670,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         reported: RunTotals::default(),
         run_id: None,
         request_counter: 0,
-        lua_handle: lua_handle.clone(),
-        session_id: handle.session_id.to_string(),
-        snapshot,
+        host: hosted.observer(),
     }
     .spawn(events);
 
@@ -981,9 +975,7 @@ struct EventPump {
     /// The run the last event belonged to. A new one starts a turn.
     run_id: Option<u64>,
     request_counter: u64,
-    lua_handle: maki_lua::EventHandle,
-    session_id: String,
-    snapshot: HeadlessSnapshot,
+    host: SessionObserver,
 }
 
 impl EventPump {
@@ -991,10 +983,7 @@ impl EventPump {
     fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
         tokio::spawn(async move {
             while let Some(envelope) = events.next().await {
-                // Folded in first, so a plugin handling `TurnEnd` finds the
-                // finished totals when it calls `maki.session.read()`.
-                self.snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(&self.lua_handle, &self.session_id, &envelope);
+                self.host.observe(&envelope);
                 if let Err(e) = self.handle(envelope) {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
@@ -1766,9 +1755,7 @@ mod tests {
             reported: RunTotals::default(),
             run_id: None,
             request_counter: 0,
-            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
-            session_id: session_id.to_string(),
-            snapshot: HeadlessSnapshot::default(),
+            host: SessionObserver::disconnected_for_test(session_id),
         };
         (pump, out_rx)
     }
