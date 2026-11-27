@@ -29,6 +29,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
@@ -516,12 +517,19 @@ pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String
     walk_builder_opts(root, patterns, true)
 }
 
-/// `.git` is always excluded, even when `gitignore` is false.
+/// `.git` is always excluded, even when `gitignore` is false. A root that
+/// cannot be read is an error here, because the walk itself would drop it and
+/// come back empty.
 pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
 ) -> Result<WalkBuilder, String> {
+    if let Err(error) = fs::read_dir(root)
+        && error.kind() == ErrorKind::PermissionDenied
+    {
+        return Err(format!("cannot read {root}: {error}"));
+    }
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
     ob.add("!.git").expect("!.git is a valid glob");
 
@@ -1282,6 +1290,24 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_builder_reports_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a directory whatever its mode.
+        if fs::read_dir(tmp.path()).is_ok() {
+            return;
+        }
+        let root = tmp.path().to_string_lossy();
+        let err = walk_builder(&root, &[]).unwrap_err();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(err.contains(root.as_ref()), "got: {err}");
     }
 
     #[test]

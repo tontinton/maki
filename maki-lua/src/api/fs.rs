@@ -1103,11 +1103,6 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 
     let result: Result<Vec<String>, String> = spawn_blocking(move || {
         let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
-        if let Err(e) = std::fs::read_dir(&root)
-            && e.kind() == ErrorKind::PermissionDenied
-        {
-            return Err(format!("cannot read {root}: {e}"));
-        }
         let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
 
         let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
