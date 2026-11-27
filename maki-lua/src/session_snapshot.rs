@@ -156,9 +156,14 @@ impl HeadlessSnapshot {
         let event = &envelope.event;
         let mut totals = lock(&self.0);
         // Envelopes only flow while a run is alive, so anything that is not
-        // an ending means the agent is busy. Sdk mode runs many turns and no
-        // driver has to remember to clear a flag between them.
-        totals.working = !matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. });
+        // an ending means the agent is busy. Only the main run's envelopes
+        // own the flag: a backgrounded subagent can end after the main
+        // run's Done, and the session must stay idle until the next prompt.
+        // Sdk mode runs many turns and no driver has to remember to clear a
+        // flag between them.
+        if envelope.subagent.is_none() {
+            totals.working = !matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. });
+        }
         // Each run ending carries that run's whole bill, subagents and
         // compaction included, so summing them lands on the exact session
         // total. A failed run paid for its rounds too. Summing `TurnComplete`
@@ -173,8 +178,13 @@ impl HeadlessSnapshot {
             } => {
                 totals.usage += *usage;
                 add_cost(&mut totals.cost, *cost);
-                totals.context_size = *context_size;
-                totals.context_window = *context_window;
+                // The bill sums across runs, but the gauge belongs to the
+                // run that ended: a subagent's final numbers must not land
+                // as the session's own context.
+                if envelope.subagent.is_none() {
+                    totals.context_size = *context_size;
+                    totals.context_window = *context_window;
+                }
             }
             AgentEvent::Error { totals: run, .. } => {
                 totals.usage += run.usage;
@@ -238,7 +248,7 @@ impl HeadlessSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::{DoneReason, RunTotals, TurnCompleteEvent};
+    use maki_agent::{DoneReason, RunTotals, SubagentInfo, TurnCompleteEvent};
     use maki_providers::Message;
 
     use super::*;
@@ -272,8 +282,27 @@ mod tests {
         })))
     }
 
-    fn done(input: u32) -> Envelope {
-        envelope(AgentEvent::Done {
+    const SUB_TASK: &str = "toolu_sub";
+
+    fn subagent(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: SUB_TASK.to_owned(),
+                name: "sub".to_owned(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                control: Arc::default(),
+                parent_call: None,
+            }),
+            run_id: 0,
+        }
+    }
+
+    fn done_event(input: u32, window: u32) -> AgentEvent {
+        AgentEvent::Done {
             usage: TokenUsage {
                 input: u64::from(input),
                 ..Default::default()
@@ -281,10 +310,14 @@ mod tests {
             cost: Some(TURN_COST),
             list_cost: None,
             context_size: input,
-            context_window: WINDOW,
+            context_window: window,
             num_turns: 1,
             reason: DoneReason::EndTurn,
-        })
+        }
+    }
+
+    fn done(input: u32) -> Envelope {
+        envelope(done_event(input, WINDOW))
     }
 
     /// Sdk mode serves many turns on one session, so `Done` is a turn boundary
@@ -340,5 +373,53 @@ mod tests {
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0));
         assert_eq!(totals.context_size, FIRST_TURN_INPUT);
+    }
+
+    /// The parent run owns the session's gauge and status. A subagent's
+    /// ending overwrites neither, least of all late: a backgrounded
+    /// subagent can finish only after the main run's `Done`.
+    #[test]
+    fn subagent_endings_leave_the_gauge_and_status_alone() {
+        const SUB_SIZE: u32 = 9_100;
+        const SUB_WINDOW: u32 = 128_000;
+
+        let snapshot = HeadlessSnapshot::default();
+        snapshot.observe(&turn_complete(FIRST_TURN_INPUT));
+        snapshot.observe(&subagent(done_event(SUB_SIZE, SUB_WINDOW)));
+
+        {
+            let totals = lock(&snapshot.0);
+            assert!(totals.working, "the parent run still runs");
+            assert_eq!(
+                totals.usage.input,
+                u64::from(SUB_SIZE),
+                "the subagent's bill still joins the totals"
+            );
+            assert_eq!(totals.context_size, FIRST_TURN_INPUT);
+            assert_eq!(totals.context_window, WINDOW);
+        }
+
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+        assert!(!lock(&snapshot.0).working);
+
+        // The idle session now only takes envelopes from the backgrounded
+        // subagent. None of them may wake it or retarget its gauge.
+        snapshot.observe(&subagent(done_event(SUB_SIZE, SUB_WINDOW)));
+        snapshot.observe(&subagent(AgentEvent::TurnComplete(Box::new(
+            TurnCompleteEvent {
+                message: Message::user("sub go".into()),
+                usage: TokenUsage::default(),
+                model: String::new(),
+                cost: None,
+                subsidised_list_cost: None,
+                context_size: Some(SUB_SIZE),
+                context_window: SUB_WINDOW,
+            },
+        ))));
+
+        let totals = lock(&snapshot.0);
+        assert!(!totals.working, "nothing prompts, the session stays idle");
+        assert_eq!(totals.context_size, FIRST_TURN_INPUT);
+        assert_eq!(totals.context_window, WINDOW);
     }
 }
