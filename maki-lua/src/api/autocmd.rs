@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::Message;
+use maki_storage::id::SessionRef;
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_autocmd::{MESSAGE_KEY, host_event_fields};
@@ -12,7 +13,7 @@ use crate::api::session::message_table;
 use crate::api::util::convert::TableExt;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
 use crate::plugin_permissions::{Permission, grant_hint};
-use crate::runtime::{quoted_list, run_detached, strip_traceback, warn_plugin_once};
+use crate::runtime::{Lineage, quoted_list, run_on_behalf_of, strip_traceback, warn_plugin_once};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -94,6 +95,7 @@ pub(crate) async fn dispatch(
     pattern: Option<String>,
     data: Value,
     message: Option<Message>,
+    session: Option<SessionRef>,
 ) {
     let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
@@ -163,7 +165,8 @@ pub(crate) async fn dispatch(
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
+        if let Err(e) = run_on_behalf_of(&lua, session.clone(), callback.call_async::<()>(ev)).await
+        {
             tracing::warn!(
                 event,
                 plugin = &*plugin,
@@ -504,8 +507,18 @@ async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult
         }
         None => (None, Value::Nil),
     };
+    // Handlers run for whichever session the caller runs for.
+    let session = Lineage::current(&lua).session;
     for event in events {
-        dispatch(lua.clone(), event, pattern.clone(), data.clone(), None).await;
+        dispatch(
+            lua.clone(),
+            event,
+            pattern.clone(),
+            data.clone(),
+            None,
+            session.clone(),
+        )
+        .await;
     }
     Ok(())
 }

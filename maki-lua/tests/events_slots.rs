@@ -6,14 +6,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use maki_agent::AgentMode;
-use maki_agent::agent::{AgentCall, AgentSlot};
+use arc_swap::ArcSwap;
+use maki_agent::agent::{
+    AgentCall, AgentSlot, HistorySnapshot, SharedHeader, SharedMessages, publish_live_session,
+};
 use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{LayerAnswer, LayerVerdict};
+use maki_agent::session::{SessionHeader, StoredSession};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
+use maki_agent::{AgentEvent, AgentMode, DoneReason, Envelope};
 use maki_lua::agent_autocmd::{HostEvent, host_event_fields};
+use maki_lua::headless::{HeadlessHost, SessionOpening};
+use maki_lua::session_snapshot::{MODE_BUILD, STATUS_IDLE};
 use maki_lua::test_support::{
     content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
 };
@@ -21,8 +27,8 @@ use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
-use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
-use maki_storage::id::MakiId;
+use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, Role, TokenUsage};
+use maki_storage::id::{MakiId, SessionRef};
 use test_case::test_case;
 use tokio::join;
 use tokio::time::timeout;
@@ -573,6 +579,99 @@ end }})
         serde_json::json!({ "k": "v" }),
     );
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
+}
+
+/// A `TurnEnd` handler runs for its session, so an id-less read answers for
+/// it. The agent republishes the header only once `Done` is out, so the
+/// handler must still read the finished turn, not a working one.
+#[test]
+fn turn_end_handler_reads_its_finished_turn() {
+    const TURN_INPUT: u32 = 1_000;
+    const WINDOW: u32 = 200_000;
+    let (reg, host) = host();
+    let plugins = HeadlessHost::many(host.event_handle());
+    let id = SessionRef::from(MakiId::generate());
+    let header: SharedHeader = Arc::new(ArcSwap::from_pointee(SessionHeader {
+        working: true,
+        ..SessionHeader::of(&StoredSession::new("", ""))
+    }));
+    let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    publish_live_session(id.id(), &mirror, &header);
+    let opening = SessionOpening {
+        id: id.clone(),
+        model: String::new(),
+        cwd: String::new(),
+        context_window: WINDOW,
+        usage: TokenUsage::default(),
+        context_size: 0,
+        cost: None,
+    };
+    let session = plugins.open(opening, || MODE_BUILD);
+    let listener = format!(
+        r#"
+local log = {{}}
+maki.api.create_autocmd("TurnEnd", {{ callback = function()
+    local s, err = maki.session.read()
+    log[#log + 1] = s and string.format("%s|%s|%d", s.id, s.status, s.usage.input_tokens) or err
+end }})
+{}
+"#,
+        probe_tool("probe_turn_end_read", "return table.concat(log, \";\")")
+    );
+    load(&host, "listener", &listener);
+
+    session.observe(&Envelope {
+        event: AgentEvent::Done {
+            usage: TokenUsage {
+                input: u64::from(TURN_INPUT),
+                ..Default::default()
+            },
+            cost: None,
+            list_cost: None,
+            context_size: TURN_INPUT,
+            context_window: WINDOW,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        },
+        subagent: None,
+        run_id: 0,
+    });
+
+    assert_eq!(
+        exec_tool(&reg, "probe_turn_end_read"),
+        format!("{id}|{STATUS_IDLE}|{TURN_INPUT}")
+    );
+}
+
+/// A resumed legacy session is spelled in hex everywhere else, so a
+/// `SessionEnd` handler must see `current()` and `session_id` spelled alike.
+#[test]
+fn session_end_names_a_legacy_session_the_way_it_came_in() {
+    let (reg, host) = host();
+    let listener = format!(
+        r#"
+local seen
+maki.api.create_autocmd("SessionEnd", {{ callback = function(ev)
+    seen = ev.data.session_id .. "|" .. maki.session.current()
+end }})
+{}
+"#,
+        probe_tool("probe_end_spelling", "return seen")
+    );
+    load(&host, "listener", &listener);
+    let id = MakiId::generate();
+    let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let session: SessionRef = hex.parse().unwrap();
+
+    runtime().block_on(
+        host.event_handle()
+            .end_sessions([session], SessionEndReason::Completed),
+    );
+
+    assert_eq!(
+        exec_tool(&reg, "probe_end_spelling"),
+        format!("{hex}|{hex}")
+    );
 }
 
 /// A handler has to tell the teardown paths apart, so every reason arrives

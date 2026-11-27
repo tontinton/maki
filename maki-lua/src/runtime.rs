@@ -598,6 +598,8 @@ pub enum Request {
         data: Value,
         /// A `TurnComplete` reply, which only the Lua thread can shape.
         message: Option<Message>,
+        /// The session the handlers run on behalf of.
+        session: Option<SessionRef>,
     },
     EndSession(EndSession),
     ClickTool {
@@ -642,14 +644,16 @@ enum HostHook {
     Autocmd {
         event: String,
         data: Value,
-        message: Option<Message>,
+        message: Option<Box<Message>>,
+        session: Option<SessionRef>,
     },
     EndSession(EndSession),
 }
 
 /// Reap session-owned jobs and fire `SessionEnd`.
 pub struct EndSession {
-    pub session: MakiId,
+    /// As the host named it, so a legacy hex id reads back the way it came in.
+    pub session: SessionRef,
     pub reason: SessionEndReason,
     /// Set on the paths that wait for the dispatch: the instant the caller
     /// stops waiting, and where to answer it. Absent on the queued paths.
@@ -850,9 +854,11 @@ pub(crate) struct Lineage {
     /// Slash-command hops that led to this task, so `maki.api.run_command`
     /// can refuse a chain that never ends. A keybind or tool starts at 0.
     pub(crate) command_depth: u8,
-    /// The session whose tool call this task serves. Its windows go to that
-    /// session's tab, which is not always the one on screen.
-    pub(crate) session: Option<MakiId>,
+    /// The session whose tool call or host event this task serves. Its
+    /// windows go to that session's tab, which is not always the one on
+    /// screen.
+    /// As the host named it, so a legacy hex id reads back the way it came in.
+    pub(crate) session: Option<SessionRef>,
 }
 
 impl Lineage {
@@ -2460,7 +2466,19 @@ impl<F: Future> Future for Narrowed<F> {
 ///
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
-    run_scoped(lua, TaskScope::detached(lua), fut).await
+    run_on_behalf_of(lua, None, fut).await
+}
+
+/// [`run_detached`] for a callback the host fires for {session}, so an id-less
+/// `maki.session` call in it, or a task it queues, answers for that session.
+pub(crate) async fn run_on_behalf_of<F: Future>(
+    lua: &Lua,
+    session: Option<SessionRef>,
+    fut: F,
+) -> F::Output {
+    let scope = TaskScope::detached(lua);
+    lock_cell(scope.handle()).lineage.session = session;
+    run_scoped(lua, scope, fut).await
 }
 
 /// The priority lane, reachable from off the Lua thread.
@@ -2603,10 +2621,19 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             event,
             data,
             message,
+            session,
         } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
             let is_turn_end = event == TURN_END_EVENT;
-            crate::api::autocmd::dispatch(lua.clone(), event, None, data, message).await;
+            crate::api::autocmd::dispatch(
+                lua.clone(),
+                event,
+                None,
+                data,
+                message.map(|message| *message),
+                session,
+            )
+            .await;
             if is_turn_end {
                 collect_turn_garbage(lua);
             }
@@ -2627,13 +2654,21 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             };
             let data =
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
-            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data, None)
-                .await;
-            with_jobs(lua, |store| store.kill_session(lua, end.session));
-            BackgroundTasks::of(lua).end_session(end.session);
+            crate::api::autocmd::dispatch(
+                lua.clone(),
+                event.name().to_owned(),
+                None,
+                data,
+                None,
+                Some(end.session.clone()),
+            )
+            .await;
+            let session = end.session.id();
+            with_jobs(lua, |store| store.kill_session(lua, session));
+            BackgroundTasks::of(lua).end_session(session);
             // Nothing can pick from this session's plan form again.
-            clear_session_rows(lua, &end.session.to_string());
-            clear_session_hints(lua, end.session);
+            clear_session_rows(lua, &session.to_string());
+            clear_session_hints(lua, session);
             if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }
@@ -6284,11 +6319,13 @@ pub fn spawn(
                             event,
                             data,
                             message,
+                            session,
                         } => {
                             let _ = hook_tx.send(HostHook::Autocmd {
                                 event,
                                 data,
-                                message,
+                                message: message.map(Box::new),
+                                session,
                             });
                         }
                         Request::EndSession(end) => {
@@ -7242,7 +7279,7 @@ mod tests {
         let lua = enqueue_test_lua();
         let lineage = Lineage {
             command_depth: 3,
-            session: Some(MakiId::generate()),
+            session: Some(SessionRef::generate()),
         };
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.lineage = lineage.clone();
@@ -7443,7 +7480,7 @@ mod tests {
         let mut cell = TaskCell::new(token, Some(Instant::now()), None);
         cell.lineage = Lineage {
             command_depth: SPAWN_COMMAND_DEPTH,
-            session: Some(MakiId::generate()),
+            session: Some(SessionRef::generate()),
         };
         cell.inline_spawn = Some(Vec::new());
         let scope = TaskScope::new(&lua, cell);

@@ -25,7 +25,8 @@ use maki_agent::{
     InputSource, PermissionsConfig, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
+use maki_lua::headless::{HeadlessHost, SessionOpening};
+use maki_lua::session_snapshot::MODE_BUILD;
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
@@ -310,6 +311,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
+    // `maki -p` sends its one prompt in build mode and never switches.
+    let hosted = HeadlessHost::sole(lua_handle.clone())
+        .open(SessionOpening::new(&resumed, &model, &cwd), || MODE_BUILD);
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         model: model.clone(),
         config,
@@ -381,23 +385,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // The stream shows Maki's own tool names, so a task message does too.
     let mut tasks = SubagentTasks::new(|name| name);
 
-    let snapshot = HeadlessSnapshot::default();
-    snapshot.install(
-        &lua_handle,
-        HeadlessMeta {
-            id: session_id.to_string(),
-            cwd: cwd.clone(),
-            model: model.spec(),
-        },
-        // `maki -p` sends its one prompt in build mode and never switches.
-        || MODE_BUILD,
-    );
-
     while let Some(envelope) = events.next().await {
-        // Folded in first, so a plugin handling `TurnEnd` finds the finished
-        // totals when it calls `maki.session.read()`.
-        snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(&lua_handle, &session_id, &envelope);
+        hosted.observe(&envelope);
         let Envelope {
             ref event,
             ref subagent,
@@ -506,7 +495,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     }
     let track = headless::await_shutdown(task).await;
     lua_handle
-        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .end_sessions([session_id.clone()], SessionEndReason::Completed)
         .await;
     if let Some(out) = &mut verbose_out {
         out.emit_tasks(tasks.finish(), &session_id)?;
