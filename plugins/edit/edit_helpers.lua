@@ -53,6 +53,8 @@ end
 
 -- `read` cuts a long line and ends it with the marker, so that is all the model
 -- can quote of it. A re-read shows the same cut line, hence the prefix match.
+-- A bare marker is a real line, like the body of a Python stub. Its prefix is
+-- empty and would match any line, so it only matches itself.
 local function line_matches(line, wanted)
   local text = trim(line)
   if text == wanted then
@@ -62,7 +64,7 @@ local function line_matches(line, wanted)
     return false
   end
   local shown = wanted:sub(1, -#LINE_CUT_MARKER - 1)
-  return text:sub(1, #shown) == shown
+  return shown ~= "" and text:sub(1, #shown) == shown
 end
 
 local function nearest_line(lines, wanted, from)

@@ -461,6 +461,15 @@ case("replace_lines_accepts_a_line_as_read_cut_it", function()
   has(other_line, "at line 2")
 end)
 
+case("replace_lines_bare_cut_marker_matches_only_itself", function()
+  local content = "def f():\n    ...\nccc\n"
+  eq(replace_lines(content, 2, 2, "XXX", "..."), "def f():\nXXX\nccc\n")
+
+  local r, stale = replace_lines(content, 3, 3, "XXX", "...")
+  eq(r, nil)
+  has(stale, STALE_MSG)
+end)
+
 case("replace_lines_refuses_stale_line_numbers", function()
   local content = "aaa\nbbb\nccc\nbbb\nddd\n"
 
