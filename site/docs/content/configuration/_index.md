@@ -359,6 +359,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_line_bytes` | integer | `500` | 80 | Truncate lines the model sees at this many bytes. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_single_line_bytes` | integer | `8192` | 80 | Truncate a line read alone (`limit=1`) at this many bytes, so the model can get a line `max_line_bytes` cut. |
 
 ### `plugins.skill`
 

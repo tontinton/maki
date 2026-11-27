@@ -7483,6 +7483,7 @@ mod read_tool_params {
         const HEAD: &str = "first\nsecond\n";
         const OVER_LUA_HEAP: u64 = 600 * 1024 * 1024;
         const DEFAULT_MAX_LINE_BYTES: usize = 500;
+        const DEFAULT_MAX_SINGLE_LINE_BYTES: usize = 8192;
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.log");
@@ -7500,7 +7501,29 @@ mod read_tool_params {
             serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 2 }),
         );
         let huge_line_cut = "\0".repeat(DEFAULT_MAX_LINE_BYTES);
-        assert_eq!(out, Ok(format!("2: second\n3: {huge_line_cut}...")));
+        let huge_line_bytes = OVER_LUA_HEAP - HEAD.len() as u64;
+        assert_eq!(
+            out,
+            Ok(format!(
+                "2: second\n3: {huge_line_cut}...\n\nLines cut at {DEFAULT_MAX_LINE_BYTES} bytes, the `...` at their end is not in the file: 3 ({huge_line_bytes} bytes). Read one alone (limit=1) for up to {DEFAULT_MAX_SINGLE_LINE_BYTES} bytes of it."
+            ))
+        );
+    }
+
+    #[test_case::test_case(2000, 2000, "" ; "comes_whole")]
+    #[test_case::test_case(9000, 8192, "...\n\nLines cut at 8192 bytes, the `...` at their end is not in the file: 2 (9000 bytes)." ; "is_cut_at_its_own_limit")]
+    fn a_line_read_alone(line_bytes: usize, kept_bytes: usize, tail: &str) {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        std::fs::write(&path, format!("short\n{}\n", "x".repeat(line_bytes))).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({ "path": path.to_str().unwrap(), "offset": 2, "limit": 1 }),
+        );
+        assert_eq!(out, Ok(format!("2: {}{tail}", "x".repeat(kept_bytes))));
     }
 
     #[test]
