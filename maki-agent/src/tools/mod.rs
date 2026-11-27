@@ -378,6 +378,10 @@ pub struct ToolContext {
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
+    /// Tokens the calling agent's context holds at the moment the dispatch
+    /// built this context, taken from that run's own gauge. `0` where no run
+    /// backs the context: the interpreter, CLI one-shots, a background seed.
+    pub context_size: u32,
     pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
@@ -664,6 +668,7 @@ pub fn interpreter_ctx(
         background_for: BackgroundFor::None,
         task_id: None,
         tool_use_id: None,
+        context_size: 0,
         user_response_rx,
         reauth: false,
         loaded_instructions: LoadedInstructions::new(),

@@ -790,6 +790,11 @@ fn register_prompt(
 /// "full" when code such as `code_execution` made the call. Apply output limits
 /// only in compact mode.
 ///
+/// `ctx:context_usage()` returns `{ size, window }`: the tokens the calling agent's
+/// context holds and that agent's own window, snapshotted when its run built
+/// the call's context. A subagent sees its own numbers, never the parent
+/// session's. `(nil, err)` outside a handler ctx, as in `start` and restore.
+///
 /// @param spec table Tool specification:
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
 ///   description     (string)   Required. Non-empty description shown to the model.
