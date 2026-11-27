@@ -12,7 +12,6 @@ use toml_edit::DocumentMut;
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 pub(super) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-pub(super) const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 30_000;
 const SECRET_NEEDS_CLIENT_ID: &str = "oauth.client_secret needs client_id";
 const HTTPS_CALLBACK_NEEDS_PORT: &str = "oauth.callback_scheme \"https\" needs callback_port to match the redirect URI registered with the provider";
 
@@ -99,10 +98,6 @@ fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
-fn default_startup_timeout() -> u64 {
-    DEFAULT_STARTUP_TIMEOUT_MS
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum McpServerStatus {
     Connecting,
@@ -150,8 +145,9 @@ pub struct RawServerConfig {
     pub enabled: bool,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    #[serde(default = "default_startup_timeout")]
-    pub startup_timeout: u64,
+    /// Falls back to `timeout`, which bounded startup before this field existed.
+    #[serde(default)]
+    pub startup_timeout: Option<u64>,
     #[serde(default)]
     pub always_load: bool,
     #[serde(flatten)]
@@ -164,7 +160,7 @@ impl RawServerConfig {
         Self {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
+            startup_timeout: None,
             always_load: false,
             transport,
         }
@@ -346,7 +342,8 @@ pub fn parse_server(
             "server '{name}' timeout must be > 0"
         )));
     }
-    if server.startup_timeout == 0 {
+    let startup_timeout = server.startup_timeout.unwrap_or(server.timeout);
+    if startup_timeout == 0 {
         return Err(McpError::Config(format!(
             "server '{name}' startup_timeout must be > 0"
         )));
@@ -404,7 +401,7 @@ pub fn parse_server(
     Ok(ServerConfig {
         name,
         timeout: Duration::from_millis(server.timeout),
-        startup_timeout: Duration::from_millis(server.startup_timeout),
+        startup_timeout: Duration::from_millis(startup_timeout),
         always_load: server.always_load,
         transport,
     })
@@ -543,7 +540,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
+            startup_timeout: None,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
@@ -560,7 +557,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
+            startup_timeout: None,
             always_load: false,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
@@ -652,9 +649,18 @@ environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
     #[test_case(0 ; "zero")]
     fn invalid_startup_timeout_rejected(startup_timeout: u64) {
         let mut cfg = stdio_raw(&["echo"]);
-        cfg.startup_timeout = startup_timeout;
+        cfg.startup_timeout = Some(startup_timeout);
         let err = parse("srv", cfg).unwrap_err();
         assert!(err.to_string().contains("startup_timeout"));
+    }
+
+    #[test_case("timeout = 120000", 120_000 ; "unset_follows_timeout")]
+    #[test_case("timeout = 120000\nstartup_timeout = 7000", 7_000 ; "explicit_wins")]
+    fn startup_timeout_resolution(fields: &str, expected_ms: u64) {
+        let config: McpConfig =
+            toml::from_str(&format!("[mcp.srv]\ncommand = [\"x\"]\n{fields}")).unwrap();
+        let parsed = parse("srv", config.mcp["srv"].clone()).unwrap();
+        assert_eq!(parsed.startup_timeout, Duration::from_millis(expected_ms));
     }
 
     #[test]
@@ -704,7 +710,6 @@ command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 command = ["gh", "mcp-server"]
 environment = { GITHUB_TOKEN = "tok" }
 timeout = 10000
-startup_timeout = 7000
 enabled = false
 
 [mcp.remote]
@@ -722,11 +727,6 @@ headers = { Authorization = "Bearer tok123" }
         let gh_cfg = &config.mcp["github"];
         assert!(!gh_cfg.enabled);
         assert_eq!(gh_cfg.timeout, 10000);
-        assert_eq!(gh_cfg.startup_timeout, 7000);
-        assert_eq!(
-            config.mcp["filesystem"].startup_timeout,
-            DEFAULT_STARTUP_TIMEOUT_MS
-        );
         match &gh_cfg.transport {
             RawTransport::Stdio(s) => assert_eq!(s.environment["GITHUB_TOKEN"], "tok"),
             _ => panic!("expected Stdio"),

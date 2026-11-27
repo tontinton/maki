@@ -1477,8 +1477,7 @@ pub fn kill_process_groups(_pids: &[u32]) {}
 mod tests {
     use super::*;
     use config::{
-        DEFAULT_STARTUP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, RawHttpFields, RawServerConfig,
-        RawStdioFields, RawTransport,
+        DEFAULT_TIMEOUT_MS, RawHttpFields, RawServerConfig, RawStdioFields, RawTransport,
     };
     use maki_providers::Role;
     use std::fs;
@@ -1499,7 +1498,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT_MS,
+            startup_timeout: None,
             always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
