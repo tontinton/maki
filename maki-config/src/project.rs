@@ -30,6 +30,13 @@ const HOW_TO_TRUST: &str =
     "run `maki trust add --yes PATH` and restart Maki, or pass `--trust` to load it for one run";
 const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
+const GIT_DIR: &str = ".git";
+const GITDIR_POINTER: &str = "gitdir:";
+/// Inside a worktree's entry under the main checkout's `.git/worktrees`: the
+/// path back to the worktree's `.git` file, and the path on to the shared
+/// `.git` directory.
+const WORKTREE_BACK_POINTER: &str = "gitdir";
+const WORKTREE_COMMON_DIR: &str = "commondir";
 
 /// A file under `.maki/` that only a trusted folder may hand to Maki.
 ///
@@ -415,6 +422,19 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
             TrustState::Declined(question(Vec::new())),
             None,
         ),
+        // A linked worktree holds another branch of a repository the user
+        // already answered for, which is what `git switch` in the main checkout
+        // brings in under that same answer. Only a recorded yes carries over,
+        // and only for the kinds of file it named. A `Never` on the worktree
+        // itself was matched above and stays.
+        //
+        // Nothing is written down for the worktree. The main checkout's answer
+        // is read on every start, so taking it back takes it back here too.
+        TrustDecision::Unknown | TrustDecision::Widened { .. }
+            if main_checkout_covers(&trusted_folders, &folder, &present) =>
+        {
+            ProjectDecision::new(project_config, TrustState::Trusted, None)
+        }
         // Nothing to load means nothing to ask about, and asking anyway trains
         // people to click through.
         TrustDecision::Unknown if present.is_empty() => ProjectDecision::new(
@@ -527,12 +547,21 @@ pub fn record_written_file(project_config: &ProjectConfig, file: &str) {
     }
 }
 
+/// A linked worktree usually has no answer of its own and reads the main
+/// checkout's, so that is the answer that has to learn about the file too.
+/// A folder with no answer keeps none, so covering both costs nothing.
 fn record_written_file_in(storage: &StateDir, project_config: &ProjectConfig, file: &str) {
     let root = project_config.config_root();
-    let recorded = CanonicalFolder::resolve(root)
-        .and_then(|folder| TrustedFolders::new(storage).cover_written_file(&folder, file));
-    if let Err(error) = recorded {
-        warn!(%error, file, folder = %root.display(), "cannot record a file Maki wrote into a trusted project");
+    let trusted_folders = TrustedFolders::new(storage);
+    for answered in [Some(root.to_path_buf()), linked_worktree_main(root)]
+        .into_iter()
+        .flatten()
+    {
+        let recorded = CanonicalFolder::resolve(&answered)
+            .and_then(|folder| trusted_folders.cover_written_file(&folder, file));
+        if let Err(error) = recorded {
+            warn!(%error, file, folder = %answered.display(), "cannot record a file Maki wrote into a trusted project");
+        }
     }
 }
 
@@ -631,13 +660,56 @@ pub fn project_root(cwd: &Path) -> PathBuf {
     ProjectConfig::discover(cwd).config_root
 }
 
+fn main_checkout_covers(
+    trusted_folders: &TrustedFolders,
+    worktree: &CanonicalFolder,
+    present: &[GatedFile],
+) -> bool {
+    linked_worktree_main(worktree.path())
+        .and_then(|main| CanonicalFolder::resolve(&main).ok())
+        .and_then(|main| {
+            trusted_folders
+                .decide(&main, &store_names(present), &project_root)
+                .ok()
+        })
+        .is_some_and(|decision| decision == TrustDecision::Trusted)
+}
+
+/// The main checkout `worktree` is a linked worktree of, proven from both
+/// ends. The worktree's `.git` file names its entry under the main checkout's
+/// `.git/worktrees`, and that entry has to name the worktree back. Only
+/// `git worktree add` run in the main checkout writes the entry, so a folder
+/// that merely ships a `.git` file pointing at a checkout the user trusts
+/// proves nothing. The `.git` has to be a real file for the same reason: a
+/// symlink to a genuine worktree's would otherwise pass as that worktree.
+///
+/// A worktree of a bare repository has no main checkout and gets `None`.
+fn linked_worktree_main(worktree: &Path) -> Option<PathBuf> {
+    let git_file = worktree.join(GIT_DIR);
+    if !fs::symlink_metadata(&git_file).ok()?.is_file() {
+        return None;
+    }
+    let pointer = fs::read_to_string(&git_file).ok()?;
+    let entry = worktree.join(pointer.strip_prefix(GITDIR_POINTER)?.trim());
+    let back = fs::read_to_string(entry.join(WORKTREE_BACK_POINTER)).ok()?;
+    let back = entry.join(back.trim());
+    if back.file_name()? != GIT_DIR || canonicalize_clean(back.parent()?) != worktree {
+        return None;
+    }
+    let common = fs::read_to_string(entry.join(WORKTREE_COMMON_DIR)).ok()?;
+    let common = canonicalize_clean(&entry.join(common.trim()));
+    (common.file_name()? == GIT_DIR && common.is_dir())
+        .then(|| common.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
 /// The walk stops below `home`: a dotfiles repository at `$HOME` would otherwise
 /// make every folder under home share one project root, and `PROJECT_DIR` there
 /// is the user's own global config, not something a repository shipped.
 fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     cwd.ancestors()
         .take_while(|path| Some(*path) != home)
-        .find(|path| fs::symlink_metadata(path.join(".git")).is_ok())
+        .find(|path| fs::symlink_metadata(path.join(GIT_DIR)).is_ok())
         .map(canonicalize_clean)
 }
 
@@ -674,7 +746,6 @@ mod tests {
     const EMPTY_SNAPSHOT: &str = "[]";
     const TRUST_LOCK: &str = "trusted-folders.lock";
     const UNREADABLE_STORE: &str = "broken";
-    const GIT_DIR: &str = ".git";
     const GIT_FILE_POINTER: &str = "gitdir: ../main/.git/worktrees/linked\n";
     const HOME_ITSELF: &str = "";
     const NESTED_REPO: &str = "work";
@@ -973,6 +1044,118 @@ mod tests {
         assert_eq!(
             ProjectConfig::rooted(&child, project.parent()).config_root(),
             expected
+        );
+    }
+
+    /// What stands between a main checkout the user trusted and the folder
+    /// that claims to be its worktree.
+    #[derive(Clone, Copy, Debug)]
+    enum Link {
+        TwoWay,
+        /// `worktree.useRelativePaths`: both pointers relative to the file
+        /// that holds them.
+        TwoWayRelative,
+        /// The main checkout never registered this folder: its entry names
+        /// another one.
+        BackPointerElsewhere,
+        /// A `.git` that is a symlink to a genuine worktree's.
+        #[cfg(unix)]
+        SymlinkedGitFile,
+        MainNeverTrusted,
+        /// The main checkout's yes named `init.lua` only.
+        WorktreeShipsMore,
+        WorktreeRejected,
+    }
+
+    #[test_case(Link::TwoWay, true ; "a_linked_worktree_inherits_the_main_checkouts_yes")]
+    #[test_case(Link::TwoWayRelative, true ; "relative_pointers_link_the_same_way")]
+    #[test_case(Link::BackPointerElsewhere, false ; "a_folder_the_main_checkout_does_not_name_inherits_nothing")]
+    #[cfg_attr(unix, test_case(Link::SymlinkedGitFile, false ; "a_symlink_to_a_worktrees_git_file_inherits_nothing"))]
+    #[test_case(Link::MainNeverTrusted, false ; "an_unanswered_main_checkout_has_nothing_to_inherit")]
+    #[test_case(Link::WorktreeShipsMore, false ; "a_kind_the_main_checkouts_yes_never_named_still_asks")]
+    #[test_case(Link::WorktreeRejected, false ; "a_never_on_the_worktree_stays")]
+    fn linked_worktree_trust_follows_the_main_checkout(link: Link, trusted: bool) {
+        const ENTRY: &str = ".git/worktrees/linked";
+        const RELATIVE_BACK_POINTER: &str = "../../../../linked/.git\n";
+
+        let state = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let container = tempfile::tempdir().unwrap();
+        let container = container.path().canonicalize().unwrap();
+        let [main, linked, impostor] = ["main", "linked", "impostor"].map(|name| {
+            let checkout = container.join(name);
+            fs::create_dir_all(checkout.join(PROJECT_DIR)).unwrap();
+            fs::write(checkout.join(INIT_FILE), INIT_SOURCE).unwrap();
+            checkout
+        });
+        let entry = main.join(ENTRY);
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join(WORKTREE_COMMON_DIR), "../..\n").unwrap();
+        fs::write(
+            entry.join(WORKTREE_BACK_POINTER),
+            format!("{}\n", linked.join(GIT_DIR).display()),
+        )
+        .unwrap();
+        let pointer = format!("{GITDIR_POINTER} {}\n", entry.display());
+        fs::write(linked.join(GIT_DIR), &pointer).unwrap();
+        let worktree = match link {
+            Link::TwoWayRelative => {
+                fs::write(entry.join(WORKTREE_BACK_POINTER), RELATIVE_BACK_POINTER).unwrap();
+                fs::write(linked.join(GIT_DIR), GIT_FILE_POINTER).unwrap();
+                linked
+            }
+            Link::BackPointerElsewhere => {
+                fs::write(impostor.join(GIT_DIR), &pointer).unwrap();
+                impostor
+            }
+            #[cfg(unix)]
+            Link::SymlinkedGitFile => {
+                std::os::unix::fs::symlink(linked.join(GIT_DIR), impostor.join(GIT_DIR)).unwrap();
+                impostor
+            }
+            _ => linked,
+        };
+        if matches!(link, Link::WorktreeShipsMore) {
+            fs::write(worktree.join(MCP_FILE), MCP_SOURCE).unwrap();
+        }
+        if !matches!(link, Link::MainNeverTrusted) {
+            grant(&storage, &question_at(&main)).unwrap();
+        }
+        if matches!(link, Link::WorktreeRejected) {
+            deny(&storage, &question_at(&worktree)).unwrap();
+        }
+
+        let decision = resolve_recorded(&storage, project_at(&worktree));
+
+        assert_eq!(decision.project_config.is_trusted(), trusted);
+        if !trusted {
+            return;
+        }
+        let store = TrustedFolders::new(&storage);
+        assert_eq!(
+            store
+                .status(&CanonicalFolder::resolve(&worktree).unwrap())
+                .unwrap(),
+            TrustStatus::Unknown,
+            "the worktree reads the main checkout's answer and keeps none of its own"
+        );
+
+        // Maki writing a kind the main checkout's yes never named must not
+        // make the worktree ask about Maki's own file on the next start.
+        fs::write(worktree.join(MCP_FILE), MCP_SOURCE).unwrap();
+        record_written_file(&decision.project_config, GatedFile::Mcp.file_name());
+        assert!(
+            resolve_recorded(&storage, project_at(&worktree))
+                .project_config
+                .is_trusted()
+        );
+
+        store.remove(&main).unwrap();
+        assert!(
+            !resolve_recorded(&storage, project_at(&worktree))
+                .project_config
+                .is_trusted(),
+            "taking the main checkout's yes back takes the worktree's with it"
         );
     }
 
