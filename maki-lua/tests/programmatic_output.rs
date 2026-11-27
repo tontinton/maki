@@ -41,6 +41,7 @@ const TOOLS: &[&str] = &[
 const NO_OUTPUT: &str = "(no output)";
 const GREP_NOTE_TWO_LEFT: &str = "[limit of 1 reached, 2 more match groups from 2 files not shown]";
 const GREP_NOTE_ONE_LEFT: &str = "[limit of 1 reached, 1 more match group from 1 file not shown]";
+const GREP_NOTE_ONE_CUT: &str = "[1 line cut at 500 bytes, the `...` at the end is not in the file. Use read with limit=1 on a line for more of it]";
 const GREP_COUNT_TOTAL: &str = "2 matching lines in 1 file";
 const GREP_COUNT_FILE: &str = "a.rs: 2";
 const GREP_COUNT_EXCLUDED_TOTAL: &str = "1 matching line in 1 file";
@@ -252,6 +253,20 @@ fn python_grep_preserves_match_and_context_text() {
     )
     .unwrap();
     assert!(!model_output.contains("needle-end"));
+}
+
+#[test]
+fn grep_tells_the_model_which_lines_it_cut() {
+    let (_registry, _host, ctx) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("grep.txt");
+    fs::write(
+        &path,
+        format!("needle\n{}needle\n", "m".repeat(MODEL_BYTES)),
+    )
+    .unwrap();
+    let model_output = run(&ctx, "grep", json!({ "pattern": "needle", "path": path })).unwrap();
+    assert!(model_output.ends_with(GREP_NOTE_ONE_CUT), "{model_output}");
 }
 
 #[test_case::test_case(3, 1, GREP_NOTE_TWO_LEFT ; "plural")]

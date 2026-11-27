@@ -1222,7 +1222,8 @@ async fn grep_counts(
 /// grouped by file, similar to ripgrep output.
 ///
 /// Each result entry has a `path` and a list of `groups`. Each group contains
-/// `lines`, where every line has `line_nr`, `text`, and `is_match`.
+/// `lines`, where every line has `line_nr`, `text`, and `is_match`. A line
+/// `max_line_bytes` cut also has `cut = true`, and its `text` ends in `...`.
 ///
 /// @param pattern string Regular expression to search for.
 /// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`, or `"!**/tests/**"` to leave files out). `exclude` (string): regex, a match is left out when its line matches. `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
@@ -1294,6 +1295,9 @@ async fn grep(
                 ltbl.set("line_nr", line.line_nr)?;
                 ltbl.set("text", line.text.as_str())?;
                 ltbl.set("is_match", line.is_match)?;
+                if line.cut {
+                    ltbl.set("cut", true)?;
+                }
                 lines_tbl.set(li + 1, ltbl)?;
             }
             gtbl.set("lines", lines_tbl)?;

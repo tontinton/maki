@@ -40,6 +40,10 @@ pub struct GrepLine {
     pub line_nr: usize,
     pub text: String,
     pub is_match: bool,
+    /// `text` lost its end to the line limit and closes with a marker the
+    /// file does not have.
+    #[serde(default)]
+    pub cut: bool,
 }
 
 impl GrepLine {
@@ -48,6 +52,7 @@ impl GrepLine {
             line_nr,
             text: text.into(),
             is_match: true,
+            cut: false,
         }
     }
 
@@ -56,6 +61,7 @@ impl GrepLine {
             line_nr,
             text: text.into(),
             is_match: false,
+            cut: false,
         }
     }
 }
