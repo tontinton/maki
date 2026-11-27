@@ -814,9 +814,10 @@ pub fn history_to_display(
                 }
             }
             Role::Assistant => {
+                let marker = msg.is_empty_marker();
                 for block in &msg.content {
                     match block {
-                        ContentBlock::Text { text } if !text.is_empty() => {
+                        ContentBlock::Text { text } if !text.is_empty() && !marker => {
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
                         }
                         ContentBlock::Image { source } => {
@@ -1528,6 +1529,22 @@ mod tests {
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
         assert_eq!(display[1].role, DisplayRole::Assistant);
+    }
+
+    /// The live view never streams the marker, so a restored one shows only
+    /// the thinking it kept.
+    #[test]
+    fn history_to_display_hides_empty_marker() {
+        const THOUGHT: &str = "checked the retry path";
+        let msgs = vec![Message::empty_marker(vec![ContentBlock::Thinking {
+            thinking: THOUGHT.into(),
+            signature: None,
+            reasoning_id: None,
+        }])];
+        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::Thinking);
+        assert_eq!(display[0].text, THOUGHT);
     }
 
     const RESTORE_OUTPUT: &str = "rendered output";

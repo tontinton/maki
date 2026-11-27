@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
+use maki_providers::{ContentBlock, Message, Model, Role};
 use maki_storage::auth::now_millis;
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
@@ -322,7 +322,7 @@ impl History {
             .iter()
             .rev()
             .take_while(|m| is_system_padding(m))
-            .filter(|m| is_empty_marker(m))
+            .filter(|m| m.is_empty_marker())
             .count() as u32
     }
 
@@ -509,20 +509,11 @@ pub fn unbind_thinking(messages: &mut [Message]) {
 /// Empty markers and synthetic prompts (empty `display_text`) are
 /// bookkeeping, not conversation.
 fn is_system_padding(m: &Message) -> bool {
-    is_empty_marker(m)
+    m.is_empty_marker()
         || (m.display_text.as_deref() == Some("")
             && m.content
                 .iter()
                 .all(|b| matches!(b, ContentBlock::Text { .. })))
-}
-
-/// Role and `display_text` are part of the shape: a user who types the marker
-/// text verbatim writes a real message, and it has to break the nudge streak
-/// like any other.
-fn is_empty_marker(m: &Message) -> bool {
-    matches!(m.role, Role::Assistant)
-        && m.display_text.is_none()
-        && matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
 }
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
@@ -597,7 +588,7 @@ pub(crate) fn sanitize_cancelled_history(
 
 #[cfg(test)]
 mod tests {
-    use maki_providers::{ContentBlock, Message, Role};
+    use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
     use test_case::test_case;
 
     use super::*;
@@ -638,6 +629,14 @@ mod tests {
             display_text: Some(String::new()),
             ..Default::default()
         }
+    }
+
+    fn make_thinking_marker() -> Message {
+        Message::empty_marker(vec![ContentBlock::Thinking {
+            thinking: FIRST.into(),
+            signature: Some(SIGNATURE.into()),
+            reasoning_id: None,
+        }])
     }
 
     fn make_mirror() -> SharedMessages {
@@ -1065,11 +1064,11 @@ mod tests {
     #[test_case(
         vec![
             make_tool_result_msg(&["t1"]),
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
             Message::synthetic("nudge".into()),
-            Message::empty_marker(),
+            make_thinking_marker(),
             Message::synthetic("nudge".into()),
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
             Message::synthetic("continue".into()),
         ],
         1
@@ -1089,18 +1088,28 @@ mod tests {
     #[test_case(
         vec![
             make_tool_result_msg(&["t1"]),
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
             Message::synthetic("nudge".into()),
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
             Message::synthetic("nudge".into()),
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
         ],
         3
         ; "counts_markers_in_padding_tail"
     )]
     #[test_case(
         vec![
-            Message::empty_marker(),
+            make_tool_result_msg(&["t1"]),
+            make_thinking_marker(),
+            Message::synthetic("nudge".into()),
+            make_thinking_marker(),
+        ],
+        2
+        ; "counts_markers_that_kept_thinking"
+    )]
+    #[test_case(
+        vec![
+            Message::empty_marker(Vec::new()),
             Message::synthetic("nudge".into()),
             Message::user("continue".into()),
         ],
@@ -1109,7 +1118,7 @@ mod tests {
     )]
     #[test_case(
         vec![
-            Message::empty_marker(),
+            Message::empty_marker(Vec::new()),
             Message::synthetic("nudge".into()),
             Message::user(EMPTY_RESPONSE_MARKER.into()),
         ],

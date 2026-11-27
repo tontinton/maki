@@ -443,9 +443,10 @@ fn replay_assistant(
     cwd: &Path,
     home: Option<&Path>,
 ) {
+    let marker = msg.is_empty_marker();
     for block in &msg.content {
         match block {
-            MsgBlock::Text { text } => updates.push(text_delta(text)),
+            MsgBlock::Text { text } if !marker => updates.push(text_delta(text)),
             MsgBlock::Thinking { thinking, .. } => updates.push(thinking_delta(thinking)),
             MsgBlock::ToolUse {
                 id, name, input, ..
@@ -649,6 +650,19 @@ mod tests {
     #[test_case(Some("") ; "blank")]
     fn replay_hides_an_observation_without_a_line(line: Option<&str>) {
         assert!(updates_json(&[observation_with(line)]).is_empty());
+    }
+
+    #[test]
+    fn replay_hides_the_empty_marker_but_not_its_thinking() {
+        let marker = Message::empty_marker(vec![MsgBlock::Thinking {
+            thinking: REPLY.into(),
+            signature: None,
+            reasoning_id: None,
+        }]);
+        assert_eq!(
+            updates_json(&[marker]),
+            [serde_json::to_value(thinking_delta(REPLY)).unwrap()]
+        );
     }
 
     #[test]

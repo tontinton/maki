@@ -836,16 +836,29 @@ impl Serialize for Message {
 
 impl Message {
     /// Stands in for an assistant turn with no text, thinking alone or empty,
-    /// which providers reject as the trailing message. Never a real response:
-    /// readers mining history for model text must skip it.
-    pub fn empty_marker() -> Self {
+    /// which providers reject as the trailing message. The turn's thinking
+    /// stays in front, because a signed block must go back as it came. Never
+    /// a real response: readers mining history for model text must skip it.
+    pub fn empty_marker(mut content: Vec<ContentBlock>) -> Self {
+        content.retain(ContentBlock::is_thinking);
+        content.push(ContentBlock::Text {
+            text: EMPTY_RESPONSE_MARKER.into(),
+        });
         Self {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: EMPTY_RESPONSE_MARKER.into(),
-            }],
+            content,
             ..Default::default()
         }
+    }
+
+    /// Role and `display_text` are part of the shape: a user who types the
+    /// marker text verbatim writes a real message.
+    pub fn is_empty_marker(&self) -> bool {
+        let mut rest = self.content.iter().skip_while(|b| b.is_thinking());
+        matches!(self.role, Role::Assistant)
+            && self.display_text.is_none()
+            && matches!(rest.next(), Some(ContentBlock::Text { text }) if text == EMPTY_RESPONSE_MARKER)
+            && rest.next().is_none()
     }
 
     /// Something the host saw, reported to the model without pretending
@@ -2180,6 +2193,50 @@ mod tests {
         let mut message = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
         change(&mut message);
         assert_eq!(message.is_host_context_update(), expected);
+    }
+
+    fn signed_thinking() -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: PROMPT.into(),
+            signature: Some(OTHER_DATA.into()),
+            reasoning_id: None,
+        }
+    }
+
+    #[test_case(|_: &mut Message| {}, true ; "as_built")]
+    #[test_case(|m: &mut Message| m.content.insert(0, signed_thinking()), true ; "kept_thinking")]
+    #[test_case(|m: &mut Message| m.content.push(signed_thinking()), false ; "thinking_after_marker")]
+    #[test_case(|m: &mut Message| m.content.insert(0, ContentBlock::Text { text: PROMPT.into() }), false ; "real_text")]
+    #[test_case(|m: &mut Message| m.role = Role::User, false ; "typed_by_user")]
+    #[test_case(|m: &mut Message| m.display_text = Some(PROMPT.into()), false ; "visible")]
+    fn empty_marker_is_the_constructed_shape(change: fn(&mut Message), expected: bool) {
+        let mut message = Message::empty_marker(Vec::new());
+        change(&mut message);
+        assert_eq!(message.is_empty_marker(), expected);
+    }
+
+    #[test]
+    fn empty_marker_keeps_the_turns_thinking() {
+        let redacted = ContentBlock::RedactedThinking {
+            data: OTHER_DATA.into(),
+        };
+        let marker = Message::empty_marker(vec![
+            signed_thinking(),
+            ContentBlock::Text {
+                text: String::new(),
+            },
+            redacted.clone(),
+        ]);
+        assert_eq!(
+            marker.content,
+            [
+                signed_thinking(),
+                redacted,
+                ContentBlock::Text {
+                    text: EMPTY_RESPONSE_MARKER.into()
+                }
+            ]
+        );
     }
 
     /// A block this build cannot read may hold a newer build's data, so it

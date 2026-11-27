@@ -50,6 +50,8 @@ const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// overflow in a row means it did not help and retrying only burns a summary.
 const MAX_OVERFLOW_RECOVERIES: u32 = 1;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+/// Kept thinking reads as a finished turn, so "continue where you left off" gets an empty reply.
+const CUT_OFF_PROMPT: &str = "Your previous response hit the output limit before you replied. Continue the task and give your answer.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
 const MAX_NUDGES: u32 = 20;
@@ -785,15 +787,15 @@ impl<'h> Agent<'h> {
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
         } else {
+            let cut_off = stop_reason == Some(StopReason::MaxTokens)
+                && self.num_turns <= self.config.max_continuation_turns;
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+            } else if self.recover_stalled_turn(response.message.content, cut_off)? {
                 return Ok(TurnOutcome::Continue);
             }
 
-            if stop_reason == Some(StopReason::MaxTokens)
-                && self.num_turns <= self.config.max_continuation_turns
-            {
+            if cut_off {
                 warn!(
                     self.num_turns,
                     "response truncated (max_tokens), re-prompting"
@@ -1096,23 +1098,36 @@ impl<'h> Agent<'h> {
     }
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
-    /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    /// place in history. Returns true when the model was asked to go on. A
+    /// cut-off turn always is, by a user message, since the marker leaves no
+    /// answer to continue in place.
+    fn recover_stalled_turn(
+        &mut self,
+        content: Vec<ContentBlock>,
+        cut_off: bool,
+    ) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = !self.moved_last_round
             && nudges < MAX_NUDGES
             && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
-        if !nudge {
+        self.history.push(Message::empty_marker(content));
+        let prompt = if cut_off {
+            warn!(
+                self.num_turns,
+                "response without text truncated (max_tokens), re-prompting"
+            );
+            CUT_OFF_PROMPT
+        } else if nudge {
+            warn!(
+                nudges = nudges + 1,
+                "empty response after tool calls, nudging model to continue"
+            );
+            self.event_tx.send(AgentEvent::Nudge)?;
+            NUDGE_PROMPT
+        } else {
             return Ok(false);
-        }
-
-        warn!(
-            nudges = nudges + 1,
-            "empty response after tool calls, nudging model to continue"
-        );
-        self.event_tx.send(AgentEvent::Nudge)?;
-        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        };
+        self.history.push(Message::synthetic(prompt.into()));
         Ok(true)
     }
 
@@ -1719,6 +1734,13 @@ mod tests {
             signature: None,
             reasoning_id: None,
         }])
+    }
+
+    fn stalled_response(stop_reason: StopReason) -> StreamResponse {
+        StreamResponse {
+            stop_reason: Some(stop_reason),
+            ..thinking_response()
+        }
     }
 
     fn thought_response() -> StreamResponse {
@@ -2599,22 +2621,48 @@ mod tests {
 
     /// A truncated answer buys another turn, but only until one of the two
     /// budgets runs out: the continuation limit or the caller's `max_turns`.
-    #[test_case(&[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
-    #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
+    /// A truncated turn of only thinking spends the same budget.
+    #[test_case(text_response, &[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
+    #[test_case(text_response, &[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
+    #[test_case(text_response, &[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
+    #[test_case(text_response, &[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
+    #[test_case(stalled_response, &[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "stalled_max_tokens_continues")]
+    #[test_case(stalled_response, &[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "stalled_max_tokens_gives_up_after_limit")]
     #[tokio::test]
     async fn turn_counting(
+        respond: fn(StopReason) -> StreamResponse,
         stops: &[StopReason],
         max_turns: Option<u32>,
         expected_turns: u32,
         expected_reason: DoneReason,
     ) {
-        let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
+        let responses: Vec<_> = stops.iter().map(|s| respond(*s)).collect();
         let provider = MockProvider::new(responses);
         let (turns, reason) = run_agent(provider, max_turns).await;
         assert_eq!(turns, expected_turns);
         assert_eq!(reason, expected_reason);
+    }
+
+    /// Continuing in place would extend the marker, so the request after a
+    /// cut-off turn without text ends on a user message.
+    #[tokio::test]
+    async fn cut_off_stalled_turn_continues_with_a_user_message() {
+        let provider = MockProvider::new(vec![
+            stalled_response(StopReason::MaxTokens),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        let requests = requests.lock().unwrap();
+        assert_append_only(&requests[0], &requests[1]);
+        let last: Message =
+            serde_json::from_value(requests[1].messages.last().unwrap().clone()).unwrap();
+        assert!(matches!(last.role, Role::User));
+        assert_eq!(last.first_text_content(), Some(CUT_OFF_PROMPT));
     }
 
     /// `--max-budget-usd`: the turn that crosses the cap finishes, and the
@@ -4627,6 +4675,31 @@ mod tests {
             "history holds a message no provider will accept: {:?}",
             history.as_slice()
         );
+    }
+
+    /// Signed thinking must go back as it came, so a turn of nothing else
+    /// keeps it in front of the marker instead of losing it.
+    #[tokio::test]
+    async fn stalled_turn_keeps_its_signed_thinking() {
+        let signed = ContentBlock::Thinking {
+            thinking: THOUGHT.into(),
+            signature: Some(THOUGHT_SIGNATURE.into()),
+            reasoning_id: None,
+        };
+        let provider = MockProvider::new(vec![
+            tool_call_response("glob", "t1"),
+            assistant_response(vec![signed.clone()]),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        let requests = requests.lock().unwrap();
+        assert_append_only(&requests[1], &requests[2]);
+        assert_eq!(requests[2].thinking(), [signed]);
     }
 
     /// Pins the regression where a stale nudge counter made a follow-up

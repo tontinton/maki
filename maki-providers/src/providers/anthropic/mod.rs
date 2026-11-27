@@ -1339,6 +1339,14 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         json!([{"type": "text", "text": EMPTY_RESPONSE_MARKER}])
         ; "only_unsigned_thinking_falls_back"
     )]
+    #[test_case(
+        Message::empty_marker(vec![thinking_block("hmm")]).content,
+        json!([
+            {"type": "thinking", "thinking": "hmm", "signature": THINKING_SIGNATURE},
+            {"type": "text", "text": EMPTY_RESPONSE_MARKER},
+        ])
+        ; "stalled_turn_replays_its_thinking"
+    )]
     fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
         let messages = vec![message(Role::Assistant, content)];
         let json: Value =
