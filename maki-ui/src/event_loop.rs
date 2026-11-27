@@ -38,9 +38,10 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
-    LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiReply, WinEvent, fetch_provider_usage,
+    CANCEL_CANCELLED, CANCEL_IDLE, EventHandle, HintReader, InputMode, InputRequest,
+    InputRulesReader, Key, KeymapReader, LuaCommandReader, ModelRequest, PROMPT_QUEUED,
+    PROMPT_STARTED, PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest,
+    TaskRequest, UiAction, UiReply, WinEvent, fetch_provider_usage,
 };
 use maki_providers::Timeouts;
 use maki_providers::model_registry;
@@ -1844,6 +1845,18 @@ impl<'t> EventLoop<'t> {
                     let _ = reply_tx.send(reply);
                 });
             }
+            SessionRequest::Cancel { id } => {
+                let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
+                    match self.sessions[idx].app.cancel_turn() {
+                        Some(actions) => {
+                            self.dispatch(idx, actions);
+                            json!(CANCEL_CANCELLED)
+                        }
+                        None => json!(CANCEL_IDLE),
+                    }
+                });
+                let _ = reply_tx.send(reply);
+            }
         }
     }
 
@@ -1945,9 +1958,9 @@ impl<'t> EventLoop<'t> {
         match self.sessions[idx].app.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
-                Ok(json!("started"))
+                Ok(json!(PROMPT_STARTED))
             }
-            SubmitOutcome::Queued => Ok(json!("queued")),
+            SubmitOutcome::Queued => Ok(json!(PROMPT_QUEUED)),
             SubmitOutcome::Rejected(e) => Err(e.into()),
         }
     }
