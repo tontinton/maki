@@ -218,6 +218,8 @@ maki.api.register_tool({
 const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 
+const SHORTHAND_VALUE: &str = "Red";
+
 const STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { url = { type = "string" } },
@@ -976,10 +978,12 @@ fn handler_state_flows_to_tool_output_and_serde() {
     assert_eq!(parsed.state(), Some(&expected), "state must survive serde");
 }
 
-/// Restores `tool` from `src` and returns the snapshot's concatenated text.
+/// Restores `tool` from `src` and returns the text of its body and header
+/// snapshots, joined.
 fn restore_snapshot_text(
     src: &str,
     tool: &str,
+    input: Value,
     clicks: Vec<usize>,
     state: Option<serde_json::Value>,
 ) -> String {
@@ -993,7 +997,7 @@ fn restore_snapshot_text(
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: "ok".to_owned(),
-            input: serde_json::json!({}),
+            input,
             is_error: false,
             tool_output_lines: ToolOutputLines::default(),
             theme_gen: None,
@@ -1009,7 +1013,9 @@ fn restore_snapshot_text(
 
     let mut text = String::new();
     for env in iter::from_fn(|| rx.try_recv().ok()) {
-        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. }
+        | maki_agent::AgentEvent::ToolHeaderSnapshot { snapshot, .. } = env.event
+        {
             for line in snapshot.lines.iter() {
                 for span in &line.spans {
                     text.push_str(&span.text);
@@ -1042,8 +1048,51 @@ fn restore_reads_persisted_state(with_state: bool, expected: &str) {
             end
         }})"#,
     );
-    let text = restore_snapshot_text(&src, "state_restore", Vec::new(), state);
+    let text = restore_snapshot_text(&src, "state_restore", json!({}), Vec::new(), state);
     assert!(text.contains(expected), "expected {expected:?} in: {text}");
+}
+
+/// The stored call keeps the shorthand the model sent. Restore and header
+/// must still see the clean shape the live handler got.
+#[test_case::test_case(
+    r#"{ type = "object", required = { "target" },
+         properties = { target = { type = "string", alias = "file_path" } } }"#,
+    json!({ "file_path": SHORTHAND_VALUE }),
+    "input.target"
+    ; "alias"
+)]
+#[test_case::test_case(
+    r#"{ type = "object", required = { "items" }, properties = { items = {
+         type = "array", accept_single = true,
+         items = { type = "object", required = { "label" },
+                   properties = { label = { type = "string" } } } } } }"#,
+    json!({ "label": SHORTHAND_VALUE }),
+    "input.items[1].label"
+    ; "accept_single"
+)]
+fn restore_sees_canonical_input_from_shorthand(schema: &str, input: Value, probe: &str) {
+    let src = format!(
+        r#"local function probe(input) return {probe} end
+        maki.api.register_tool({{
+            name = "shorthand_restore",
+            description = "t",
+            schema = {schema},
+            handler = function() return "ok" end,
+            header = function(input) return "header=" .. probe(input) end,
+            restore = function(input)
+                local buf = maki.ui.buf()
+                buf:line("body=" .. probe(input))
+                return buf
+            end
+        }})"#,
+    );
+    let text = restore_snapshot_text(&src, "shorthand_restore", input, Vec::new(), None);
+    for expected in [
+        format!("header={SHORTHAND_VALUE}"),
+        format!("body={SHORTHAND_VALUE}"),
+    ] {
+        assert!(text.contains(&expected), "expected {expected:?} in: {text}");
+    }
 }
 
 #[test]
@@ -1075,6 +1124,7 @@ fn restore_ctx_is_userdata_with_gated_capabilities() {
     let text = restore_snapshot_text(
         &src,
         "ctx_restore",
+        json!({}),
         Vec::new(),
         Some(serde_json::json!({ "tag": "hi" })),
     );
@@ -1218,7 +1268,7 @@ fn restore_snapshot_contains_async_run_content(clicks: Vec<usize>, expected: &st
             end
         }})"#,
     );
-    let text = restore_snapshot_text(&src, "async_restore", clicks, None);
+    let text = restore_snapshot_text(&src, "async_restore", json!({}), clicks, None);
     assert!(text.contains("sync line"), "sync content missing: {text}");
     assert!(
         text.contains(expected),
