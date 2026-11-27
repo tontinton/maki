@@ -373,6 +373,7 @@ maki.setup({
 | `allow_background` | boolean | `true` | - | Expose a `background` input that pushes subagent results to the chat when they finish. |
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
+| `uncapped_thinking` | boolean | `false` | - | Let the `thinking` input go above the parent's thinking level, e.g. a strong parent on medium handing a weaker model high. Only enable if you trust callers to decide how hard a subagent thinks. |
 
 ### `plugins.webfetch`
 

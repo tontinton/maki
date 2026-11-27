@@ -1721,8 +1721,8 @@ impl ThinkingConfig {
     }
 
     /// Caps this config at `parent`. A subagent's thinking request is written
-    /// by the model, not the user, so it may go down but never above what the
-    /// parent session runs with. A parent of `Adaptive` set no ceiling at all,
+    /// by the model, not the user, so by default it may go down but never above
+    /// what the parent session runs with. A parent of `Adaptive` set no ceiling at all,
     /// so the child gets whatever it asked for; but against a parent that did
     /// name a level or a count, a child's `Adaptive` is "let the model decide"
     /// with no upper bound, which sits above any concrete ceiling, so the
