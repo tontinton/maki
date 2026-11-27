@@ -10,7 +10,10 @@ function M.handler(input, ctx)
     return { llm_output = "error: path is required", is_error = true }
   end
   local path = maki.fs.abspath(raw)
-  local meta = maki.fs.metadata(path)
+  local meta, meta_err = maki.fs.metadata(path)
+  if meta_err then
+    return { llm_output = "error: cannot read " .. path .. ": " .. meta_err, is_error = true }
+  end
   if not meta then
     return { llm_output = "error: path not found: " .. path, is_error = true }
   end

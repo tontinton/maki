@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
+use std::fs::{File, FileType, ReadDir};
 use std::io::{
     BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
 };
@@ -72,16 +72,12 @@ fn filetype_str(ft: &FileType) -> &'static str {
 
 fn collect_dir_entries(
     base: &Path,
-    dir: &Path,
+    entries: ReadDir,
     depth: u32,
     max_depth: u32,
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, &'static str)>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = match path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
@@ -102,8 +98,10 @@ fn collect_dir_entries(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if visited.insert(canonical) {
-                collect_dir_entries(base, &path, depth + 1, max_depth, visited, out);
+            if visited.insert(canonical)
+                && let Ok(children) = std::fs::read_dir(&path)
+            {
+                collect_dir_entries(base, children, depth + 1, max_depth, visited, out);
             }
         }
     }
@@ -780,7 +778,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 /// `name` is relative to {path}, so nested entries (`depth` > 1) keep their
-/// directory, as in `"tests/lib.rs"`.
+/// directory, as in `"tests/lib.rs"`. A nested directory that cannot be read
+/// is listed without its contents; an unreadable {path} is an error.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
@@ -800,15 +799,11 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
     };
 
     let result = spawn_blocking(move || -> Result<Vec<(String, &'static str)>, String> {
-        if !abs.exists() {
-            return Err(format!("dir: path does not exist: {}", abs.display()));
-        }
-        if !abs.is_dir() {
-            return Err(format!("dir: not a directory: {}", abs.display()));
-        }
+        let entries = std::fs::read_dir(&abs)
+            .map_err(|e| format!("dir: cannot read {}: {e}", abs.display()))?;
         let mut out = Vec::new();
         let mut visited = HashSet::new();
-        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
+        collect_dir_entries(&abs, entries, 1, max_depth, &mut visited, &mut out);
         Ok(out)
     })
     .await
@@ -1108,6 +1103,11 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 
     let result: Result<Vec<String>, String> = spawn_blocking(move || {
         let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
+        if let Err(e) = std::fs::read_dir(&root)
+            && e.kind() == ErrorKind::PermissionDenied
+        {
+            return Err(format!("cannot read {root}: {e}"));
+        }
         let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
 
         let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
@@ -1605,6 +1605,8 @@ mod tests {
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
+    #[cfg(unix)]
+    const PERMISSION_DENIED: &str = "Permission denied";
 
     const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
 
@@ -2179,6 +2181,43 @@ mod tests {
         assert!(
             matches!(err, mlua::Value::String(_)),
             "dir should return error for nonexistent path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case("dir" ; "dir")]
+    #[test_case("glob" ; "glob")]
+    #[tokio::test]
+    async fn unreadable_root_is_an_error(function: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a directory whatever its mode.
+        if std::fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        let path = locked.to_str().unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let call: mlua::Function = tbl.get(function).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("path", path).unwrap();
+        let args = match function {
+            "dir" => (path, opts),
+            _ => ("**/*", opts),
+        };
+        let (val, err): (mlua::Value, String) = call.call_async(args).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(
+            err.contains(path) && err.contains(PERMISSION_DENIED),
+            "error should name the path and the cause, got {err:?}"
         );
     }
 

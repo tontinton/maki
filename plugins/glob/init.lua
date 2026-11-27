@@ -20,7 +20,7 @@ maki.api.register_tool({
   kind = "search",
   description = [[Find files by glob pattern.
 
-- Respects .gitignore.
+- Respects .gitignore. Matches dotfiles.
 - Returns absolute paths sorted by modification time (newest first).
 - Prefer speculative parallel searches over sequential rounds of glob+grep.]],
 
