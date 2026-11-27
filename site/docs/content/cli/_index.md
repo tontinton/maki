@@ -43,7 +43,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
-| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
+| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key, and without one when the model policy excludes it) → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |

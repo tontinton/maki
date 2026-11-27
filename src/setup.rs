@@ -42,6 +42,7 @@ const PROVIDER_PRIORITY: &[&str] = &[
 const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
 
 /// The model to start on, plus a warning when the saved one had to be skipped.
+/// A saved model the policy excludes is skipped quietly, as the user chose that.
 /// Logging is not up this early, so the caller has to show the warning.
 pub async fn resolve_model(
     explicit: Option<&str>,
@@ -60,10 +61,10 @@ pub async fn resolve_model(
             .context("invalid --model spec")?;
         return Ok((model, None));
     }
-    let Some(spec) = read_model(storage) else {
+    let Some(spec) = read_model(storage).filter(|spec| policy.allows(spec)) else {
         return Ok((fallback_model(provider_config).await?, None));
     };
-    let skipped = match saved_model(&spec, policy).await {
+    let skipped = match saved_model(&spec).await {
         Ok(model) => return Ok((model, None)),
         Err(reason) => format!("saved model {spec} unavailable ({reason:#})"),
     };
@@ -76,10 +77,7 @@ pub async fn resolve_model(
     }
 }
 
-async fn saved_model(spec: &str, policy: &ModelPolicy) -> Result<Model> {
-    if !policy.allows(spec) {
-        bail!("not allowed by provider model policy");
-    }
+async fn saved_model(spec: &str) -> Result<Model> {
     let model = from_spec_or_warm_catalog(spec).await?;
     provider_ready(&model.provider)?;
     Ok(model)
@@ -356,10 +354,13 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use maki_config::{ModelPolicy, ProviderConfig};
+    use maki_storage::StateDir;
+    use maki_storage::model::persist_model;
     use serde_json::Value;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, ProjectJson, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, ProjectJson, build_log_filter, resolve_model};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -370,6 +371,25 @@ mod tests {
     const SESSION: u64 = 7;
     const BYTES: u64 = 42;
     const WORKER_PLUGIN: &str = "background";
+    const ALLOWED_MODEL: &str = "anthropic/claude-opus-4-8";
+    const EXCLUDED_MODEL: &str = "openai/gpt-5";
+
+    #[tokio::test]
+    async fn saved_model_excluded_by_policy_falls_back_without_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        persist_model(&storage, EXCLUDED_MODEL);
+        let config = ProviderConfig {
+            default_model: Some(ALLOWED_MODEL.into()),
+            model_policy: ModelPolicy::new(&[], &[EXCLUDED_MODEL.into()]).unwrap(),
+            ..ProviderConfig::default()
+        };
+
+        let (model, warning) = resolve_model(None, &config, &storage).await.unwrap();
+
+        assert_eq!(model.spec(), ALLOWED_MODEL);
+        assert_eq!(warning, None);
+    }
 
     #[test]
     fn project_tags_span_scoped_and_unscoped_worker_logs() {
