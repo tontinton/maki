@@ -385,10 +385,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// events. `"TurnEnd"` fires once per turn of the main session. A manual
 /// `/compact` fires no `"TurnEnd"`.
 ///
-/// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
-/// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
-/// call the dispatcher yet, so plugins loaded under ACP receive no turn
-/// events. Everything else fires under `maki -p` and sdk mode as well.
+/// `"PlanReady"` comes from `maki-ui` only. `"TurnStart"` fires under ACP too,
+/// but not under `maki -p` or sdk mode. The rest fires under all of them.
 ///
 /// `"SessionEnd"` is the teardown signal: it fires first so handlers can
 /// still inspect or stop the session's jobs, then session-owned jobs are

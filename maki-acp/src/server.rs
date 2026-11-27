@@ -52,7 +52,9 @@ use tracing::{debug, info, warn};
 
 use crate::commands::{self, Invocation};
 use crate::router::{EventSink, Relay, RelayEvent};
-use crate::{AcpParams, ProjectStack, elicitation, methods, permissions, translate};
+use crate::{
+    AcpParams, AgentEventHook, ProjectStack, elicitation, methods, permissions, translate,
+};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// Turns already recorded were priced when they ran. `always_fast` is a live
@@ -739,6 +741,7 @@ async fn start_session(
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        srv.stack.on_agent_event.clone(),
     );
     let state = SessionState {
         handle,
@@ -1094,6 +1097,10 @@ fn handle_prompt(
         }
     };
 
+    // Before the send, so it precedes every event the turn produces.
+    if let (SessionInput::Prompt(prompt), Some(hook)) = (&input, &srv.stack.on_turn_start) {
+        hook(&req.session_id.0, &prompt.message);
+    }
     session
         .handle
         .input_tx
@@ -1292,6 +1299,7 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    on_agent_event: Option<AgentEventHook>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut cost = CostTally::starting_at(initial_cost);
@@ -1301,10 +1309,14 @@ fn start_event_pump(
         // sdk_mode does: the history holds these inputs anyway.
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Some(Envelope {
-            event, subagent, ..
-        }) = events.next().await
-        {
+        while let Some(envelope) = events.next().await {
+            // Before the filters below: the hook decides what a subagent's event means.
+            if let Some(hook) = &on_agent_event {
+                hook(&sid.0, &envelope);
+            }
+            let Envelope {
+                event, subagent, ..
+            } = envelope;
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1833,6 +1845,8 @@ mod tests {
             trust_policy: Arc::default(),
             yolo: false,
             on_session_end: None,
+            on_agent_event: None,
+            on_turn_start: None,
         }
     }
 
@@ -2046,6 +2060,15 @@ mod tests {
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
     async fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
+        run_pump_with_hook(srv, initial_cost, None, feed).await;
+    }
+
+    async fn run_pump_with_hook(
+        srv: &Server,
+        initial_cost: Option<f64>,
+        on_agent_event: Option<AgentEventHook>,
+        feed: impl FnOnce(&EventSender),
+    ) {
         let session = only_session(srv);
         let (guard, events) = maki_agent::event_stream();
         let pump = start_event_pump(
@@ -2057,6 +2080,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             initial_cost,
+            on_agent_event,
         );
         let sender = guard.sender(0);
         feed(&sender);
@@ -2565,6 +2589,58 @@ mod tests {
         assert_eq!(request["params"]["toolCall"]["title"], title);
     }
 
+    /// The plugin host decides what a subagent's event means, so the hook sees
+    /// every envelope in order while the client still gets only the main ones.
+    #[tokio::test]
+    async fn event_pump_hands_every_envelope_to_the_agent_event_hook() {
+        let (srv, .., mut out_rx) = test_server();
+        let session_id = client_id(&only_session(&srv).handle.session_id);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook: AgentEventHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |sid, envelope| {
+                let kind = match &envelope.event {
+                    AgentEvent::ToolStart(_) => "tool_start",
+                    AgentEvent::TextDelta { .. } => "text_delta",
+                    AgentEvent::Done { .. } => "done",
+                    _ => "other",
+                };
+                seen.lock()
+                    .unwrap()
+                    .push((sid.to_owned(), kind, envelope.subagent.is_some()));
+            })
+        };
+        run_pump_with_hook(&srv, None, Some(hook), |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: QUEUED_TEXT.to_owned(),
+                    },
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        let sid = session_id.0.to_string();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (sid.clone(), "tool_start", false),
+                (sid.clone(), "text_delta", true),
+                (sid, "done", false),
+            ]
+        );
+        assert_eq!(
+            drain(&mut out_rx).len(),
+            1,
+            "only the tool call reaches the client"
+        );
+    }
+
     /// A resumed session opens with a bill, and subagent turns spend against it
     /// even though their events never enter the transcript.
     #[tokio::test]
@@ -2989,6 +3065,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             None,
+            None,
         );
         srv.sessions.get_mut(&sid).expect(SESSION_INSTALLED).pump = AbortOnDropHandle::new(pump);
         let sender = guard.sender(0);
@@ -3195,6 +3272,109 @@ mod tests {
         let input = agent_input(input);
         assert_eq!(input.message, PATH_PROMPT);
         assert!(input.prompt.is_none());
+    }
+
+    type TurnStarts = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn record_turn_starts(srv: &mut Server) -> TurnStarts {
+        let seen = TurnStarts::default();
+        let sink = Arc::clone(&seen);
+        srv.stack.on_turn_start = Some(Arc::new(move |sid, text| {
+            sink.lock().unwrap().push((sid.to_owned(), text.to_owned()));
+        }));
+        seen
+    }
+
+    async fn prompt_with_turn_start_hook(
+        blocks: Vec<ContentBlock>,
+    ) -> (
+        SessionId,
+        UnboundedReceiver<Value>,
+        TurnStarts,
+        Option<SessionInput>,
+    ) {
+        let (mut srv, out_rx) = empty_server();
+        let seen = record_turn_starts(&mut srv);
+        let mut fixture = command_session();
+        let sid = install(&mut srv, fixture.state);
+        handle_request(
+            &mut srv,
+            "session/prompt",
+            RequestId::Number(PROMPT_ID),
+            &with_params(PromptRequest::new(sid.clone(), blocks)),
+            &fixture_settings(),
+        )
+        .await;
+        (sid, out_rx, seen, fixture.input_rx.try_recv().ok())
+    }
+
+    #[test_case(vec![ContentBlock::from(PROMPT_TEXT)], PROMPT_TEXT ; "plain_text")]
+    #[test_case(
+        vec![
+            ContentBlock::from(REVIEW_LINE),
+            ContentBlock::from(ATTACHED_TEXT),
+            ContentBlock::Image(ImageContent::new(IMAGE_DATA, IMAGE_MIME)),
+        ],
+        "Review src/main.rs\nand keep the tests green"
+        ; "custom_command_rendered_with_text_blocks_only"
+    )]
+    #[test_case(vec![ContentBlock::from(GREET_LINE)], GREET_LINE ; "mcp_prompt_line")]
+    #[test_case(
+        vec![ContentBlock::Image(ImageContent::new(IMAGE_DATA, IMAGE_MIME))], ""
+        ; "image_only_has_empty_text"
+    )]
+    #[tokio::test]
+    async fn a_prompt_fires_one_turn_start_with_the_text_the_agent_gets(
+        blocks: Vec<ContentBlock>,
+        text: &str,
+    ) {
+        let (sid, out_rx, seen, input) = prompt_with_turn_start_hook(blocks).await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(sid.0.to_string(), text.to_owned())]
+        );
+        assert_eq!(agent_input(input).message, text);
+        assert!(out_rx.is_empty(), "{PROMPT_ANSWERED_ON_TURN_END}");
+    }
+
+    #[test_case(vec![ContentBlock::from(COMPACT_LINE)] ; "compact")]
+    #[test_case(vec![ContentBlock::from(format!("/{GREET}"))] ; "rejected_command")]
+    #[tokio::test]
+    async fn a_prompt_that_starts_no_turn_fires_no_turn_start(blocks: Vec<ContentBlock>) {
+        let (_sid, _out_rx, seen, _input) = prompt_with_turn_start_hook(blocks).await;
+
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_start_comes_before_the_turn_events() {
+        let (mut srv, _, _) = test_server();
+        let sid = client_id(&only_session(&srv).handle.session_id);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        srv.stack.on_turn_start = Some(Arc::new(move |_, _| sink.lock().unwrap().push("start")));
+        let sink = Arc::clone(&log);
+        let hook: AgentEventHook = Arc::new(move |_, envelope| {
+            if matches!(envelope.event, AgentEvent::Done { .. }) {
+                sink.lock().unwrap().push("done");
+            }
+        });
+
+        handle_request(
+            &mut srv,
+            "session/prompt",
+            RequestId::Number(PROMPT_ID),
+            &prompt_request(&sid),
+            &fixture_settings(),
+        )
+        .await;
+        run_pump_with_hook(&srv, None, Some(hook), |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        assert_eq!(*log.lock().unwrap(), ["start", "done"]);
     }
 
     #[tokio::test]
