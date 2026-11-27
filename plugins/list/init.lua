@@ -5,6 +5,7 @@ local shorten_path = require("maki.shorten_path")
 local DESCRIPTION =
   [[List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 
+- Includes dotfiles.
 - Filters out instruction files (AGENTS.md, CLAUDE.md, COPILOT.md).]]
 
 maki.api.register_prompt_hint({

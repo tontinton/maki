@@ -3370,7 +3370,8 @@ List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 `name` is relative to {path}, so nested entries (`depth` > 1) keep their
-directory, as in `"tests/lib.rs"`.
+directory, as in `"tests/lib.rs"`. A nested directory that cannot be read
+is listed without its contents; an unreadable {path} is an error.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
