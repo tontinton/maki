@@ -2,6 +2,7 @@
 //! background?". Nested calls share the scope, so everything a call started is
 //! one subtree with one `home` to read.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use maki_storage::id::MakiId;
@@ -49,6 +50,10 @@ pub struct CallScope {
     trigger: Mutex<Option<CancelTrigger>>,
     home: SetOnce<TaskHome>,
     sessions: Mutex<Vec<SessionStub>>,
+    /// Whether a session already took this call's id as its task id. One-shot
+    /// for the call's whole life: moving takes the stubs away and a close
+    /// removes one, but later sessions must still look like later sessions.
+    session_claimed: AtomicBool,
 }
 
 impl CallScope {
@@ -63,11 +68,19 @@ impl CallScope {
             trigger: Mutex::new(Some(trigger)),
             home: SetOnce::new(),
             sessions: Mutex::new(Vec::new()),
+            session_claimed: AtomicBool::new(false),
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Whether this call's id is still free for a session to take as its task
+    /// id. Exactly one session per call succeeds; the first tool-handler
+    /// session inherits the call id, later and nested ones get fresh ids.
+    pub fn claim_session_id(&self) -> bool {
+        !self.session_claimed.swap(true, Ordering::Relaxed)
     }
 
     pub fn cancel(&self) -> &CancelToken {
@@ -226,6 +239,24 @@ mod tests {
         let scope = Arc::new(CallScope::new(CALL_ID.to_owned(), run));
         let guard = CallGuard::new(Arc::clone(&scope));
         (scope, guard)
+    }
+
+    /// One session per call may take the call id as its task id, whatever
+    /// happens to the stubs in between: a move empties them, a close drops
+    /// one, and the claim must stay taken either way.
+    #[test]
+    fn the_session_id_claim_is_one_shot_across_a_move() {
+        let (run_trigger, run) = CancelToken::new();
+        let (scope, guard) = scope_under(&run);
+        assert!(scope.claim_session_id());
+        assert!(!scope.claim_session_id());
+
+        let _trigger = scope.move_to(home(MakiId::generate())).unwrap();
+        assert!(!scope.claim_session_id());
+        scope.remove_session(CALL_ID);
+        assert!(!scope.claim_session_id());
+        drop(guard);
+        run_trigger.cancel();
     }
 
     #[test_case(false ; "a_stop_takes_the_owner_along")]

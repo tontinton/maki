@@ -393,8 +393,6 @@ impl App {
         if let Ok(idx) = self.chat_of_task(&done.id) {
             self.adopt_subagent(idx, &tool_owner(&done.tool));
             self.chats[idx].backs_moved_call = true;
-            // Its close can beat the receipt, and so can its final result
-            // once its first plugin event adopted it.
             outcome = match self.chats[idx].task_status() {
                 TaskStatus::Done => Some(BackgroundOutcome::Done),
                 TaskStatus::Error => Some(BackgroundOutcome::Error),
@@ -659,6 +657,9 @@ impl App {
     /// It counts as itself again when it still works but none of them does,
     /// like right before its final reply, so no count misses running work.
     fn is_wrapper(&self, chat: &Chat) -> bool {
+        if chat.has_subagent {
+            return false;
+        }
         let Some(id) = chat.task_id() else {
             return false;
         };
@@ -744,7 +745,13 @@ impl App {
             },
             _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
         };
-        self.end_task(id, BackgroundOutcome::Cancelled);
+        if matches!(action, Action::CancelSubagent { .. }) {
+            self.permission_prompt.drop_subagent(id);
+            let (ending, text) = tab_ending(BackgroundOutcome::Cancelled);
+            chat.end_early(ending, text);
+        } else {
+            self.end_task(id, BackgroundOutcome::Cancelled);
+        }
         Ok(action)
     }
 

@@ -181,6 +181,7 @@ pub(crate) struct LuaCtx {
 enum Caps {
     Handler {
         agent: Box<AgentContext>,
+        permission_prompt: bool,
     },
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
@@ -224,6 +225,19 @@ impl LuaCtx {
             ctx,
             Caps::Handler {
                 agent: Box::new(AgentContext::from(ctx)),
+                permission_prompt: false,
+            },
+        )
+    }
+
+    /// The ctx a `permission.prompt` layer runs under: agent access without
+    /// the call's first-session inheritance.
+    pub(crate) fn prompt(ctx: &ToolContext) -> Self {
+        Self::new(
+            ctx,
+            Caps::Handler {
+                agent: Box::new(AgentContext::from(ctx)),
+                permission_prompt: true,
             },
         )
     }
@@ -261,14 +275,27 @@ impl LuaCtx {
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
     pub(crate) fn agent(&self) -> Option<&AgentContext> {
         match &self.caps {
-            Caps::Handler { agent } => Some(agent),
+            Caps::Handler { agent, .. } => Some(agent),
             _ => None,
         }
     }
 
+    /// Whether this ctx is a tool's own handler, as opposed to a permission
+    /// prompt layer that merely shares its call: only the handler's session
+    /// inherits the call id.
+    pub(crate) fn is_handler(&self) -> bool {
+        matches!(
+            self.caps,
+            Caps::Handler {
+                permission_prompt: false,
+                ..
+            }
+        )
+    }
+
     fn config(&self) -> Option<&AgentConfig> {
         match &self.caps {
-            Caps::Handler { agent } => Some(&agent.config),
+            Caps::Handler { agent, .. } => Some(&agent.config),
             Caps::Start { config, .. } => Some(config),
             Caps::Restore { .. } => None,
         }
@@ -276,7 +303,7 @@ impl LuaCtx {
 
     fn workflow(&self) -> Option<bool> {
         match &self.caps {
-            Caps::Handler { agent } => Some(agent.workflow),
+            Caps::Handler { agent, .. } => Some(agent.workflow),
             Caps::Start { workflow, .. } => Some(*workflow),
             Caps::Restore { .. } => None,
         }
@@ -284,7 +311,7 @@ impl LuaCtx {
 
     fn audience(&self) -> Option<ToolAudience> {
         match &self.caps {
-            Caps::Handler { agent } => Some(agent.audience),
+            Caps::Handler { agent, .. } => Some(agent.audience),
             Caps::Start { audience, .. } => Some(*audience),
             Caps::Restore { .. } => None,
         }
@@ -299,7 +326,7 @@ impl LuaCtx {
 
     fn output_mode(&self) -> ToolOutputMode {
         match &self.caps {
-            Caps::Handler { agent } => agent.output_mode,
+            Caps::Handler { agent, .. } => agent.output_mode,
             Caps::Start { output_mode, .. } => *output_mode,
             Caps::Restore { .. } => ToolOutputMode::Compact,
         }
