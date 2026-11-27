@@ -65,6 +65,16 @@ case("handler_lists_sorted_and_filtered", function()
   rmtree(tmpdir)
 end)
 
+case("handler_adds_file_sizes_on_request", function()
+  local tmpdir = mktmpdir()
+  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "12345")
+  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
+
+  local result = list_helpers.handler({ path = tmpdir, sizes = true }, mock_ctx())
+  eq(result.llm_output, "adir/\na.txt  5")
+  rmtree(tmpdir)
+end)
+
 case("handler_loads_instructions_for_listed_dir", function()
   local tmpdir = mktmpdir()
   maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")

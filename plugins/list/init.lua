@@ -28,6 +28,7 @@ maki.api.register_tool({
         description = "Absolute path to the directory",
         required = true,
       },
+      sizes = { type = "boolean", description = "Add each file's size in bytes" },
     },
   },
 
