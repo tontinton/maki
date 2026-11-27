@@ -355,6 +355,22 @@ fn next_line(
     }
 }
 
+/// A line of a page that `max_line_bytes` cut.
+#[derive(Debug, PartialEq)]
+struct CutLine {
+    /// 1-based, in the file.
+    line: u64,
+    /// Its length before the cut.
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct LinePage {
+    lines: Vec<String>,
+    cut: Vec<CutLine>,
+    total: Option<u64>,
+}
+
 struct PageQuery {
     /// 1-based, so `0` also starts at the first line.
     offset: u64,
@@ -392,15 +408,16 @@ impl PageQuery {
 /// Returns the page and, when the query counts, the total lines in the file.
 /// Both come from one pass, so they always agree even on a log that grows
 /// while we read it. Only the page itself is ever held in memory.
-fn read_line_page(
-    mut reader: impl BufRead,
-    query: &PageQuery,
-) -> IoResult<(Vec<String>, Option<u64>)> {
+fn read_line_page(mut reader: impl BufRead, query: &PageQuery) -> IoResult<LinePage> {
     let skipped = skip_lines(&mut reader, query.offset.saturating_sub(1))?;
     let mut lines = Vec::new();
+    let mut cut = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
+        && let Some(Line {
+            text: line,
+            bytes: full_bytes,
+        }) = next_line(&mut reader, query.max_line_bytes, false)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -409,13 +426,22 @@ fn read_line_page(
             return Err(too_large());
         }
         lines.push(line);
+        if query
+            .max_line_bytes
+            .is_some_and(|max| full_bytes > max.min(MAX_READ_BYTES))
+        {
+            cut.push(CutLine {
+                line: skipped + lines.len() as u64,
+                bytes: full_bytes,
+            });
+        }
     }
     let total = if query.count {
         Some(skipped + lines.len() as u64 + skip_lines(&mut reader, u64::MAX)?)
     } else {
         None
     };
-    Ok((lines, total))
+    Ok(LinePage { lines, cut, total })
 }
 
 /// Read a window of lines from the file at `path`.
@@ -516,8 +542,8 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// UTF-8.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
-/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
-/// @return (table?, string?) `{ lines = string[], total = integer? }`, or nil plus an error message.
+/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `cut` lists every line it cut as `{ line, bytes }`: its number in the file and its full length. `count = false` stops reading after the page and leaves `total` nil.
+/// @return (table?, string?) `{ lines = string[], cut = table[], total = integer? }`, or nil plus an error message.
 /// @example
 /// local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
 /// if err then return end
@@ -526,7 +552,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
     let query = PageQuery::from_opts(opts.as_ref())?;
-    let (lines, total) = try_pair!(
+    let page = try_pair!(
         spawn_blocking(move || {
             let reader = BufReader::with_capacity(SCAN_CHUNK, File::open(abs)?);
             read_line_page(reader, &query)
@@ -534,9 +560,17 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
         .await
         .map_err(mlua::Error::external)?
     );
+    let cut = lua.create_table()?;
+    for entry in page.cut {
+        let tbl = lua.create_table()?;
+        tbl.set("line", entry.line)?;
+        tbl.set("bytes", entry.bytes)?;
+        cut.push(tbl)?;
+    }
     let tbl = lua.create_table()?;
-    tbl.set("lines", lua.create_sequence_from(lines)?)?;
-    tbl.set("total", total)?;
+    tbl.set("lines", lua.create_sequence_from(page.lines)?)?;
+    tbl.set("cut", cut)?;
+    tbl.set("total", page.total)?;
     Ok((Some(tbl), None))
 }
 
@@ -1725,7 +1759,7 @@ mod tests {
     #[test_case("caf\u{e9}!", &["caf\u{e9}..."]; "cut_after_a_multibyte_char")]
     #[test_case("ab\u{1f389}", &["ab..."]; "cut_inside_a_multibyte_char")]
     fn read_line_page_splits_and_cuts_lines(content: &str, expected: &[&str]) {
-        let (lines, total) =
+        let LinePage { lines, total, .. } =
             read_line_page(small_reader(content.as_bytes()), &cut_query()).unwrap();
         assert_eq!(lines, expected);
         assert_eq!(total, Some(expected.len() as u64));
@@ -1745,7 +1779,8 @@ mod tests {
             limit,
             ..PageQuery::default()
         };
-        let (lines, total) = read_line_page(small_reader(PAGE_LOG.as_bytes()), &query).unwrap();
+        let LinePage { lines, total, .. } =
+            read_line_page(small_reader(PAGE_LOG.as_bytes()), &query).unwrap();
         assert_eq!(lines, expected);
         assert_eq!(total, Some(PAGE_LOG_LINES));
     }
@@ -1759,7 +1794,7 @@ mod tests {
             count: false,
             ..PageQuery::default()
         };
-        let (lines, total) = read_line_page(&mut reader, &query).unwrap();
+        let LinePage { lines, total, .. } = read_line_page(&mut reader, &query).unwrap();
         assert_eq!(lines, ["l2"]);
         assert_eq!(total, None);
         let next = next_line(&mut reader, None, false)
@@ -1837,8 +1872,15 @@ mod tests {
     fn read_line_page_cuts_a_line_bigger_than_the_read_limit() {
         let huge_line = || BufReader::new(repeat(b'x').take(MAX_READ_BYTES * 2));
 
-        let (lines, total) = read_line_page(huge_line(), &cut_query()).unwrap();
+        let LinePage { lines, cut, total } = read_line_page(huge_line(), &cut_query()).unwrap();
         assert_eq!(lines, ["x".repeat(CUT as usize) + LINE_CUT_MARKER]);
+        assert_eq!(
+            cut,
+            [CutLine {
+                line: 1,
+                bytes: MAX_READ_BYTES * 2
+            }]
+        );
         assert_eq!(total, Some(1));
 
         let err = read_line_page(huge_line(), &PageQuery::default()).unwrap_err();

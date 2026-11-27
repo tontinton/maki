@@ -3,6 +3,11 @@ local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
 
 local HIGHLIGHT_CONTEXT_LINES = 200
+local CUT_NOTE = "\n\nLines cut at %d bytes, the `...` at their end is not in the file: %s"
+local CUT_NOTE_ITEM = "%d (%d bytes)"
+local CUT_NOTE_MORE = " and %d more"
+local CUT_NOTE_WHOLE_LINE = " Read one alone (limit=1) for up to %d bytes of it."
+local CUT_NOTE_MAX_LINES = 5
 
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
@@ -20,6 +25,11 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
+  max_single_line_bytes = {
+    default = 8192,
+    min = 80,
+    desc = "Truncate a line read alone (`limit=1`) at this many bytes, so the model can get a line `max_line_bytes` cut.",
+  },
   max_output_lines = output_limits.specs.max_output_lines,
 })
 
@@ -49,21 +59,28 @@ end
 -- `read_lines` call, so the window, its context and the total always agree.
 -- Lines arrive already cut to `max_line_bytes`, so even a huge file or line
 -- never fills the Lua heap that all plugins share.
-local function read_window(path, start, limit, count, ctx)
+local function read_window(path, start, limit, count, ctx, max_line_bytes)
   local first = math.max(start - HIGHLIGHT_CONTEXT_LINES, 1)
   local context_len = start - first
   local page, err = maki.fs.read_lines(path, {
     offset = first,
     limit = limit and context_len + limit,
-    max_line_bytes = output_limits.line_bytes(opts, ctx),
+    max_line_bytes = max_line_bytes or output_limits.line_bytes(opts, ctx),
     count = count,
   })
   if not page then
     return nil, err
   end
   local lines = page.lines
+  local cut = {}
+  for _, entry in ipairs(page.cut) do
+    if entry.line >= start then
+      cut[#cut + 1] = entry
+    end
+  end
   return {
     lines = table.move(lines, context_len + 1, #lines, 1, {}),
+    cut = cut,
     total = page.total,
     context = table.concat(lines, "\n", 1, math.min(context_len, #lines)),
   }
@@ -122,6 +139,27 @@ local function first_line(path, offset, ctx)
   return math.max(page.total + offset + 1, 1)
 end
 
+-- The cut itself is only a `...` at the end of the line, which reads like
+-- the file's own text once it is copied somewhere else.
+local function cut_note(cut, max_line_bytes, whole_line_bytes)
+  if #cut == 0 then
+    return ""
+  end
+  local items = {}
+  for i = 1, math.min(#cut, CUT_NOTE_MAX_LINES) do
+    items[i] = CUT_NOTE_ITEM:format(cut[i].line, cut[i].bytes)
+  end
+  local note = CUT_NOTE:format(max_line_bytes, table.concat(items, ", "))
+  if #cut > CUT_NOTE_MAX_LINES then
+    note = note .. CUT_NOTE_MORE:format(#cut - CUT_NOTE_MAX_LINES)
+  end
+  note = note .. "."
+  if whole_line_bytes then
+    note = note .. CUT_NOTE_WHOLE_LINE:format(whole_line_bytes)
+  end
+  return note
+end
+
 local function read_file(path, offset, limit, ctx)
   local start, start_err = first_line(path, offset, ctx)
   if not start then
@@ -132,8 +170,15 @@ local function read_file(path, offset, limit, ctx)
   if max_output_lines then
     max_lines = math.min(max_lines or max_output_lines, max_output_lines)
   end
+  -- A line read alone is the way to get one the page view cut.
+  local max_line_bytes = output_limits.line_bytes(opts, ctx)
+  local alone_gets_more = opts.max_single_line_bytes > max_line_bytes
+  if limit == 1 and max_line_bytes > 0 and alone_gets_more then
+    max_line_bytes = opts.max_single_line_bytes
+    alone_gets_more = false
+  end
 
-  local window, err = read_window(path, start, max_lines, true, ctx)
+  local window, err = read_window(path, start, max_lines, true, ctx, max_line_bytes)
   if not window then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
@@ -162,6 +207,8 @@ local function read_file(path, offset, limit, ctx)
         trunc_start
       )
   end
+
+  llm_output = llm_output .. cut_note(window.cut, max_line_bytes, alone_gets_more and opts.max_single_line_bytes)
 
   local shown = #lines
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)

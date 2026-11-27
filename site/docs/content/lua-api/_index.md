@@ -3105,9 +3105,9 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
-- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `cut` lists every line it cut as `{ line, bytes }`: its number in the file and its full length. `count = false` stops reading after the page and leaves `total` nil.
 
-**Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
+**Returns:** (`table?`, `string?`) `{ lines = string[], cut = table[], total = integer? }`, or nil plus an error message.
 
 **Example:**
 
