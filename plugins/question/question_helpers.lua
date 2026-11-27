@@ -25,6 +25,38 @@ function QuestionHelpers.format_answers(questions, answers)
   return table.concat(lines, "\n")
 end
 
+local function is_labels(list)
+  if type(list) ~= "table" then
+    return false
+  end
+  for _, label in pairs(list) do
+    if type(label) ~= "string" then
+      return false
+    end
+  end
+  return true
+end
+
+-- A `question.form` layer answers in the form's own shape, and anything else
+-- would reach the model as a garbled answer, so the caller asks the user.
+function QuestionHelpers.is_reply(result)
+  if type(result) ~= "table" then
+    return false
+  end
+  if result.type == "dismiss" then
+    return true
+  end
+  if result.type ~= "submit" or type(result.answers) ~= "table" then
+    return false
+  end
+  for i, labels in pairs(result.answers) do
+    if type(i) ~= "number" or i < 1 or i % 1 ~= 0 or not is_labels(labels) then
+      return false
+    end
+  end
+  return true
+end
+
 -- A fixed wrap width, not the terminal's: the chat panel re-wraps long lines and
 -- maps a click back to the line it came from, so the row -> option map survives
 -- a resize. The cap gets a floor, because a card that hides the very picks it
