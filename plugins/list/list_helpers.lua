@@ -21,7 +21,7 @@ function M.handler(input, ctx)
     return { llm_output = "error: path is not a directory: " .. path, is_error = true }
   end
 
-  local listing, err = dir_listing.list(path, ctx)
+  local listing, err = dir_listing.list(path, ctx, { sizes = input.sizes })
   if not listing then
     return { llm_output = "error: " .. tostring(err), is_error = true }
   end

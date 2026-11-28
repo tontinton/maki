@@ -9613,7 +9613,9 @@ return M
 -- Shared directory listing for index and list plugins, so every caller
 -- shows a directory the same way. Listing also loads the directory's
 -- instruction files onto the call.
-function M.list(path, ctx)
+
+-- `opts.sizes` puts each file's size in bytes behind its name.
+function M.list(path, ctx, opts)
 function M.view(text, ctx)
 ```
 

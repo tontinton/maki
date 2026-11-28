@@ -37,6 +37,7 @@ List directory contents. Returns entry names sorted alphabetically, directories 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the directory |
+| `sizes` | boolean | no | Add each file's size in bytes |
 
 ### `read` {#read}
 

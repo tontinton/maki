@@ -5,10 +5,12 @@
 local ToolView = require("maki.tool_view")
 
 local DEFAULT_MAX_LINES = 0
+local SIZE_SEP = "  "
 
 local M = {}
 
-function M.list(path, ctx)
+-- `opts.sizes` puts each file's size in bytes behind its name.
+function M.list(path, ctx, opts)
   local entries, err = maki.fs.dir(path)
   if not entries then
     return nil, err
@@ -27,7 +29,8 @@ function M.list(path, ctx)
   table.sort(dirs)
   table.sort(files)
   for _, f in ipairs(files) do
-    dirs[#dirs + 1] = f
+    local meta = opts and opts.sizes and maki.fs.metadata(maki.fs.joinpath(path, f))
+    dirs[#dirs + 1] = meta and f .. SIZE_SEP .. meta.size or f
   end
 
   ctx:load_instructions(path)
