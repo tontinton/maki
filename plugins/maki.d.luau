@@ -100,6 +100,7 @@ declare maki: {
   image: {
     probe: @checked (data: string | buffer) -> (any, string?),
     decode: @checked (data: string | buffer) -> (any, string?),
+    copy: @checked (data: string | buffer) -> (boolean?, string?),
   },
   interpreter: {
     run: @checked (code: string, opts: any) -> (any, string?),
